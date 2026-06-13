@@ -23,7 +23,8 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from . import float as _float
-from .identity import get_raw_agent_identity, resolve_agent as _resolve_agent_by_name
+from .identity import get_raw_agent_identity
+from . import signatures as _signatures
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,22 @@ def _validate_agent_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Header sanitization
+# ---------------------------------------------------------------------------
+
+def _sanitize_header_field(value: str) -> str:
+    """Strip header delimiter characters to prevent field injection.
+
+    The mesh header uses [ and ] as field delimiters. User-provided values
+    like agent names or task IDs must not contain these characters, or an
+    attacker could inject spurious fields that overwrite the sender.
+    """
+    if not isinstance(value, str):
+        return str(value)
+    return value.replace("[", "").replace("]", "")
+
+
+# ---------------------------------------------------------------------------
 # Identity helpers
 # ---------------------------------------------------------------------------
 
@@ -155,6 +172,7 @@ def _deliver_webhook(
     url: str,
     body: str,
     secret: str,
+    extra_headers: Optional[dict] = None,
 ) -> Optional[str]:
     """Deliver an HMAC-signed webhook POST with retry.
 
@@ -171,6 +189,8 @@ def _deliver_webhook(
         "Content-Type": "application/json",
         "X-Hub-Signature-256": f"sha256={sig}",
     }
+    if extra_headers:
+        headers.update(extra_headers)
 
     for attempt in range(_DELIVERY_RETRIES):
         try:
@@ -249,15 +269,11 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
     except ValueError as e:
         return {"error": str(e)}
 
-    # Resolve target
-    target_info = _resolve_agent_by_name(agent)
-    if not target_info:
-        return {"error": f"Agent '{agent}' not found in fleet vault"}
-
-    # Validate webhook config
+    # Resolve target and validate
     raw_info = get_raw_agent_identity(agent)
     if not raw_info:
-        return {"error": f"Agent '{agent}' has no identity in fleet vault"}
+        return {"error": f"Agent '{agent}' not found in fleet vault"}
+
     is_valid, error = _validate_agent_webhook_config(raw_info)
     if not is_valid:
         return {"error": f"Agent '{agent}' webhook config invalid: {error}"}
@@ -265,9 +281,15 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
     # Build mesh metadata header
     from_agent = os.getenv("A2A_AGENT_NAME", "hermes-agent")
     task_id = task_id or str(uuid.uuid4())
+    # SEC-06: Sanitize all field values to prevent header injection
+    from_agent = _sanitize_header_field(from_agent)
+    agent = _sanitize_header_field(agent)
+    task_id = _sanitize_header_field(task_id)
+    action = _sanitize_header_field(action)
+    reply = _sanitize_header_field(reply)
     header = f"[a2a][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
     if ref:
-        header += f"[ref:{ref}]"
+        header += f"[ref:{_sanitize_header_field(ref)}]"
     padded_message = f"{header} {message}"
 
     # Part 1: Webhook to target
@@ -289,8 +311,21 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
     except ValueError as e:
         return {"error": f"Agent '{agent}' webhook URL failed SSRF check: {e}"}
 
+    # SEC-06: Per-agent Ed25519 signature for identity binding
+    extra_headers = {}
+    try:
+        sender_identity = get_raw_agent_identity(from_agent)
+        if sender_identity:
+            signer_key = _signatures.load_signer_key(sender_identity)
+            if signer_key:
+                extra_headers["X-Mesh-Signature"] = _signatures.sign_message(
+                    signer_key, from_agent, agent, task_id, message
+                )
+    except Exception as exc:
+        logger.debug("Mesh relay: signing skipped for %s: %s", from_agent, exc)
+
     body = json.dumps({"text": padded_message}, sort_keys=True)
-    delivery_id = _deliver_webhook(target_url, body, webhook_secret)
+    delivery_id = _deliver_webhook(target_url, body, webhook_secret, extra_headers=extra_headers)
 
     if delivery_id is None:
         return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}

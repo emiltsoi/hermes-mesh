@@ -12,10 +12,18 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Identity YAML cache (ARCH-01: avoid triple reads per message)
+# ---------------------------------------------------------------------------
+
+_identity_cache: dict[str, tuple[float, Optional[dict]]] = {}
+_CACHE_TTL = 60.0  # seconds
 
 
 def _hermes_root() -> Path:
@@ -59,7 +67,26 @@ def _resolve_env(value: str) -> Optional[str]:
 
 
 def _load_identity_yaml(path: Path) -> Optional[dict]:
-    """Load and normalize an identity.yaml file."""
+    """Load and normalize an identity.yaml file with TTL caching.
+
+    Cache hits avoid re-reading files within _CACHE_TTL (60s).
+    On cache miss or expiry, delegates to _load_identity_yaml_impl.
+    """
+    path_str = str(path)
+    now = time.monotonic()
+    if path_str in _identity_cache:
+        cached_at, cached_val = _identity_cache[path_str]
+        if now - cached_at < _CACHE_TTL:
+            return cached_val
+        del _identity_cache[path_str]
+
+    result = _load_identity_yaml_impl(path)
+    _identity_cache[path_str] = (now, result)
+    return result
+
+
+def _load_identity_yaml_impl(path: Path) -> Optional[dict]:
+    """Load and normalize an identity.yaml file (no caching)."""
     if not path.exists():
         return None
     import yaml
