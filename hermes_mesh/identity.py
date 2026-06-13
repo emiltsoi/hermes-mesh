@@ -38,12 +38,23 @@ def _fleet_agents_root() -> Path:
 
 
 def _resolve_env(value: str) -> Optional[str]:
-    """Resolve ${ENV_VAR} interpolations in vault values."""
+    """Resolve ${ENV_VAR} interpolations in vault values.
+
+    Raises RuntimeError if an env var is referenced but not set —
+    fail-closed: never use a template string as a secret.
+    """
     if not isinstance(value, str):
         return value
     match = re.fullmatch(r"^\$\{([^}]+)\}$", value.strip())
     if match:
-        return os.environ.get(match.group(1), value)
+        env_key = match.group(1)
+        resolved = os.environ.get(env_key)
+        if resolved is None:
+            raise RuntimeError(
+                f"Vault env var ${env_key} is not set — refusing to use "
+                f"template string as a secret. Set {env_key} in the environment."
+            )
+        return resolved
     return value
 
 

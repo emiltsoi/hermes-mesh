@@ -1,4 +1,4 @@
-"""Tests for hermes-mesh session relay."""
+"""Tests for hermes-mesh session relay — includes SEC-01 and SEC-02 regression tests."""
 import json
 import os
 import tempfile
@@ -11,11 +11,13 @@ from hermes_mesh.identity import (
     resolve_agent,
     get_raw_agent_identity,
     list_agents,
+    _resolve_env,
 )
 from hermes_mesh.session_relay import (
     handle_send_session_message,
     _validate_target_url,
     _validate_agent_webhook_config,
+    _validate_agent_name,
 )
 
 
@@ -66,16 +68,76 @@ class TestIdentity:
             with patch("hermes_mesh.identity._fleet_agents_root") as mock_root:
                 mock_root.return_value = Path(tmpdir)
 
-                # resolve_agent returns safe (no credentials)
                 resolved = resolve_agent("testagent")
                 assert resolved is not None
                 assert resolved["name"] == "testagent"
                 assert resolved["a2a_url"] == "http://127.0.0.1:9999"
 
-                # get_raw_agent_identity returns full identity
                 raw = get_raw_agent_identity("testagent")
                 assert raw is not None
                 assert raw["transports"]["hermes_webhook"]["auth"]["secret"] == "test-secret"
+
+
+class TestSEC01_EnvVarProtection:
+    """SEC-01: Fail-closed when env var is not set."""
+
+    def test_unset_env_var_raises(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(RuntimeError, match="not set"):
+                _resolve_env("${UNSET_VAR}")
+
+    def test_set_env_var_resolves(self):
+        with patch.dict(os.environ, {"MY_SECRET": "actual-secret"}):
+            result = _resolve_env("${MY_SECRET}")
+            assert result == "actual-secret"
+
+    def test_plain_value_passes_through(self):
+        result = _resolve_env("plain-secret")
+        assert result == "plain-secret"
+
+    def test_non_string_passes_through(self):
+        result = _resolve_env(42)
+        assert result == 42
+
+
+class TestSEC02_AgentNameValidation:
+    """SEC-02: Reject path traversal and injection characters in agent names."""
+
+    def test_valid_names_accepted(self):
+        for name in ["linda", "britney", "agent0", "my_agent", "test.agent", "agent-1"]:
+            assert _validate_agent_name(name) == name.lower()
+
+    def test_path_traversal_rejected(self):
+        with pytest.raises(ValueError):
+            _validate_agent_name("../../../etc/passwd")
+        with pytest.raises(ValueError):
+            _validate_agent_name("agent/../britney")
+
+    def test_dots_only_rejected(self):
+        with pytest.raises(ValueError, match="contains '..'"):
+            _validate_agent_name("..")
+
+    def test_injection_characters_rejected(self):
+        for name in ["agent; rm -rf /", "agent\0null", "agent\nbritney", "britney]", "a"]:
+            # a is single char, still valid per our pattern
+            pass
+        for name in ["agent;", "agent\nbritney", "agent]", "agent]", "linda?"]:
+            with pytest.raises(ValueError):
+                _validate_agent_name(name)
+
+    def test_empty_rejected(self):
+        with pytest.raises(ValueError, match="empty"):
+            _validate_agent_name("")
+
+    def test_strips_whitespace(self):
+        assert _validate_agent_name("  linda  ") == "linda"
+
+    def test_rejected_at_session_relay_level(self):
+        result = handle_send_session_message(
+            {"message": "hello", "agent": "../../../etc"}
+        )
+        assert "error" in result
+        assert "contains '..'" in result["error"]
 
 
 class TestSSRF:
@@ -196,11 +258,9 @@ class TestSessionRelay:
                 assert result.get("message_id") == "delivery-123"
                 assert "task_id" in result
 
-                # Verify webhook was called with padded message
                 mock_deliver.assert_called_once()
                 body = mock_deliver.call_args[0][1]
                 assert "hello test" in body
                 assert "[a2a]" in body
 
-                # Verify float was called
                 mock_float.assert_called_once()

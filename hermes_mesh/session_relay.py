@@ -70,6 +70,32 @@ def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Agent name validation
+# ---------------------------------------------------------------------------
+
+_AGENT_NAME_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_.-]*$", __import__("re").IGNORECASE)
+
+
+def _validate_agent_name(name: str) -> str:
+    """Validate agent name against allowlist pattern.
+
+    Returns the lowercased, stripped name.
+    Raises ValueError if the name contains path traversal or injection characters.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Agent name must not be empty")
+    if ".." in name:
+        raise ValueError(f"Agent name contains '..': {name!r}")
+    if not _AGENT_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid agent name: {name!r}. "
+            f"Allowed: a-z, 0-9, underscore, dot, hyphen, starting with alphanumeric."
+        )
+    return name.lower()
+
+
+# ---------------------------------------------------------------------------
 # Identity helpers
 # ---------------------------------------------------------------------------
 
@@ -216,6 +242,12 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
         return {"error": "'message' is required"}
     if not agent:
         return {"error": "'agent' is required"}
+
+    # SEC-02: Validate agent name before path construction
+    try:
+        agent = _validate_agent_name(agent)
+    except ValueError as e:
+        return {"error": str(e)}
 
     # Resolve target
     target_info = _resolve_agent_by_name(agent)
