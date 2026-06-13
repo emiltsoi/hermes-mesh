@@ -1,0 +1,21 @@
+[project]
+name = "hermes-mesh"
+version = "0.1.0"
+description = "Session-aware mesh relay for Hermes fleet agents — wife-to-wife communication, fleet identity, gateway hook float"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/emiltsoi/hermes-mesh"
+Repository = "https://github.com/emiltsoi/hermes-mesh.git"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["hermes_mesh"]
