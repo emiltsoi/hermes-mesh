@@ -94,5 +94,5 @@ re-implement it.
 ## Dependencies
 
 - Hermes Agent with A2A platform adapter enabled
-- Python stdlib + pyyaml
+- Python stdlib + pyyaml + cryptography (Ed25519 identity signing)
 - No external HTTP libraries (uses `urllib`)
