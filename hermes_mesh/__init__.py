@@ -24,7 +24,7 @@ def validate_config(config) -> bool:
     return True
 
 
-def _serialize_dict_handler(handler):
+def _json_dump_handler(handler):
     """Wrap a handler that returns a dict so the tool registry sees a JSON string."""
     def wrapper(*args, **kwargs):
         result = handler(*args, **kwargs)
@@ -50,7 +50,7 @@ def register(ctx) -> None:
                     "properties": {},
                 },
             },
-            handler=_serialize_dict_handler(handle_mesh_list),
+            handler=_json_dump_handler(handle_mesh_list),
         )
 
         ctx.register_tool(
@@ -96,7 +96,7 @@ def register(ctx) -> None:
                     "required": ["url", "secret"],
                 },
             },
-            handler=_serialize_dict_handler(handle_mesh_register),
+            handler=_json_dump_handler(handle_mesh_register),
         )
 
         ctx.register_tool(
@@ -145,7 +145,7 @@ def register(ctx) -> None:
                     "required": ["message", "agent"],
                 },
             },
-            handler=_serialize_dict_handler(handle_mesh_send),
+            handler=_json_dump_handler(handle_mesh_send),
         )
         logger.info("Hermes Mesh: registered mesh tools")
     except Exception:
