@@ -111,6 +111,38 @@ def _global_mesh_target_session() -> Optional[str]:
         return None
 
 
+def _patch_gateway_runner_authz() -> None:
+    """Work around a stale GatewayRunner method signature.
+
+    ``gateway.run:GatewayRunner`` overrides ``_get_unauthorized_dm_behavior``
+    without the ``profile`` keyword-only argument that its own
+    ``_is_user_authorized`` call site passes (``profile=source.profile``).
+    The mixin implementation already has the correct signature and uses
+    ``_adapter_dm_policy(platform, profile=profile)``. Bind it onto
+    ``GatewayRunner`` at import so unauthorized DMs do not crash the gateway.
+    """
+    try:
+        import inspect
+        from gateway.run import GatewayRunner
+        from gateway.authz_mixin import GatewayAuthorizationMixin
+    except Exception:
+        return
+
+    try:
+        sig = inspect.signature(GatewayRunner._get_unauthorized_dm_behavior)
+    except Exception:
+        return
+    if "profile" in sig.parameters:
+        return
+
+    try:
+        GatewayRunner._get_unauthorized_dm_behavior = (
+            GatewayAuthorizationMixin._get_unauthorized_dm_behavior
+        )
+    except Exception:
+        return
+
+
 class MeshAdapter(BasePlatformAdapter):
     """Receive HMAC-signed Mesh messages into a configured platform session."""
 
@@ -124,6 +156,8 @@ class MeshAdapter(BasePlatformAdapter):
     enforces_own_access_policy: bool = True
 
     def __init__(self, config: PlatformConfig):
+        # Patch stale upstream method signature before the adapter is connected.
+        _patch_gateway_runner_authz()
         super().__init__(config, Platform("mesh"))
         self._background_tasks = getattr(self, "_background_tasks", set())
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
