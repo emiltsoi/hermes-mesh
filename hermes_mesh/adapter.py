@@ -14,7 +14,13 @@ import os
 import re
 import errno
 import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - PyYAML is a hard dependency of Hermes
+    yaml = None  # type: ignore[assignment]
 
 try:
     from aiohttp import web
@@ -79,6 +85,32 @@ def check_mesh_requirements() -> bool:
         return False
 
 
+def _global_mesh_target_session() -> Optional[str]:
+    """Return target_session from the global ~/.hermes/config.yaml, if any.
+
+    Profile configs can override ``platforms.mesh.extra`` entirely, which
+    drops the global ``target_session``. Falling back to the global value
+    lets the mesh adapter still route into the configured platform session
+    (e.g. ``telegram:dm:<id>``) without requiring the user to duplicate it
+    in every profile.
+    """
+    if yaml is None:
+        return None
+    try:
+        global_cfg = Path.home() / ".hermes" / "config.yaml"
+        if not global_cfg.exists():
+            return None
+        data = yaml.safe_load(global_cfg.read_text(encoding="utf-8")) or {}
+        return (
+            data.get("platforms", {})
+            .get("mesh", {})
+            .get("extra", {})
+            .get("target_session")
+        )
+    except Exception:
+        return None
+
+
 class MeshAdapter(BasePlatformAdapter):
     """Receive HMAC-signed Mesh messages into a configured platform session."""
 
@@ -100,6 +132,8 @@ class MeshAdapter(BasePlatformAdapter):
         self._route: str = config.extra.get("route", "receive")
         self._secret: str = config.extra.get("secret", "")
         self._target_session: Optional[str] = config.extra.get("target_session")
+        if not self._target_session:
+            self._target_session = _global_mesh_target_session()
         self._agent_name: str = str(
             config.extra.get("agent_name")
             or os.getenv("MESH_AGENT_NAME")
@@ -240,13 +274,33 @@ class MeshAdapter(BasePlatformAdapter):
         if self._target_session:
             parts = self._target_session.split(":", 2)
             target_platform_str = parts[0]
-            target_chat_type = parts[1] if len(parts) > 1 else "dm"
-            target_chat_id = parts[2] if len(parts) > 2 else parts[1]
+            if len(parts) == 3:
+                target_chat_type = parts[1]
+                target_chat_id = parts[2]
+            elif len(parts) == 2:
+                target_chat_type = "dm"
+                target_chat_id = parts[1]
+            else:
+                target_chat_type = "dm"
+                target_chat_id = parts[0]
+
+            # For DM target sessions, use the chat_id as user_id so platform
+            # env allowlists (e.g. TELEGRAM_ALLOWED_USERS) match the intended
+            # recipient. Keep the mesh sender identity in user_name and
+            # user_id_alt for logging and any downstream fallback.
+            if target_chat_type == "dm":
+                user_id = target_chat_id
+                user_id_alt = f"mesh:{sender}"
+            else:
+                user_id = f"mesh:{sender}"
+                user_id_alt = None
+
             source = self.build_source(
                 chat_id=target_chat_id,
                 chat_name=f"mesh/{sender}",
                 chat_type=target_chat_type,
-                user_id=f"mesh:{sender}",
+                user_id=user_id,
+                user_id_alt=user_id_alt,
                 user_name=sender,
                 _platform=Platform(target_platform_str),
             )
