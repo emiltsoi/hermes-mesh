@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -167,17 +168,51 @@ _DELIVERY_TIMEOUT = int(
 
 
 def _validate_resolved_ip(host: str, allow_loopback: bool = False) -> str:
-    """Resolve hostname and validate the actual IP for SSRF protection."""
+    """Resolve hostname and validate all returned IPs for SSRF protection.
+
+    urllib's urlopen and asyncio TCP stacks resolve via ``getaddrinfo``,
+    which can prefer IPv6. ``socket.gethostbyname`` is IPv4-only, so a
+    clean A record plus a loopback/Private AAAA record would bypass the
+    old check. We validate every A and AAAA record here.
+    """
     if not host:
         raise ValueError("Empty host")
-    ip = socket.gethostbyname(host)
-    if ip in ("0.0.0.0", "127.0.0.1"):
-        if not allow_loopback:
-            raise ValueError(f"Loopback address blocked: {ip}")
-        return ip
-    if any(ip.startswith(p) for p in _BLOCKED_PREFIXES) and not allow_loopback:
-        raise ValueError(f"Private/reserved address blocked: {ip}")
-    return ip
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve host {host}: {exc}") from exc
+    if not addrinfo:
+        raise ValueError(f"No addresses for host {host}")
+
+    first_ip = None
+    for _, _, _, _, sockaddr in addrinfo:
+        ip_str = sockaddr[0]
+        if first_ip is None:
+            first_ip = ip_str
+        # When the caller explicitly allows local/loopback delivery, skip
+        # the private/reserved checks entirely.
+        if allow_loopback:
+            continue
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if ip_obj.is_loopback:
+            raise ValueError(f"Loopback address blocked: {ip_str}")
+        # Private, link-local, multicast, reserved, unspecified, and the
+        # CGNAT (100.64.0.0/10) and benchmark (198.18.0.0/15) ranges.
+        if (
+            ip_obj.is_private
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+            or ip_obj in ipaddress.ip_network("100.64.0.0/10")
+            or ip_obj in ipaddress.ip_network("198.18.0.0/15")
+        ):
+            raise ValueError(f"Private/reserved address blocked: {ip_str}")
+
+    return first_ip or host
 
 
 def _deliver_webhook(
