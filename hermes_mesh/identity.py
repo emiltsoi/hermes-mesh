@@ -1,6 +1,9 @@
 """Fleet identity resolution for Hermes mesh.
 
 Resolves agent identities from the fleet vault at:
+  $HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml
+
+Falls back to the legacy A2A vault path for backward compatibility:
   $HERMES_HOME/fleet/a2a/agents/<name>/identity.yaml
 
 This is a focused subset of the old hermes-agent-a2a identity.py —
@@ -12,40 +15,51 @@ from __future__ import annotations
 import logging
 import os
 import re
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Identity YAML cache (ARCH-01: avoid triple reads per message)
-# ---------------------------------------------------------------------------
-
-_identity_cache: dict[str, tuple[float, Optional[dict]]] = {}
-_CACHE_TTL = 60.0  # seconds
 
 
 def _hermes_root() -> Path:
     """Return the Hermes root directory (above profiles/ if inside one)."""
     home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
     parts = home.parts
-    if "profiles" in parts:
+    if any(p == "profiles" for p in parts):
         idx = parts.index("profiles")
         return Path(*parts[:idx]) if idx > 0 else Path("/")
     return home
 
 
+def _fleet_root() -> Path:
+    """Return the fleet root directory from env or HERMES_HOME/fleet."""
+    return Path(
+        os.environ.get("MESH_VAULT_PATH")
+        or os.environ.get("A2A_VAULT_PATH")
+        or str(_hermes_root() / "fleet")
+    )
+
+
+def _mesh_agents_root() -> Path:
+    """Return the primary mesh agents directory."""
+    return _fleet_root() / "mesh" / "agents"
+
+
+def _legacy_a2a_agents_root() -> Path:
+    """Return the legacy A2A agents directory for backward compatibility."""
+    return _fleet_root() / "a2a" / "agents"
+
+
 def _fleet_agents_root() -> Path:
-    """Return the fleet agents directory."""
-    fleet_root = Path(os.environ.get(
-        "A2A_VAULT_PATH",
-        str(_hermes_root() / "fleet")
-    ))
-    return fleet_root / "a2a" / "agents"
+    """Return the fleet agents directory.
+
+    Prefers fleet/mesh/agents; falls back to fleet/a2a/agents for
+    backward compatibility with existing identities.
+    """
+    return _mesh_agents_root()
 
 
-def _resolve_env(value: str) -> Optional[str]:
+def _resolve_env(value: Any) -> Any:
     """Resolve ${ENV_VAR} interpolations in vault values.
 
     Raises RuntimeError if an env var is referenced but not set —
@@ -67,26 +81,7 @@ def _resolve_env(value: str) -> Optional[str]:
 
 
 def _load_identity_yaml(path: Path) -> Optional[dict]:
-    """Load and normalize an identity.yaml file with TTL caching.
-
-    Cache hits avoid re-reading files within _CACHE_TTL (60s).
-    On cache miss or expiry, delegates to _load_identity_yaml_impl.
-    """
-    path_str = str(path)
-    now = time.monotonic()
-    if path_str in _identity_cache:
-        cached_at, cached_val = _identity_cache[path_str]
-        if now - cached_at < _CACHE_TTL:
-            return cached_val
-        del _identity_cache[path_str]
-
-    result = _load_identity_yaml_impl(path)
-    _identity_cache[path_str] = (now, result)
-    return result
-
-
-def _load_identity_yaml_impl(path: Path) -> Optional[dict]:
-    """Load and normalize an identity.yaml file (no caching)."""
+    """Load and normalize an identity.yaml file."""
     if not path.exists():
         return None
     import yaml
@@ -111,6 +106,15 @@ def _load_identity_yaml_impl(path: Path) -> Optional[dict]:
     return raw
 
 
+def _identity_file_for_agent(agent_key: str) -> Optional[Path]:
+    """Return the identity.yaml path for an agent, preferring mesh over legacy a2a."""
+    for root in (_mesh_agents_root(), _legacy_a2a_agents_root()):
+        candidate = root / agent_key / "identity.yaml"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def resolve_agent(name: str) -> Optional[dict]:
     """Look up an agent by name in the fleet vault.
 
@@ -121,7 +125,9 @@ def resolve_agent(name: str) -> Optional[dict]:
     if not name:
         return None
     agent_key = name.lower()
-    identity_file = _fleet_agents_root() / agent_key / "identity.yaml"
+    identity_file = _identity_file_for_agent(agent_key)
+    if not identity_file:
+        return None
     identity = _load_identity_yaml(identity_file)
     if not identity:
         return None
@@ -130,7 +136,8 @@ def resolve_agent(name: str) -> Optional[dict]:
         "description": identity.get("description", ""),
         "role": identity.get("role", ""),
         "a2a_url": (
-            (identity.get("transports", {}).get("a2a_rpc", {}) or {}).get("url", "")
+            (identity.get("transports", {}).get("hermes_webhook", {}) or {}).get("url", "")
+            or (identity.get("transports", {}).get("a2a_rpc", {}) or {}).get("url", "")
             or identity.get("a2a_url", "")
         ),
     }
@@ -145,27 +152,55 @@ def get_raw_agent_identity(name: str) -> Optional[dict]:
     if not name:
         return None
     agent_key = name.lower()
-    identity_file = _fleet_agents_root() / agent_key / "identity.yaml"
+    identity_file = _identity_file_for_agent(agent_key)
+    if not identity_file:
+        return None
     return _load_identity_yaml(identity_file)
 
 
 def list_agents() -> list[dict]:
-    """Return all fleet agents from the vault (no credentials)."""
-    agents_dir = _fleet_agents_root()
-    if not agents_dir.is_dir():
-        return []
+    """Return all fleet agents from the vault (no credentials).
+
+    Merges agents from both fleet/mesh/agents and the legacy
+    fleet/a2a/agents directories.
+    """
     agents = []
     seen = set()
-    for agent_dir in agents_dir.iterdir():
-        if not agent_dir.is_dir():
+    for root in (_mesh_agents_root(), _legacy_a2a_agents_root()):
+        if not root.is_dir():
             continue
-        identity_file = agent_dir / "identity.yaml"
-        identity = _load_identity_yaml(identity_file)
-        if not identity:
-            continue
-        name = str(identity.get("name") or agent_dir.name).lower()
-        if name in seen:
-            continue
-        seen.add(name)
-        agents.append(resolve_agent(name))
-    return [a for a in agents if a]
+        for agent_dir in root.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            identity_file = agent_dir / "identity.yaml"
+            identity = _load_identity_yaml(identity_file)
+            if not identity:
+                continue
+            name = str(identity.get("name") or agent_dir.name).lower()
+            if name in seen:
+                continue
+            seen.add(name)
+            resolved = resolve_agent(name)
+            if resolved:
+                agents.append(resolved)
+    return agents
+
+
+def write_agent_identity(agent_key: str, identity: dict, prefer_mesh: bool = True) -> Path:
+    """Write an identity.yaml for an agent, creating parent directories.
+
+    By default writes to fleet/mesh/agents. Set prefer_mesh=False to
+    write to the legacy fleet/a2a/agents location.
+    """
+    import yaml
+
+    agent_key = agent_key.lower().strip()
+    if not agent_key:
+        raise ValueError("Agent key must not be empty")
+    root = _mesh_agents_root() if prefer_mesh else _legacy_a2a_agents_root()
+    agent_dir = root / agent_key
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    identity_file = agent_dir / "identity.yaml"
+    with open(identity_file, "w", encoding="utf-8") as f:
+        yaml.safe_dump(identity, f, sort_keys=False, allow_unicode=True)
+    return identity_file

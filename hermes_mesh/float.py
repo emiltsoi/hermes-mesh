@@ -7,6 +7,7 @@ Env var chain: HERMES_TELEGRAM_BOT_TOKEN → A2A_TELEGRAM_BOT_TOKEN → TELEGRAM
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ def send(text: str, sender_name: str = "hermes-agent") -> None:
     url = f"https://api.telegram.org/bot{bot}/sendMessage"
     payload = {
         "chat_id": chat,
-        "text": text,
+        "text": html.escape(text),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
@@ -63,8 +64,8 @@ def send(text: str, sender_name: str = "hermes-agent") -> None:
             body = resp.read().decode()
             result = json.loads(body)
             if not result.get("ok"):
-                logger.debug("Float delivery failed: %s", result.get("description", "unknown"))
+                logger.warning("Float delivery failed: %s", result.get("description", "unknown"))
             else:
                 logger.debug("Float sent to %s: %d chars", chat, len(text))
     except Exception as e:
-        logger.debug("Float delivery error: %s", e)
+        logger.error("Float delivery error: %s", e)

@@ -9,7 +9,7 @@ to add fleet-specific session routing, identity resolution, and gateway float.
 **The standard A2A plugin handles:** discover, call, serve Agent Cards, JSON-RPC,
 bearer auth, injection filters, audit logging.
 
-**hermes-mesh adds:** `a2a_send_session_message` — route a message into another
+**hermes-mesh adds:** `mesh_list`, `mesh_send`, and `mesh_register` — route a message into another
 fleet agent's live gateway session with full sender context preserved.
 
 ## Why
@@ -30,13 +30,13 @@ gateway hook delivery that routes into the target agent's active session.
 
 ```
 Caller Agent
-  └─ a2a_send_session_message(agent="britney", message="...")
+  └─ mesh_send(agent="britney", message="...")
        │
        ├─ 1. Resolve target identity from fleet vault
-       │     (hermes_root/profiles/<name>/a2a/vault.yaml)
+       │     ($HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml)
        │
        ├─ 2. Build padded message with mesh metadata header:
-       │     [a2a][from:linda][to:britney][id:uuid][action:do][reply:yes]
+       │     [mesh][from:linda][to:britney][id:uuid][action:do][reply:yes]
        │
        ├─ 3. HMAC-SHA256 sign + POST to target's hermes_webhook endpoint
        │
@@ -48,7 +48,7 @@ Caller Agent
 Agents are resolved from the vault:
 
 ```
-$HERMES_HOME/fleet/a2a/agents/
+$HERMES_HOME/fleet/mesh/agents/
   ├── britney/
   │   └── identity.yaml   ← name, transports.hermes_webhook.{url, auth.secret}
   ├── linda/
@@ -93,6 +93,6 @@ re-implement it.
 
 ## Dependencies
 
-- Hermes Agent with A2A platform adapter enabled
-- Python stdlib + pyyaml + cryptography (Ed25519 identity signing)
+- Hermes Agent
+- Python stdlib + pyyaml
 - No external HTTP libraries (uses `urllib`)
