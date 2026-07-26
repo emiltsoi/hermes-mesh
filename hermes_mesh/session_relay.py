@@ -1,13 +1,13 @@
 """Session relay — the core mesh primitive.
 
-handle_send_session_message routes a message into another fleet agent's
+handle_mesh_send routes a message into another fleet agent's
 live gateway session with full sender context preserved.
 
 Two-part delivery:
   1. HMAC-signed webhook POST to target agent's gateway relay
   2. Echo float to sender's Telegram DM for visibility
 
-Auto-pads [a2a][from:<self>][to:<agent>][id:<uuid>][action:<action>][reply:<reply>]
+Auto-pads [mesh][from:<self>][to:<agent>][id:<uuid>][action:<action>][reply:<reply>]
 header. Caller passes raw message; tool handles all mesh metadata.
 """
 from __future__ import annotations
@@ -17,14 +17,16 @@ import hmac
 import json
 import logging
 import os
+import re
+import socket
+import urllib.request
 import time
 import uuid
 from typing import Optional
 from urllib.parse import urlparse
 
 from . import float as _float
-from .identity import get_raw_agent_identity
-from . import signatures as _signatures
+from .identity import get_raw_agent_identity, list_agents, resolve_agent as _resolve_agent_by_name, write_agent_identity
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ def _is_loopback(url: str) -> bool:
 
 def _is_local(url: str) -> bool:
     host = urlparse(url).hostname or ""
-    return any(host.startswith(p) for p in _LOCAL_PREFIXES)
+    return any(host.startswith(p) for p in _LOCAL_PREFIXES) or host.lower() in {"::1", "[::1]"}
 
 
 def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
@@ -74,7 +76,7 @@ def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
 # Agent name validation
 # ---------------------------------------------------------------------------
 
-_AGENT_NAME_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_.-]*$", __import__("re").IGNORECASE)
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$", re.IGNORECASE)
 
 
 def _validate_agent_name(name: str) -> str:
@@ -97,22 +99,6 @@ def _validate_agent_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Header sanitization
-# ---------------------------------------------------------------------------
-
-def _sanitize_header_field(value: str) -> str:
-    """Strip header delimiter characters to prevent field injection.
-
-    The mesh header uses [ and ] as field delimiters. User-provided values
-    like agent names or task IDs must not contain these characters, or an
-    attacker could inject spurious fields that overwrite the sender.
-    """
-    if not isinstance(value, str):
-        return str(value)
-    return value.replace("[", "").replace("]", "")
-
-
-# ---------------------------------------------------------------------------
 # Identity helpers
 # ---------------------------------------------------------------------------
 
@@ -127,7 +113,10 @@ def _transport_auth_value(transport: dict, key: str) -> str:
     auth = transport.get("auth", {}) if isinstance(transport, dict) else {}
     if not isinstance(auth, dict):
         return ""
-    return auth.get(key, "") or ""
+    value = auth.get(key, "") if auth else ""
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _is_local_fleet_agent(agent_name: str) -> bool:
@@ -163,23 +152,44 @@ def _validate_agent_webhook_config(agent_info: dict) -> tuple[bool, str]:
 # Delivery
 # ---------------------------------------------------------------------------
 
-_DELIVERY_RETRIES = int(os.getenv("A2A_WEBHOOK_DELIVERY_RETRIES", "3"))
-_DELIVERY_BACKOFF = float(os.getenv("A2A_WEBHOOK_DELIVERY_BACKOFF", "1.0"))
-_DELIVERY_TIMEOUT = int(os.getenv("A2A_WEBHOOK_DELIVERY_TIMEOUT", "10"))
+_DELIVERY_RETRIES = int(
+    os.getenv("MESH_WEBHOOK_DELIVERY_RETRIES")
+    or os.getenv("A2A_WEBHOOK_DELIVERY_RETRIES", "3")
+)
+_DELIVERY_BACKOFF = float(
+    os.getenv("MESH_WEBHOOK_DELIVERY_BACKOFF")
+    or os.getenv("A2A_WEBHOOK_DELIVERY_BACKOFF", "1.0")
+)
+_DELIVERY_TIMEOUT = int(
+    os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT")
+    or os.getenv("A2A_WEBHOOK_DELIVERY_TIMEOUT", "10")
+)
+
+
+def _validate_resolved_ip(host: str, allow_loopback: bool = False) -> str:
+    """Resolve hostname and validate the actual IP for SSRF protection."""
+    if not host:
+        raise ValueError("Empty host")
+    ip = socket.gethostbyname(host)
+    if ip in ("0.0.0.0", "127.0.0.1"):
+        if not allow_loopback:
+            raise ValueError(f"Loopback address blocked: {ip}")
+        return ip
+    if any(ip.startswith(p) for p in _BLOCKED_PREFIXES) and not allow_loopback:
+        raise ValueError(f"Private/reserved address blocked: {ip}")
+    return ip
 
 
 def _deliver_webhook(
     url: str,
     body: str,
     secret: str,
-    extra_headers: Optional[dict] = None,
+    allow_loopback: bool = False,
 ) -> Optional[str]:
     """Deliver an HMAC-signed webhook POST with retry.
 
     Returns the delivery_id on success, or None if all retries fail.
     """
-    import urllib.request
-
     sig = hmac.new(
         secret.encode(),
         body.encode(),
@@ -189,11 +199,13 @@ def _deliver_webhook(
         "Content-Type": "application/json",
         "X-Hub-Signature-256": f"sha256={sig}",
     }
-    if extra_headers:
-        headers.update(extra_headers)
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
 
     for attempt in range(_DELIVERY_RETRIES):
         try:
+            _validate_resolved_ip(host, allow_loopback=allow_loopback)
             req = urllib.request.Request(
                 url,
                 data=body.encode(),
@@ -227,10 +239,10 @@ def _deliver_webhook(
 
 
 # ---------------------------------------------------------------------------
-# handle_send_session_message
+# handle_mesh_send
 # ---------------------------------------------------------------------------
 
-def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
+def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     """Send a session-aware message to a Hermes mesh peer.
 
     Routes the message to the target agent's gateway webhook so the
@@ -269,27 +281,25 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
     except ValueError as e:
         return {"error": str(e)}
 
-    # Resolve target and validate
-    raw_info = get_raw_agent_identity(agent)
-    if not raw_info:
+    # Resolve target
+    target_info = _resolve_agent_by_name(agent)
+    if not target_info:
         return {"error": f"Agent '{agent}' not found in fleet vault"}
 
+    # Validate webhook config
+    raw_info = get_raw_agent_identity(agent)
+    if not raw_info:
+        return {"error": f"Agent '{agent}' has no identity in fleet vault"}
     is_valid, error = _validate_agent_webhook_config(raw_info)
     if not is_valid:
         return {"error": f"Agent '{agent}' webhook config invalid: {error}"}
 
     # Build mesh metadata header
-    from_agent = os.getenv("A2A_AGENT_NAME", "hermes-agent")
+    from_agent = os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "hermes-agent")
     task_id = task_id or str(uuid.uuid4())
-    # SEC-06: Sanitize all field values to prevent header injection
-    from_agent = _sanitize_header_field(from_agent)
-    agent = _sanitize_header_field(agent)
-    task_id = _sanitize_header_field(task_id)
-    action = _sanitize_header_field(action)
-    reply = _sanitize_header_field(reply)
-    header = f"[a2a][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
+    header = f"[mesh][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
     if ref:
-        header += f"[ref:{_sanitize_header_field(ref)}]"
+        header += f"[ref:{ref}]"
     padded_message = f"{header} {message}"
 
     # Part 1: Webhook to target
@@ -302,30 +312,22 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
     if not webhook_secret:
         return {"error": "Webhook delivery failed — no shared secret"}
 
-    # SSRF check
+    # M2: target_info already resolved; derive local allow from the URL itself
     try:
         target_url = _validate_target_url(
             target_url,
-            allow_loopback=_is_local_fleet_agent(agent),
+            allow_loopback=_is_loopback(target_url) or _is_local(target_url),
         )
     except ValueError as e:
         return {"error": f"Agent '{agent}' webhook URL failed SSRF check: {e}"}
 
-    # SEC-06: Per-agent Ed25519 signature for identity binding
-    extra_headers = {}
-    try:
-        sender_identity = get_raw_agent_identity(from_agent)
-        if sender_identity:
-            signer_key = _signatures.load_signer_key(sender_identity)
-            if signer_key:
-                extra_headers["X-Mesh-Signature"] = _signatures.sign_message(
-                    signer_key, from_agent, agent, task_id, message
-                )
-    except Exception as exc:
-        logger.debug("Mesh relay: signing skipped for %s: %s", from_agent, exc)
+    # C5: per-agent HMAC — sign with the sender's own webhook secret if available
+    sender_info = get_raw_agent_identity(from_agent)
+    sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret") if sender_info else ""
+    signing_secret = sender_secret or webhook_secret
 
-    body = json.dumps({"text": padded_message}, sort_keys=True)
-    delivery_id = _deliver_webhook(target_url, body, webhook_secret, extra_headers=extra_headers)
+    body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
+    delivery_id = _deliver_webhook(target_url, body, signing_secret, allow_loopback=_is_loopback(target_url) or _is_local(target_url))
 
     if delivery_id is None:
         return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}
@@ -343,3 +345,71 @@ def handle_send_session_message(args: dict | None = None, **kwargs) -> dict:
         "agent": agent,
         "gateway_delivery": True,
     }
+
+# ---------------------------------------------------------------------------
+# mesh_list / mesh_register tools
+# ---------------------------------------------------------------------------
+
+def handle_mesh_list(args=None, **kwargs) -> dict:
+    """List all agents registered in the fleet mesh vault."""
+    agents = list_agents()
+    return {"agents": agents, "count": len(agents)}
+
+
+def handle_mesh_register(args=None, **kwargs) -> dict:
+    """Register or update an agent identity in the fleet mesh vault.
+
+    Args:
+        name: Agent name (defaults to MESH_AGENT_NAME env var).
+        url: Hermes webhook URL for this agent.
+        secret: Shared HMAC secret for this agent.
+        role: Optional role description (default "agent").
+        description: Optional human-readable description.
+        overwrite: Whether to overwrite an existing identity (default False).
+    """
+    merged = dict(args) if args else {}
+    merged.update(kwargs)
+
+    name = merged.get("name") or __import__("os").getenv("MESH_AGENT_NAME") or __import__("os").getenv("A2A_AGENT_NAME", "")
+    url = merged.get("url", "")
+    secret = merged.get("secret", "")
+    role = merged.get("role", "agent")
+    description = merged.get("description", "")
+    overwrite = bool(merged.get("overwrite", False))
+
+    if not name:
+        return {"error": "'name' is required (or set MESH_AGENT_NAME)"}
+    try:
+        name = _validate_agent_name(name)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    if not url:
+        return {"error": "'url' is required"}
+    if not url.startswith(("http://", "https://")):
+        return {"error": f"URL must use http/https: {url}"}
+    if not secret:
+        return {"error": "'secret' is required for HMAC webhook auth"}
+
+    if not overwrite and get_raw_agent_identity(name):
+        return {"registered": False, "error": f"Agent '{name}' already exists; set overwrite=True to replace"}
+
+    identity = {
+        "id": name,
+        "name": name,
+        "description": description,
+        "role": role,
+        "transports": {
+            "hermes_webhook": {
+                "url": url,
+                "auth": {"type": "hmac-sha256", "secret": secret},
+            },
+        },
+    }
+    try:
+        path = write_agent_identity(name, identity)
+    except Exception as e:
+        return {"registered": False, "error": f"Failed to write identity: {e}"}
+
+    return {"registered": True, "name": name, "path": str(path)}
+
