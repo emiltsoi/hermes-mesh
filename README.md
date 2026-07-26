@@ -123,16 +123,176 @@ export TELEGRAM_HOME_CHANNEL=...        # Where floats go
 `A2A_*` names (`A2A_AGENT_NAME`, `A2A_WEBHOOK_DELIVERY_RETRIES`, etc.) are
 still accepted as fallbacks for backward compatibility.
 
-## CTA Protocol
+## Use Cases
 
-Messages carry a 2D Call To Action in the header:
+All of these patterns are powered by `mesh_send` — the session relay tool that delivers a message into a target agent's live conversation context with full thread continuity. No polling, no separate worker process, no context loss.
 
-| Field  | Values | Meaning |
-|--------|--------|---------|
-| action | `do`   | Recipient should take action |
-|        | `info` | Informational — acknowledge |
-| reply  | `yes`  | Sender expects a reply |
-|        | `no`   | Fire-and-forget |
+### Background agents that wake on schedule
+
+You want an agent to do work while you're not watching — poll a feed, check a system, prepare a daily briefing. Most agent frameworks solve this with a separate daemon or polling loop.
+
+The Hermes mesh approach: the agent's session *is* the ambient worker. A cron job fires `mesh_send` → routes into the agent's live session → agent wakes with full context intact → acts → replies via the mesh.
+
+```
+Cron tick fires
+     │
+     ▼
+mesh_send → agent's live session
+     │
+     ▼
+Agent session wakes. Full conversation history available.
+Agent reads the mesh message, acts, replies.
+     │
+     ▼
+Reply routes back through the mesh to the caller.
+```
+
+No separate worker daemon. No polling. The agent was sleeping — its session was idle. The schedule woke it via `mesh_send`. When it finishes, it goes back to sleep. The session persists so the next wake has full context from the previous run.
+
+What this enables: daily digests compiled by 7am, monitoring agents that alert only on change, background research that accumulates context over days and delivers when ready.
+
+### Specialist chain — humans curate, agents specialize
+
+A complex task needs architecture thinking, domain discovery, and implementation planning. You could throw it all at one agent, but specialists are better.
+
+The Hermes mesh approach: talk to three different agents in sequence via `mesh_send`, each building full context independently. When you reach execution, you have three expert perspectives — not one confused generalist.
+
+```
+You → mesh_send → Isa (Discovery)
+     ← structured findings with full codebase context
+
+You → mesh_send → Britney (Architecture)
+     ← architecture proposal grounded in Isa's actual findings
+
+You → mesh_send → Linda (Design Review)
+     ← signed-off design with coupling and failure mode analysis
+
+You → Merge all three perspectives → Claude Code executes with full specialist context
+```
+
+Each agent maintained a fully-persistent session. Isa's context is complete — she was inside the codebase, she knows what she found and what she dismissed. Britney responds to Isa's actual findings. Linda reviews the real architecture, not a paraphrase. All routing happens via `mesh_send` through the mesh — the user never leaves their own interface.
+
+The human is the curator: deciding which specialist to consult, in what order, when to stop prep and start executing.
+
+What this enables: multi-domain tasks handled by actual specialists rather than a single LLM acting as all of them, quality-gated workflows where each specialist signs off before the next stage, reduced hallucination because each specialist's claims are grounded in their own exploration.
+
+### Specialist injection — agents loop in specialists mid-chain
+
+During any relay chain, an agent can pull in a specialist via `mesh_send` without restarting or losing context. The chain pauses, the specialist responds, their output flows back in, the chain continues.
+
+```
+Britney → mesh_send → Linda (design review)
+    │
+    Linda detects a coupling issue that spans Isa's domain
+    │
+    Linda → mesh_send → Isa: "What's the import graph for module X?"
+    Isa responds with the graph
+    │
+    Linda folds Isa's data into the review
+    Linda → mesh_send → Britney: "Approved, with one routing change"
+```
+
+The human didn't know to call Isa — Linda did it because the mesh discipline says: wrong domain, route first. No context loss, no chain restart, no paraphrase. The specialist consultation is invisible to the caller.
+
+What this enables: agents that self-correct by consulting the right specialist when they hit a domain boundary, chains that get smarter as they run without human intervention, context that flows through the right expert regardless of who initiated the chain.
+
+### Parallel specialist prep — all at once, not one at a time
+
+Same result as the specialist chain, but run in parallel instead of sequence. All three calls to `mesh_send` fire simultaneously — each agent works in isolation with a complete session, none waiting for the others.
+
+```
+You → mesh_send → Isa (discovery)    ─┐
+You → mesh_send → Britney (arch)     ─┤
+You → mesh_send → Linda (review)     ─┘
+     All three act in parallel
+     │
+     ▼
+You receive three independent, fully-contextual responses
+Merge → Claude Code executes
+```
+
+Each agent had an uninterrupted, complete session. None of them know about the others until you merge the outputs. The context never got diluted by multitasking — every specialist worked in isolation and delivered a finished result.
+
+What this enables: same quality as sequential specialist prep in a fraction of the time, agents that work at their own pace without blocking each other, human curator assembles the final output from complete specialist perspectives rather than watching a generalist try to do three things at once.
+
+## The Mesh: Session-Aware Fleet Messaging
+
+This is the main thing that makes Hermes fleets different from standard A2A.
+
+**Standard A2A is orchestration:** one agent delegates a task to another, gets a result back, continues. The relationship is client → worker. Context doesn't persist between turns.
+
+**Hermes mesh is teamwork:** agents hold conversations across sessions, preserve sender context (sender name, message ID being replied to), and route replies through the mesh by convention. Britney can ask Linda a question mid-dispatch and get a threaded reply back — when both agents follow the mesh discipline documented below.
+
+`mesh_send` is the mesh bridge. The envelope carries sender context — sender name and the message ID being replied to — so the recipient's LLM sees exactly who asked and what they're responding to. Thread continuity within the mesh is preserved by agent discipline, not protocol enforcement: agents agree to route replies through `mesh_send` back to the sender. This is intentional — convention-based coordination lets agents exercise judgment rather than follow mechanical rules. The fleet's organic interactions (escalation instead of reflex-loop, context-aware routing) emerge from this flexibility.
+
+**In a multi-owner or adversarial deployment, this model is insufficient.** A protocol-level mechanism would be needed. `X-Fleet-Hops` (for 1-1 task exchange) could address reflexive loops there; mesh multi-party discussions have no loop problem since each agent routes independently.
+
+This is not a webhook relay. It's a session-to-session handoff where the envelope does the routing work.
+
+**What this enables:**
+- Agents that work as a team, not just a delegation chain
+- Cross-fleet coordination without either side needing to know internal topology
+- Thread-preserving conversations between agents that outlive a single task
+- Mesh discipline: domain routing, reply accountability, full context preserved
+
+**Google A2A compatibility** is available from the separate [hermes-agent-a2a](https://github.com/emiltsoi/hermes-agent-a2a) plugin — it provides standard A2A JSON-RPC for external agent onboarding. But the mesh session relay is what you can't get elsewhere.
+
+### Mesh Discipline: The CTA Protocol
+
+Every `mesh_send` carries a **CTA** (Call To Action) that tells the recipient what to do with it:
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `action` | `do` \| `info` | `do`: act on this message. `info`: log/acknowledge only |
+| `reply` | `yes` \| `no` | `yes`: sender expects a reply. `no`: fire-and-forget |
+
+**Combinations:**
+- `action=do + reply=yes`: take action, then reply with result
+- `action=do + reply=no`: act on it, no reply needed
+- `action=info + reply=yes`: acknowledge and reply when done processing
+- `action=info + reply=no`: acknowledge only, no reply needed
+
+**Reply rule:** All mesh replies use `mesh_send` back to the originating peer — not a plain Telegram DM or platform DM. Plain DMs break thread continuity. The mesh handles the return path.
+
+**Agent prompt for mesh discipline:**
+
+> When you receive a mesh message:
+> 1. Read the CTA — `action` tells you what to do, `reply` tells you whether to respond
+> 2. If `reply=yes`: respond via `mesh_send` back to the sender, using the same message ID as a reference (`ref` field)
+> 3. Never reply via plain Telegram DM or platform DM — always route through the mesh so the reply carries your full context and reaches the correct thread
+> 4. If you need to route the message to another agent first (wrong domain), do so immediately — don't hold it
+> 5. If the CTA is ambiguous, reply=yes is the safe default
+
+**Example — Britney dispatches to Linda:**
+
+```python
+mesh_send(
+    message="Linda, review PR #123 before I merge. Link: https://github.com/...",
+    agent="linda",
+    action="do",
+    reply="yes"
+)
+# Linda's session receives it attributed to Britney.
+# Linda's reply routes back through the mesh to Britney's session.
+```
+
+**Example — Linda acknowledges without replying:**
+
+```python
+mesh_send(
+    message="Routing to Britney — she owns SWE dispatch.",
+    agent="britney",
+    action="info",
+    reply="no"
+)
+# Britney receives the update; Linda has already forwarded.
+```
+
+### Session Float via Webhook Delivery
+
+The primary session relay mechanism is webhook delivery: `mesh_send` POSTs the `[mesh]` envelope to the target agent's `hermes_webhook` URL (e.g. `http://.../mesh/receive`), HMAC-SHA256 signed with the **sender's** own secret. The target gateway receives the webhook on its `mesh` platform adapter and routes it into the configured session. This works without any extra hook handler registered.
+
+`hermes-mesh` also sends a best-effort Telegram float to the sender's `TELEGRAM_HOME_CHANNEL` when `TELEGRAM_BOT_TOKEN` is set. The float is fire-and-forget; the tool result reflects the webhook delivery status, not the float.
 
 ## Relationship to hermes-agent-a2a
 
