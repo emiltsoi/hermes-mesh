@@ -32,7 +32,14 @@ except ImportError:
 
 from .identity import get_raw_agent_identity
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    coerce_plaintext_gateway_command,
+)
+from gateway.session import build_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +185,8 @@ class MeshAdapter(BasePlatformAdapter):
         self._dm_policy: str = "allowlist"
         self._runner = None
         self._seen_message_ids: set[str] = set()
+        self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue()
+        self._mesh_processor: Optional[asyncio.Task] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -225,6 +234,7 @@ class MeshAdapter(BasePlatformAdapter):
             return False
 
         self._mark_connected()
+        self._mesh_processor = asyncio.create_task(self._mesh_processor_loop())
         logger.info(
             "[mesh] Listening on %s:%d — agent '%s'",
             self._host or "* (all interfaces, IPv4+IPv6)",
@@ -234,6 +244,20 @@ class MeshAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if self._mesh_processor:
+            try:
+                self._mesh_inbox.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+            try:
+                await asyncio.wait_for(self._mesh_processor, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._mesh_processor.cancel()
+                try:
+                    await self._mesh_processor
+                except asyncio.CancelledError:
+                    pass
+            self._mesh_processor = None
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -372,14 +396,58 @@ class MeshAdapter(BasePlatformAdapter):
             msg_id,
         )
 
-        task = asyncio.create_task(self.handle_message(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        await self._mesh_inbox.put(event)
 
         return web.json_response(
             {"status": "accepted", "delivery_id": msg_id},
             status=202,
         )
+
+    async def _mesh_processor_loop(self) -> None:
+        """Serialize mesh deliveries so each message gets its own gateway turn.
+
+        Without this, rapid consecutive mesh posts are queued as follow-ups
+        inside a single ``GatewayRunner._handle_message`` invocation. The
+        conversation loop then reuses the same ``GatewayStreamConsumer`` across
+        multiple assistant replies, which causes the gateway to suppress the
+        final Telegram send for every reply after the first ("final delivery
+        already confirmed").
+        """
+        while True:
+            event = await self._mesh_inbox.get()
+            if event is None:
+                self._mesh_inbox.task_done()
+                break
+            try:
+                await self._process_mesh_event(event)
+            except Exception:
+                logger.exception("[mesh] Failed to process queued message")
+            finally:
+                self._mesh_inbox.task_done()
+
+    async def _process_mesh_event(self, event: MessageEvent) -> None:
+        """Dispatch one mesh message as a fresh gateway turn."""
+        coerce_plaintext_gateway_command(event)
+        await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+        # _process_message_background expects the session guard/task ownership
+        # that handle_message() normally installs before spawning it.
+        current_task = asyncio.current_task()
+        interrupt_event = asyncio.Event()
+        self._active_sessions[session_key] = interrupt_event
+        self._session_tasks[session_key] = current_task
+        try:
+            await self._process_message_background(event, session_key)
+        finally:
+            if self._session_tasks.get(session_key) is current_task:
+                self._session_tasks.pop(session_key, None)
+            self._active_sessions.pop(session_key, None)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info for mesh sessions."""
