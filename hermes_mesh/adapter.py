@@ -184,7 +184,10 @@ class MeshAdapter(BasePlatformAdapter):
         # is an allowlist (trustworthy) rather than open/pairing.
         self._dm_policy: str = "allowlist"
         self._runner = None
-        self._seen_message_ids: set[str] = set()
+        # Ordered dict used as an insertion-ordered bounded set. Evict the
+        # oldest id when the cap is exceeded instead of nuking the whole set
+        # (which would let an attacker replay previously-seen messages).
+        self._seen_message_ids: Dict[str, None] = {}
         self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue()
         self._mesh_processor: Optional[asyncio.Task] = None
 
@@ -258,6 +261,7 @@ class MeshAdapter(BasePlatformAdapter):
                 except asyncio.CancelledError:
                     pass
             self._mesh_processor = None
+        await self.cancel_background_tasks()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -301,9 +305,9 @@ class MeshAdapter(BasePlatformAdapter):
         if msg_id in self._seen_message_ids:
             logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
             return web.json_response({"status": "duplicate"}, status=200)
-        self._seen_message_ids.add(msg_id)
-        if len(self._seen_message_ids) > 10000:
-            self._seen_message_ids.clear()
+        self._seen_message_ids[msg_id] = None
+        while len(self._seen_message_ids) > 10000:
+            self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
 
         if from_field and sender != from_field:
             logger.warning("[mesh] Envelope sender '%s' does not match body 'from' field '%s'", sender, from_field)
@@ -412,14 +416,31 @@ class MeshAdapter(BasePlatformAdapter):
         multiple assistant replies, which causes the gateway to suppress the
         final Telegram send for every reply after the first ("final delivery
         already confirmed").
+
+        Each mesh message is wrapped in its own ``asyncio.Task`` so session
+        ownership/cancellation points at the per-message task, not at the
+        long-lived processor loop. Cancelling the per-message task (e.g.
+        ``busy_input_mode=interrupt`` or ``/stop``) therefore cannot kill the
+        processor and drop the rest of the inbox queue.
         """
         while True:
             event = await self._mesh_inbox.get()
             if event is None:
                 self._mesh_inbox.task_done()
                 break
+            _task = asyncio.create_task(self._process_mesh_event(event))
             try:
-                await self._process_mesh_event(event)
+                self._background_tasks.add(_task)
+                _task.add_done_callback(self._background_tasks.discard)
+            except TypeError:
+                pass
+            try:
+                await _task
+            except asyncio.CancelledError:
+                # Distinguish "this per-message task was cancelled" from
+                # "the processor loop itself is being torn down".
+                if not _task.cancelled():
+                    break
             except Exception:
                 logger.exception("[mesh] Failed to process queued message")
             finally:
@@ -436,18 +457,23 @@ class MeshAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
-        # _process_message_background expects the session guard/task ownership
-        # that handle_message() normally installs before spawning it.
-        current_task = asyncio.current_task()
-        interrupt_event = asyncio.Event()
-        self._active_sessions[session_key] = interrupt_event
-        self._session_tasks[session_key] = current_task
+        # Use the base adapter's session-lifecycle helper. It installs the
+        # guard and spawns ``_process_message_background`` as a tracked
+        # background task; ``cancel_session_processing`` cancels the child
+        # task (not the mesh processor loop) and cleans the guard.
+        if not self._start_session_processing(event, session_key):
+            logger.warning("[mesh] Failed to start session processing for %s", session_key)
+            return
+
+        task = self._session_tasks.get(session_key)
+        if task is None:
+            return
         try:
-            await self._process_message_background(event, session_key)
-        finally:
-            if self._session_tasks.get(session_key) is current_task:
-                self._session_tasks.pop(session_key, None)
-            self._active_sessions.pop(session_key, None)
+            await task
+        except asyncio.CancelledError:
+            # Expected when a session command or ``busy_input_mode=interrupt``
+            # cancels the in-flight turn.
+            pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info for mesh sessions."""
