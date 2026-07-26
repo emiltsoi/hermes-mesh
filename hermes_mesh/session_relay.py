@@ -27,6 +27,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from . import float as _float
+from .common import transport as _transport, transport_auth_value as _transport_auth_value
 from .identity import get_raw_agent_identity, list_agents, resolve_agent as _resolve_agent_by_name, write_agent_identity
 
 logger = logging.getLogger(__name__)
@@ -102,23 +103,6 @@ def _validate_agent_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Identity helpers
 # ---------------------------------------------------------------------------
-
-def _transport(agent_info: dict, name: str) -> dict:
-    if not isinstance(agent_info, dict):
-        return {}
-    transport = agent_info.get("transports", {}).get(name, {})
-    return transport if isinstance(transport, dict) else {}
-
-
-def _transport_auth_value(transport: dict, key: str) -> str:
-    auth = transport.get("auth", {}) if isinstance(transport, dict) else {}
-    if not isinstance(auth, dict):
-        return ""
-    value = auth.get(key, "") if auth else ""
-    if value is None:
-        return ""
-    return str(value)
-
 
 def _is_local_fleet_agent(agent_name: str) -> bool:
     """Check if an agent is a local fleet agent with a valid URL."""
@@ -238,7 +222,16 @@ def _deliver_webhook(
     parsed = urlparse(url)
     host = parsed.hostname or ""
 
+    # Enforce a single total deadline across all attempts instead of letting
+    # each attempt run for the full _DELIVERY_TIMEOUT and accumulate linearly.
+    deadline = time.monotonic() + _DELIVERY_TIMEOUT
+
     for attempt in range(_DELIVERY_RETRIES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.error("Mesh relay: delivery exceeded total timeout budget")
+            return None
+
         try:
             _validate_resolved_ip(host, allow_loopback=allow_loopback)
             req = urllib.request.Request(
@@ -247,7 +240,10 @@ def _deliver_webhook(
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=_DELIVERY_TIMEOUT) as resp:
+            # Give each attempt an equal share of the remaining budget so a
+            # slow/dead target cannot consume the whole timeout on one attempt.
+            attempt_timeout = max(1.0, remaining / (_DELIVERY_RETRIES - attempt))
+            with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
                 result = json.loads(resp.read().decode())
                 delivery_id = result.get("delivery_id", "unknown")
             if attempt > 0:
@@ -257,13 +253,17 @@ def _deliver_webhook(
                 )
             return delivery_id
         except Exception as exc:
-            if attempt < _DELIVERY_RETRIES - 1:
+            remaining = deadline - time.monotonic()
+            if attempt < _DELIVERY_RETRIES - 1 and remaining > 0:
                 backoff = _DELIVERY_BACKOFF * (2 ** attempt)
-                logger.warning(
-                    "Mesh relay: delivery attempt %d/%d failed: %s, retrying in %.1fs",
-                    attempt + 1, _DELIVERY_RETRIES, exc, backoff,
-                )
-                time.sleep(backoff)
+                # Never sleep past the deadline; leave at least 1s for next attempt.
+                sleep_time = min(backoff, max(0.0, remaining - 1.0))
+                if sleep_time > 1e-3:
+                    logger.warning(
+                        "Mesh relay: delivery attempt %d/%d failed: %s, retrying in %.1fs",
+                        attempt + 1, _DELIVERY_RETRIES, exc, sleep_time,
+                    )
+                    time.sleep(sleep_time)
             else:
                 logger.error(
                     "Mesh relay: delivery failed after %d attempts: %s",
@@ -407,13 +407,13 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 # mesh_list / mesh_register tools
 # ---------------------------------------------------------------------------
 
-def handle_mesh_list(args=None, **kwargs) -> dict:
+def handle_mesh_list(args: dict | None = None, **kwargs) -> dict:
     """List all agents registered in the fleet mesh vault."""
     agents = list_agents()
     return {"agents": agents, "count": len(agents)}
 
 
-def handle_mesh_register(args=None, **kwargs) -> dict:
+def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
     """Register or update an agent identity in the fleet mesh vault.
 
     Args:
@@ -427,7 +427,7 @@ def handle_mesh_register(args=None, **kwargs) -> dict:
     merged = dict(args) if args else {}
     merged.update(kwargs)
 
-    name = merged.get("name") or __import__("os").getenv("MESH_AGENT_NAME") or __import__("os").getenv("A2A_AGENT_NAME", "")
+    name = merged.get("name") or os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "")
     url = merged.get("url", "")
     secret = merged.get("secret", "")
     role = merged.get("role", "agent")

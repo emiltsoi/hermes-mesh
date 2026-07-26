@@ -6,6 +6,7 @@ metadata envelope, and routes the message into the configured platform
 session (e.g. the local agent's Telegram DM).
 """
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -41,24 +42,9 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 
+from .common import transport as _transport, transport_auth_value as _transport_auth_value
+
 logger = logging.getLogger(__name__)
-
-
-def _transport(agent_info: dict, name: str) -> dict:
-    if not isinstance(agent_info, dict):
-        return {}
-    transport = agent_info.get("transports", {}).get(name, {})
-    return transport if isinstance(transport, dict) else {}
-
-
-def _transport_auth_value(transport: dict, key: str) -> str:
-    auth = transport.get("auth", {}) if isinstance(transport, dict) else {}
-    if not isinstance(auth, dict):
-        return ""
-    value = auth.get(key, "")
-    if value is None:
-        return ""
-    return str(value)
 
 
 # Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to bind
@@ -92,6 +78,7 @@ def check_mesh_requirements() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
 def _global_mesh_target_session() -> Optional[str]:
     """Return target_session from the global ~/.hermes/config.yaml, if any.
 
@@ -118,38 +105,6 @@ def _global_mesh_target_session() -> Optional[str]:
         return None
 
 
-def _patch_gateway_runner_authz() -> None:
-    """Work around a stale GatewayRunner method signature.
-
-    ``gateway.run:GatewayRunner`` overrides ``_get_unauthorized_dm_behavior``
-    without the ``profile`` keyword-only argument that its own
-    ``_is_user_authorized`` call site passes (``profile=source.profile``).
-    The mixin implementation already has the correct signature and uses
-    ``_adapter_dm_policy(platform, profile=profile)``. Bind it onto
-    ``GatewayRunner`` at import so unauthorized DMs do not crash the gateway.
-    """
-    try:
-        import inspect
-        from gateway.run import GatewayRunner
-        from gateway.authz_mixin import GatewayAuthorizationMixin
-    except Exception:
-        return
-
-    try:
-        sig = inspect.signature(GatewayRunner._get_unauthorized_dm_behavior)
-    except Exception:
-        return
-    if "profile" in sig.parameters:
-        return
-
-    try:
-        GatewayRunner._get_unauthorized_dm_behavior = (
-            GatewayAuthorizationMixin._get_unauthorized_dm_behavior
-        )
-    except Exception:
-        return
-
-
 class MeshAdapter(BasePlatformAdapter):
     """Receive HMAC-signed Mesh messages into a configured platform session."""
 
@@ -163,8 +118,6 @@ class MeshAdapter(BasePlatformAdapter):
     enforces_own_access_policy: bool = True
 
     def __init__(self, config: PlatformConfig):
-        # Patch stale upstream method signature before the adapter is connected.
-        _patch_gateway_runner_authz()
         super().__init__(config, Platform("mesh"))
         self._background_tasks = getattr(self, "_background_tasks", set())
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
@@ -188,7 +141,7 @@ class MeshAdapter(BasePlatformAdapter):
         # oldest id when the cap is exceeded instead of nuking the whole set
         # (which would let an attacker replay previously-seen messages).
         self._seen_message_ids: Dict[str, None] = {}
-        self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue()
+        self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue(maxsize=256)
         self._mesh_processor: Optional[asyncio.Task] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -253,7 +206,9 @@ class MeshAdapter(BasePlatformAdapter):
             except asyncio.QueueFull:
                 pass
             try:
-                await asyncio.wait_for(self._mesh_processor, timeout=5)
+                # Allow the processor to drain the inbox (including any
+                # in-flight per-message task) before cancelling it.
+                await asyncio.wait_for(self._mesh_processor, timeout=30)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._mesh_processor.cancel()
                 try:
@@ -400,7 +355,14 @@ class MeshAdapter(BasePlatformAdapter):
             msg_id,
         )
 
-        await self._mesh_inbox.put(event)
+        try:
+            self._mesh_inbox.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("[mesh] Inbox full; rejecting message %s", msg_id)
+            return web.json_response(
+                {"status": "busy", "delivery_id": msg_id},
+                status=503,
+            )
 
         return web.json_response(
             {"status": "accepted", "delivery_id": msg_id},
