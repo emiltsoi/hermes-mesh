@@ -295,8 +295,30 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     Returns:
         {task_id, state, status, delivery, agent, gateway_delivery}
     """
+    # The Hermes tool executor invokes handlers as handler(args, **kwargs) and
+    # injects runtime context (task_id, session_id, user_task, etc.) into kwargs.
+    # Those are not tool arguments. Mesh parameters come from the `args` dict;
+    # we accept non-runtime kwargs for convenience, but we must never let the
+    # framework's task_id (the conversation session id) become the mesh message
+    # id, otherwise every mesh_send in a single turn has the same id.
     merged = dict(args) if args else {}
-    merged.update(kwargs)
+    for key, value in kwargs.items():
+        if key in {
+            "task_id",
+            "session_id",
+            "user_task",
+            "tool_call_id",
+            "turn_id",
+            "api_request_id",
+            "enabled_tools",
+            "enabled_toolsets",
+            "disabled_toolsets",
+            "skip_pre_tool_call_hook",
+            "skip_tool_request_middleware",
+            "tool_request_middleware_trace",
+        }:
+            continue
+        merged.setdefault(key, value)
 
     message = merged.get("message", "")
     agent = merged.get("agent", "")
