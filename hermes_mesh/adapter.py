@@ -85,6 +85,12 @@ class MeshAdapter(BasePlatformAdapter):
     # Mesh deliveries are event-triggered; never prompt for session restoration.
     interactive_resume: bool = False
 
+    # HMAC signature verification at intake acts as an allowlist: only peers
+    # whose secret we share can reach this adapter. Tell GatewayRunner that
+    # this adapter enforces its own access policy so env allowlists do not
+    # double-deny authenticated mesh senders.
+    enforces_own_access_policy: bool = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("mesh"))
         self._background_tasks = getattr(self, "_background_tasks", set())
@@ -99,6 +105,9 @@ class MeshAdapter(BasePlatformAdapter):
             or os.getenv("MESH_AGENT_NAME")
             or os.getenv("A2A_AGENT_NAME", "hermes-agent")
         ).strip()
+        # GatewayRunner uses this to decide whether the adapter's intake gating
+        # is an allowlist (trustworthy) rather than open/pairing.
+        self._dm_policy: str = "allowlist"
         self._runner = None
         self._seen_message_ids: set[str] = set()
 
