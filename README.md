@@ -143,7 +143,23 @@ the upstream `hermes-agent` core does not include A2A support.
 
 The old plugin's `a2a_send_session_message` is the genesis of this project —
 a focused, dependency-light extraction of the only unique feature the old
-plugin had that the upstream standard doesn't cover.
+plugin had that the upstream standard doesn't cover. `hermes-mesh` carries the
+same `[mesh][from:...][to:...]` envelope, the same per-agent HMAC
+authentication, and the same shared `fleet/mesh/agents` vault that originated
+in `hermes-agent-a2a`, without the rest of the A2A protocol surface.
+
+## OpenClaw interoperability
+
+Hermes agents are not the only mesh participants. The companion
+[openclaw-mesh](https://github.com/emiltsoi/openclaw-mesh) plugin turns an
+OpenClaw agent into a full mesh peer using the same vault format, envelope
+format, and HMAC scheme.
+
+A Hermes agent can `mesh_send(agent="emts", message="...")` and an OpenClaw
+agent receives the full `[mesh]` envelope with sender identity, action, reply
+intent, and thread id. Replies flow back the same way. Both agents keep the
+session context — who asked, what they asked for, and whether a reply is
+expected — across the Hermes/OpenClaw boundary.
 
 ## License
 
