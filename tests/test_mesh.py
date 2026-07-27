@@ -103,9 +103,9 @@ class TestSEC01_EnvVarProtection:
         result = _resolve_env("plain-secret")
         assert result == "plain-secret"
 
-    def test_non_string_passes_through(self):
+    def test_non_string_coerced_to_str(self):
         result = _resolve_env(42)
-        assert result == 42
+        assert result == "42"
 
 
 class TestSEC02_AgentNameValidation:
@@ -126,9 +126,6 @@ class TestSEC02_AgentNameValidation:
             _validate_agent_name("..")
 
     def test_injection_characters_rejected(self):
-        for name in ["agent; rm -rf /", "agent\0null", "agent\nbritney", "britney]", "a"]:
-            # a is single char, still valid per our pattern
-            pass
         for name in ["agent;", "agent\nbritney", "agent]", "agent]", "linda?"]:
             with pytest.raises(ValueError):
                 _validate_agent_name(name)
@@ -161,9 +158,15 @@ class TestSSRF:
         with pytest.raises(ValueError, match="Private"):
             _validate_target_url("http://192.168.1.1/admin")
 
-    def test_allows_public_url(self):
-        url = _validate_target_url("https://example.com/api")
-        assert url == "https://example.com/api"
+    def test_allows_public_ip(self):
+        # Use a literal public IP so the test does not depend on external DNS.
+        url = _validate_target_url("https://1.1.1.1/api")
+        assert url == "https://1.1.1.1/api"
+
+    def test_blocks_172_17_private(self):
+        # 172.16.0.0/12 is private; string-prefix checks used to miss 172.17-172.31.
+        with pytest.raises(ValueError, match="Private"):
+            _validate_target_url("http://172.17.0.1/admin")
 
     def test_rejects_non_http(self):
         with pytest.raises(ValueError, match="http/https"):
@@ -213,8 +216,8 @@ class TestSessionRelay:
         assert "agent" in result["error"].lower()
 
     def test_agent_not_found(self):
-        with patch("hermes_mesh.session_relay._resolve_agent_by_name") as mock_resolve:
-            mock_resolve.return_value = None
+        with patch("hermes_mesh.session_relay.get_raw_agent_identity") as mock_raw:
+            mock_raw.return_value = None
             result = handle_mesh_send(
                 {"message": "hello", "agent": "nonexistent"}
             )
@@ -223,6 +226,7 @@ class TestSessionRelay:
 
     def test_successful_delivery(self):
         """End-to-end test of session relay delivery."""
+        import os
         import yaml
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -242,19 +246,13 @@ class TestSessionRelay:
                 yaml.safe_dump(identity, f)
 
             with (
-                patch("hermes_mesh.session_relay._resolve_agent_by_name") as mock_resolve,
+                patch.dict(os.environ, {"MESH_AGENT_NAME": "testagent"}),
                 patch("hermes_mesh.session_relay.get_raw_agent_identity") as mock_raw,
                 patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver,
                 patch("hermes_mesh.session_relay._float.send") as mock_float,
-                patch("hermes_mesh.session_relay._is_local_fleet_agent") as mock_local,
             ):
-                mock_resolve.return_value = {
-                    "name": "testagent",
-                    "a2a_url": "http://127.0.0.1:19999",
-                }
                 mock_raw.return_value = identity
                 mock_deliver.return_value = "delivery-123"
-                mock_local.return_value = True
 
                 result = handle_mesh_send(
                     {"message": "hello test", "agent": "testagent"}
@@ -361,7 +359,7 @@ class TestHMACSecretSelection:
                 return sender_identity
             return target_identity
 
-        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}),              patch("hermes_mesh.session_relay._resolve_agent_by_name", return_value=target_identity),              patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw),              patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver,              patch("hermes_mesh.session_relay._float.send"),              patch("hermes_mesh.session_relay._is_loopback", return_value=True),              patch("hermes_mesh.session_relay._is_local", return_value=False):
+        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}),              patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw),              patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver,              patch("hermes_mesh.session_relay._float.send"):
 
             result = handle_mesh_send({"message": "hi", "agent": "target"})
             assert result.get("status") == "delivered"

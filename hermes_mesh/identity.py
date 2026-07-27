@@ -50,23 +50,14 @@ def _legacy_a2a_agents_root() -> Path:
     return _fleet_root() / "a2a" / "agents"
 
 
-def _fleet_agents_root() -> Path:
-    """Return the fleet agents directory.
-
-    Prefers fleet/mesh/agents; falls back to fleet/a2a/agents for
-    backward compatibility with existing identities.
-    """
-    return _mesh_agents_root()
-
-
-def _resolve_env(value: Any) -> Any:
-    """Resolve ${ENV_VAR} interpolations in vault values.
+def _resolve_env(value: Any) -> str:
+    """Resolve ${ENV_VAR} interpolations and coerce values to strings.
 
     Raises RuntimeError if an env var is referenced but not set —
     fail-closed: never use a template string as a secret.
     """
     if not isinstance(value, str):
-        return value
+        return str(value)
     match = re.fullmatch(r"^\$\{([^}]+)\}$", value.strip())
     if match:
         env_key = match.group(1)
@@ -162,7 +153,8 @@ def list_agents() -> list[dict]:
     """Return all fleet agents from the vault (no credentials).
 
     Merges agents from both fleet/mesh/agents and the legacy
-    fleet/a2a/agents directories.
+    fleet/a2a/agents directories. Builds the public view from the
+    already-loaded identity dict so each YAML is parsed only once.
     """
     agents = []
     seen = set()
@@ -180,9 +172,17 @@ def list_agents() -> list[dict]:
             if name in seen:
                 continue
             seen.add(name)
-            resolved = resolve_agent(name)
-            if resolved:
-                agents.append(resolved)
+            a2a_url = (
+                (identity.get("transports", {}).get("hermes_webhook", {}) or {}).get("url", "")
+                or (identity.get("transports", {}).get("a2a_rpc", {}) or {}).get("url", "")
+                or identity.get("a2a_url", "")
+            )
+            agents.append({
+                "name": name,
+                "description": identity.get("description", ""),
+                "role": identity.get("role", ""),
+                "a2a_url": a2a_url,
+            })
     return agents
 
 
@@ -200,7 +200,15 @@ def write_agent_identity(agent_key: str, identity: dict, prefer_mesh: bool = Tru
     root = _mesh_agents_root() if prefer_mesh else _legacy_a2a_agents_root()
     agent_dir = root / agent_key
     agent_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(agent_dir, 0o700)
+    except OSError:
+        logger.warning("Mesh identity: could not chmod directory %s", agent_dir)
     identity_file = agent_dir / "identity.yaml"
     with open(identity_file, "w", encoding="utf-8") as f:
         yaml.safe_dump(identity, f, sort_keys=False, allow_unicode=True)
+    try:
+        os.chmod(identity_file, 0o600)
+    except OSError:
+        logger.warning("Mesh identity: could not chmod file %s", identity_file)
     return identity_file

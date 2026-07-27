@@ -15,6 +15,7 @@ import os
 import re
 import errno
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -32,6 +33,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from .identity import get_raw_agent_identity
+from .session_relay import _validate_agent_name
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -47,9 +49,9 @@ from .common import transport as _transport, transport_auth_value as _transport_
 logger = logging.getLogger(__name__)
 
 
-# Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to bind
-# BOTH address families (IPv4 + IPv6) — the portable dual-stack default.
-DEFAULT_HOST = None
+# Default bind host is loopback-only. Set ``host: 0.0.0.0`` or ``host: ::``
+# in config.yaml explicitly to bind externally.
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8645
 
 _MESH_ENVELOPE_RE = re.compile(
@@ -63,7 +65,7 @@ def _is_loopback_host(host: Optional[str]) -> bool:
     """True when `host` binds only to the local machine."""
     if not host:
         return False
-    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+    return host.strip().lower() in {"127.0.0.1", "localhost", "::1", "::"}
 
 
 def check_mesh_requirements() -> bool:
@@ -234,26 +236,54 @@ class MeshAdapter(BasePlatformAdapter):
         text = str(payload.get("text", ""))
         from_field = payload.get("from")
 
-        # C5: per-agent HMAC — verify with the sender's own webhook secret if known
+        # H4: require a replay timestamp and reject messages outside a 5-minute window.
+        timestamp_str = request.headers.get("X-Mesh-Timestamp", "")
+        try:
+            msg_ts = float(timestamp_str)
+        except (TypeError, ValueError):
+            logger.warning("[mesh] Missing or invalid X-Mesh-Timestamp header")
+            return web.json_response({"status": "unauthorized"}, status=401)
+        now = time.time()
+        if abs(now - msg_ts) > 300:
+            logger.warning("[mesh] X-Mesh-Timestamp outside replay window")
+            return web.json_response({"status": "unauthorized"}, status=401)
+
+        # S1/S2: per-agent HMAC. Require a valid, non-empty `from` field and
+        # verify the signature with the sender's own webhook secret. Never fall
+        # back to the receiver's secret: knowing the receiver's secret must not
+        # let an attacker spoof an arbitrary sender.
         provided = request.headers.get("X-Hub-Signature-256", "")
         if self._secret != "INSECURE_NO_AUTH":
-            verify_secret = self._secret
-            if from_field:
-                sender_info = get_raw_agent_identity(from_field)
-                if sender_info:
-                    sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret")
-                    if sender_secret:
-                        verify_secret = sender_secret
+            if not from_field or not isinstance(from_field, str):
+                logger.warning("[mesh] Missing sender 'from' field")
+                return web.json_response({"status": "unauthorized"}, status=401)
+            try:
+                from_field = _validate_agent_name(from_field)
+            except ValueError as exc:
+                logger.warning("[mesh] Invalid sender name: %s", exc)
+                return web.json_response({"status": "unauthorized"}, status=401)
+
+            sender_info = get_raw_agent_identity(from_field)
+            if not sender_info:
+                logger.warning("[mesh] Unknown sender '%s'", from_field)
+                return web.json_response({"status": "unauthorized"}, status=401)
+            sender_secret = _transport_auth_value(
+                _transport(sender_info, "hermes_webhook"), "secret"
+            )
+            if not sender_secret:
+                logger.warning("[mesh] Sender '%s' has no webhook secret", from_field)
+                return web.json_response({"status": "unauthorized"}, status=401)
+
             expected = "sha256=" + hmac.new(
-                verify_secret.encode(), body, hashlib.sha256
+                sender_secret.encode(), body, hashlib.sha256
             ).hexdigest()
             if not hmac.compare_digest(provided.encode(), expected.encode()):
-                logger.warning("[mesh] HMAC verification failed")
+                logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
                 return web.json_response({"status": "unauthorized"}, status=401)
 
         m = _MESH_ENVELOPE_RE.match(text)
         if not m:
-            return web.json_response({"status": "missing mesh envelope"}, status=400)
+            return web.json_response({"status": "bad request"}, status=400)
 
         sender, recipient, msg_id, action, reply, ref = m.groups()
 
@@ -265,8 +295,12 @@ class MeshAdapter(BasePlatformAdapter):
             self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
 
         if from_field and sender != from_field:
-            logger.warning("[mesh] Envelope sender '%s' does not match body 'from' field '%s'", sender, from_field)
-            return web.json_response({"status": "sender mismatch"}, status=401)
+            logger.warning(
+                "[mesh] Envelope sender '%s' does not match body 'from' field '%s'",
+                sender,
+                from_field,
+            )
+            return web.json_response({"status": "unauthorized"}, status=401)
         body_text = text[m.end():].lstrip()
 
         if recipient != self._agent_name:
@@ -275,10 +309,7 @@ class MeshAdapter(BasePlatformAdapter):
                 recipient,
                 self._agent_name,
             )
-            return web.json_response(
-                {"status": "recipient mismatch", "recipient": recipient},
-                status=404,
-            )
+            return web.json_response({"status": "not found"}, status=404)
 
         # Render the message with routing CTA so the agent sees the mesh context.
         cta = ""
@@ -391,11 +422,8 @@ class MeshAdapter(BasePlatformAdapter):
                 self._mesh_inbox.task_done()
                 break
             _task = asyncio.create_task(self._process_mesh_event(event))
-            try:
-                self._background_tasks.add(_task)
-                _task.add_done_callback(self._background_tasks.discard)
-            except TypeError:
-                pass
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
             try:
                 await _task
             except asyncio.CancelledError:
