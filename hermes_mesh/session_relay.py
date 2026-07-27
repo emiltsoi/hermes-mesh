@@ -14,21 +14,23 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import logging
 import os
 import re
 import socket
-import urllib.request
+import ssl
 import time
+import urllib.error
 import uuid
 from typing import Optional
 from urllib.parse import urlparse
 
 from . import float as _float
 from .common import transport as _transport, transport_auth_value as _transport_auth_value
-from .identity import get_raw_agent_identity, list_agents, resolve_agent as _resolve_agent_by_name, write_agent_identity
+from .identity import get_raw_agent_identity, list_agents, write_agent_identity
 
 logger = logging.getLogger(__name__)
 
@@ -36,20 +38,80 @@ logger = logging.getLogger(__name__)
 # SSRF protection (focused subset of old security.py)
 # ---------------------------------------------------------------------------
 
-_BLOCKED_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::1", "[::1]"}
-_BLOCKED_PREFIXES = ("169.254.", "0.", "127.", "10.", "172.16.", "192.168.")
-
-_LOCAL_PREFIXES = ("127.", "10.", "172.16.", "192.168.")
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_BENCHMARK = ipaddress.ip_network("198.18.0.0/15")
 
 
-def _is_loopback(url: str) -> bool:
-    host = urlparse(url).hostname or ""
-    return host.lower() in _BLOCKED_HOSTS
+def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_local: bool) -> bool:
+    """Return True when `ip_obj` must be rejected for the given policy."""
+    if allow_local:
+        if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+            return False
+    else:
+        if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+            return True
+    return (
+        ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+        or ip_obj in _CGNAT
+        or ip_obj in _BENCHMARK
+    )
 
 
-def _is_local(url: str) -> bool:
-    host = urlparse(url).hostname or ""
-    return any(host.startswith(p) for p in _LOCAL_PREFIXES) or host.lower() in {"::1", "[::1]"}
+def _resolve_host(host: str) -> tuple[list[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]:
+    """Resolve a hostname and validate all returned addresses.
+
+    Returns a list of parsed IP objects plus a flag that is True when *every*
+    returned address is loopback/private/link-local. A mixed set (e.g. DNS
+    rebinding returning both 127.0.0.1 and a public IP) is treated as untrusted.
+    """
+    if not host:
+        raise ValueError("Empty host")
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve host {host}: {exc}") from exc
+    if not addrinfo:
+        raise ValueError(f"No addresses for host {host}")
+
+    ip_objs: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for _, _, _, _, sockaddr in addrinfo:
+        try:
+            ip_objs.append(ipaddress.ip_address(sockaddr[0]))
+        except ValueError:
+            continue
+    if not ip_objs:
+        raise ValueError(f"No valid IP addresses for host {host}")
+
+    all_local = all(
+        ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local for ip_obj in ip_objs
+    )
+    return ip_objs, all_local
+
+
+def _is_local_url(url: str) -> bool:
+    """Return True when the URL's host is a known local/loopback endpoint.
+
+    This is used by callers (e.g. mesh_send) to decide whether loopback/private
+    addresses are expected for a target. Literal IPs are classified with
+    ipaddress; hostnames must be localhost/loopback literals to avoid treating
+    an attacker-controlled public domain as local.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}:
+        return True
+    # Handle bracketed IPv6 and literal IPs.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ip_obj = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local)
 
 
 def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
@@ -62,16 +124,89 @@ def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
     if not url.startswith(("http://", "https://")):
         raise ValueError(f"URL must use http/https: {url}")
 
-    host = urlparse(url).hostname or ""
-    if host.lower() in _BLOCKED_HOSTS:
-        if not allow_loopback:
-            raise ValueError(f"Loopback address blocked: {host}")
-        return url
-
-    if any(host.startswith(p) for p in _BLOCKED_PREFIXES) and not allow_loopback:
-        raise ValueError(f"Private/reserved address blocked: {host}")
-
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    ip_objs, _ = _resolve_host(host)
+    for ip_obj in ip_objs:
+        if _is_ip_blocked(ip_obj, allow_local=allow_loopback):
+            if allow_loopback:
+                scope = "Private/reserved"
+            elif ip_obj.is_loopback:
+                scope = "Loopback"
+            else:
+                scope = "Private/reserved"
+            raise ValueError(f"{scope} address blocked: {ip_obj}")
     return url
+
+
+def _pinned_request(
+    url: str,
+    body: bytes,
+    headers: dict,
+    timeout: float,
+    allow_local: bool,
+) -> bytes:
+    """Make a single POST to the resolved IP while preserving SNI/Host.
+
+    This closes the DNS-rebinding/TOCTOU window: the hostname is resolved once,
+    all returned IPs are validated, and the connection is opened to one of the
+    validated IPs while the TLS certificate is still checked against the original
+    hostname. The caller is responsible for deciding whether loopback/private
+    targets are expected.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"URL must use http/https: {url}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("Empty host")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    ip_objs, _ = _resolve_host(host)
+    if not ip_objs:
+        raise ValueError(f"No valid IP addresses for host {host}")
+    for ip_obj in ip_objs:
+        if _is_ip_blocked(ip_obj, allow_local=allow_local):
+            if allow_local:
+                scope = "Private/reserved"
+            elif ip_obj.is_loopback:
+                scope = "Loopback"
+            else:
+                scope = "Private/reserved"
+            raise ValueError(f"{scope} address blocked: {ip_obj}")
+
+    resolved_ip = str(ip_objs[0])
+    host_header = host if parsed.port is None else f"{host}:{port}"
+    req_headers = dict(headers)
+    req_headers.setdefault("Host", host_header)
+
+    if parsed.scheme == "https":
+        if allow_local:
+            # Local/self-signed testing: disable verification to avoid hostname
+            # mismatch errors for 127.0.0.1 / localhost certificates.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        else:
+            context = ssl.create_default_context()
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            resolved_ip, port, timeout=timeout, context=context, server_hostname=host
+        )
+    else:
+        conn = http.client.HTTPConnection(resolved_ip, port, timeout=timeout)
+
+    try:
+        conn.request("POST", path, body=body, headers=req_headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status >= 400:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, resp)
+        return data
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -98,26 +233,6 @@ def _validate_agent_name(name: str) -> str:
             f"Allowed: a-z, 0-9, underscore, dot, hyphen, starting with alphanumeric."
         )
     return name.lower()
-
-
-# ---------------------------------------------------------------------------
-# Identity helpers
-# ---------------------------------------------------------------------------
-
-def _is_local_fleet_agent(agent_name: str) -> bool:
-    """Check if an agent is a local fleet agent with a valid URL."""
-    try:
-        from .identity import list_agents
-        agents = list_agents()
-        for agent in agents:
-            if agent.get("name", "").lower() == agent_name.lower():
-                url = agent.get("a2a_url", "")
-                if url:
-                    _validate_target_url(url, allow_loopback=True)
-                    return True
-        return False
-    except Exception:
-        return False
 
 
 def _validate_agent_webhook_config(agent_info: dict) -> tuple[bool, str]:
@@ -151,54 +266,6 @@ _DELIVERY_TIMEOUT = int(
 )
 
 
-def _validate_resolved_ip(host: str, allow_loopback: bool = False) -> str:
-    """Resolve hostname and validate all returned IPs for SSRF protection.
-
-    urllib's urlopen and asyncio TCP stacks resolve via ``getaddrinfo``,
-    which can prefer IPv6. ``socket.gethostbyname`` is IPv4-only, so a
-    clean A record plus a loopback/Private AAAA record would bypass the
-    old check. We validate every A and AAAA record here.
-    """
-    if not host:
-        raise ValueError("Empty host")
-    try:
-        addrinfo = socket.getaddrinfo(host, None)
-    except socket.gaierror as exc:
-        raise ValueError(f"Unable to resolve host {host}: {exc}") from exc
-    if not addrinfo:
-        raise ValueError(f"No addresses for host {host}")
-
-    first_ip = None
-    for _, _, _, _, sockaddr in addrinfo:
-        ip_str = sockaddr[0]
-        if first_ip is None:
-            first_ip = ip_str
-        # When the caller explicitly allows local/loopback delivery, skip
-        # the private/reserved checks entirely.
-        if allow_loopback:
-            continue
-        try:
-            ip_obj = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        if ip_obj.is_loopback:
-            raise ValueError(f"Loopback address blocked: {ip_str}")
-        # Private, link-local, multicast, reserved, unspecified, and the
-        # CGNAT (100.64.0.0/10) and benchmark (198.18.0.0/15) ranges.
-        if (
-            ip_obj.is_private
-            or ip_obj.is_link_local
-            or ip_obj.is_multicast
-            or ip_obj.is_reserved
-            or ip_obj.is_unspecified
-            or ip_obj in ipaddress.ip_network("100.64.0.0/10")
-            or ip_obj in ipaddress.ip_network("198.18.0.0/15")
-        ):
-            raise ValueError(f"Private/reserved address blocked: {ip_str}")
-
-    return first_ip or host
-
-
 def _deliver_webhook(
     url: str,
     body: str,
@@ -206,6 +273,10 @@ def _deliver_webhook(
     allow_loopback: bool = False,
 ) -> Optional[str]:
     """Deliver an HMAC-signed webhook POST with retry.
+
+    The hostname is resolved once per attempt and the connection is pinned to
+    the validated IP. This prevents DNS-rebinding / TOCTOU races where a TTL
+    flip returns a loopback/private address after validation passed.
 
     Returns the delivery_id on success, or None if all retries fail.
     """
@@ -217,10 +288,8 @@ def _deliver_webhook(
     headers = {
         "Content-Type": "application/json",
         "X-Hub-Signature-256": f"sha256={sig}",
+        "X-Mesh-Timestamp": str(time.time()),
     }
-
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
 
     # Enforce a single total deadline across all attempts instead of letting
     # each attempt run for the full _DELIVERY_TIMEOUT and accumulate linearly.
@@ -233,19 +302,18 @@ def _deliver_webhook(
             return None
 
         try:
-            _validate_resolved_ip(host, allow_loopback=allow_loopback)
-            req = urllib.request.Request(
-                url,
-                data=body.encode(),
-                headers=headers,
-                method="POST",
-            )
             # Give each attempt an equal share of the remaining budget so a
             # slow/dead target cannot consume the whole timeout on one attempt.
             attempt_timeout = max(1.0, remaining / (_DELIVERY_RETRIES - attempt))
-            with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
-                result = json.loads(resp.read().decode())
-                delivery_id = result.get("delivery_id", "unknown")
+            data = _pinned_request(
+                url,
+                body.encode(),
+                headers,
+                attempt_timeout,
+                allow_local=allow_loopback,
+            )
+            result = json.loads(data.decode())
+            delivery_id = result.get("delivery_id", "unknown")
             if attempt > 0:
                 logger.info(
                     "Mesh relay: delivery succeeded on attempt %d/%d",
@@ -338,21 +406,32 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     except ValueError as e:
         return {"error": str(e)}
 
-    # Resolve target
-    target_info = _resolve_agent_by_name(agent)
-    if not target_info:
-        return {"error": f"Agent '{agent}' not found in fleet vault"}
+    # Validate envelope fields before they are inserted into the bracket header.
+    if action not in {"do", "info"}:
+        return {"error": f"Invalid action '{action}'; must be 'do' or 'info'"}
+    if reply not in {"yes", "no"}:
+        return {"error": f"Invalid reply '{reply}'; must be 'yes' or 'no'"}
+    if ref is not None and ref != "":
+        if not isinstance(ref, str) or not re.fullmatch(r"^[A-Za-z0-9_.:-]*$", ref):
+            return {"error": "Invalid ref; must be alphanumeric, dots, dashes, underscores, colons or periods"}
+    else:
+        ref = None
 
-    # Validate webhook config
+    # Resolve target identity once (A1: get_raw_agent_identity is enough).
     raw_info = get_raw_agent_identity(agent)
     if not raw_info:
-        return {"error": f"Agent '{agent}' has no identity in fleet vault"}
+        return {"error": f"Agent '{agent}' not found in fleet vault"}
     is_valid, error = _validate_agent_webhook_config(raw_info)
     if not is_valid:
         return {"error": f"Agent '{agent}' webhook config invalid: {error}"}
 
     # Build mesh metadata header
     from_agent = os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "hermes-agent")
+    try:
+        from_agent = _validate_agent_name(from_agent)
+    except ValueError as e:
+        return {"error": f"Invalid sender name: {e}"}
+
     task_id = task_id or str(uuid.uuid4())
     header = f"[mesh][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
     if ref:
@@ -369,22 +448,24 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     if not webhook_secret:
         return {"error": "Webhook delivery failed — no shared secret"}
 
-    # M2: target_info already resolved; derive local allow from the URL itself
-    try:
-        target_url = _validate_target_url(
-            target_url,
-            allow_loopback=_is_loopback(target_url) or _is_local(target_url),
-        )
-    except ValueError as e:
-        return {"error": f"Agent '{agent}' webhook URL failed SSRF check: {e}"}
-
-    # C5: per-agent HMAC — sign with the sender's own webhook secret if available
+    # C5: per-agent HMAC — sign with the sender's own webhook secret only.
+    # Never fall back to the target's secret; that would let a sender that the
+    # receiver does not know claim an arbitrary identity.
     sender_info = get_raw_agent_identity(from_agent)
-    sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret") if sender_info else ""
-    signing_secret = sender_secret or webhook_secret
+    if not sender_info:
+        return {"error": f"Sender '{from_agent}' has no identity in fleet vault"}
+    sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret")
+    if not sender_secret:
+        return {"error": f"Sender '{from_agent}' has no webhook secret configured"}
+    signing_secret = sender_secret
 
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
-    delivery_id = _deliver_webhook(target_url, body, signing_secret, allow_loopback=_is_loopback(target_url) or _is_local(target_url))
+    delivery_id = _deliver_webhook(
+        target_url,
+        body,
+        signing_secret,
+        allow_loopback=_is_local_url(target_url),
+    )
 
     if delivery_id is None:
         return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}

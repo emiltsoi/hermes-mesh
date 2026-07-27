@@ -11,6 +11,7 @@ import html
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -30,6 +31,13 @@ def _resolve_credentials() -> tuple[str, str]:
         or os.getenv("TELEGRAM_HOME_CHANNEL", "")
     )
     return bot, chat
+
+
+def _redact(text: str, secret: str) -> str:
+    """Replace occurrences of `secret` in `text` with a placeholder."""
+    if not secret:
+        return text
+    return text.replace(secret, "<redacted>")
 
 
 def send(text: str, sender_name: str = "hermes-agent") -> None:
@@ -67,5 +75,13 @@ def send(text: str, sender_name: str = "hermes-agent") -> None:
                 logger.warning("Float delivery failed: %s", result.get("description", "unknown"))
             else:
                 logger.debug("Float sent to %s: %d chars", chat, len(text))
+    except urllib.error.HTTPError as e:
+        # HTTPError may include the full URL in its string representation,
+        # which contains the secret bot token. Log only status/reason.
+        logger.error(
+            "Float delivery error: HTTP %s %s (bot redacted)",
+            e.code,
+            e.reason,
+        )
     except Exception as e:
-        logger.error("Float delivery error: %s", e)
+        logger.error("Float delivery error: %s", _redact(str(e), bot))
