@@ -1,24 +1,35 @@
 """Tests for hermes-mesh session relay — includes SEC-01 and SEC-02 regression tests."""
+import asyncio
+import hashlib
+import hmac
 import json
 import os
+import stat
 import tempfile
+import time
+import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hermes_mesh.adapter import MeshAdapter
 from hermes_mesh.identity import (
     resolve_agent,
     get_raw_agent_identity,
     list_agents,
     _resolve_env,
+    write_agent_identity,
 )
 from hermes_mesh.session_relay import (
     handle_mesh_send,
     _validate_target_url,
     _validate_agent_webhook_config,
     _validate_agent_name,
+    _pinned_request,
 )
+from gateway.config import PlatformConfig
+from hermes_mesh import float as float_module
 
 
 class TestIdentity:
@@ -365,3 +376,238 @@ class TestHMACSecretSelection:
             assert result.get("status") == "delivered"
             mock_deliver.assert_called_once()
             assert mock_deliver.call_args[0][2] == "sender-secret"
+
+
+class TestAdapterHandleMesh:
+    """Adapter intake: replay window, envelope validation, per-agent HMAC."""
+
+    @staticmethod
+    def _make_adapter(secret="INSECURE_NO_AUTH", agent_name="ada", target_session="telegram:dm:123"):
+        return MeshAdapter(
+            PlatformConfig(
+                extra={
+                    "secret": secret,
+                    "agent_name": agent_name,
+                    "target_session": target_session,
+                }
+            )
+        )
+
+    @staticmethod
+    def _make_request(body, headers):
+        request = MagicMock()
+        request.read = AsyncMock(return_value=json.dumps(body).encode())
+        request.headers = headers
+        return request
+
+    @staticmethod
+    def _envelope(sender="ada", recipient="ADA", msg_id="testid-123", action="do", reply="yes", ref=None, body="hello"):
+        header = (
+            f"[mesh][from:{sender}][to:{recipient}][id:{msg_id}]"
+            f"[action:{action}][reply:{reply}]"
+        )
+        if ref:
+            header += f"[ref:{ref}]"
+        return f"{header} {body}"
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_lowercase_agent_name(self):
+        adapter = self._make_adapter(agent_name="ADA")
+        assert adapter._agent_name == "ada"
+
+    def test_rejects_nan_timestamp(self):
+        adapter = self._make_adapter()
+        text = self._envelope()
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": "NaN"},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 401
+
+    def test_rejects_inf_timestamp(self):
+        adapter = self._make_adapter()
+        text = self._envelope()
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": "Infinity"},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 401
+
+    def test_rejects_past_timestamp(self):
+        adapter = self._make_adapter()
+        text = self._envelope()
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time() - 500)},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 401
+
+    def test_rejects_future_timestamp(self):
+        adapter = self._make_adapter()
+        text = self._envelope()
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time() + 500)},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 401
+
+    def test_accepts_valid_timestamp(self):
+        adapter = self._make_adapter()
+        text = self._envelope()
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+
+    def test_rejects_invalid_action(self):
+        adapter = self._make_adapter()
+        text = self._envelope(action="drop-table")
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 400
+
+    def test_rejects_invalid_sender(self):
+        adapter = self._make_adapter()
+        text = self._envelope(sender="ada; rm -rf /")
+        req = self._make_request(
+            {"from": "ada; rm -rf /", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status in (400, 401)
+
+    def test_hmac_verifies_with_sender_secret(self):
+        adapter = self._make_adapter(secret="receiver-secret")
+        sender = "daji"
+        text = self._envelope(sender=sender, recipient="ada")
+        body = json.dumps({"from": sender, "text": text}, sort_keys=True).encode()
+        sig = "sha256=" + hmac.new(b"sender-secret", body, hashlib.sha256).hexdigest()
+        req = self._make_request(
+            {"from": sender, "text": text},
+            {
+                "X-Mesh-Timestamp": str(time.time()),
+                "X-Hub-Signature-256": sig,
+            },
+        )
+        with patch("hermes_mesh.adapter.get_raw_agent_identity") as mock_raw, \
+             patch("hermes_mesh.adapter._transport") as mock_transport, \
+             patch("hermes_mesh.adapter._transport_auth_value", return_value="sender-secret"):
+            mock_raw.return_value = {"id": sender}
+            mock_transport.return_value = {"auth": {"secret": "sender-secret"}}
+            resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+
+    def test_hmac_rejects_bad_signature(self):
+        adapter = self._make_adapter(secret="receiver-secret")
+        sender = "daji"
+        text = self._envelope(sender=sender, recipient="ada")
+        req = self._make_request(
+            {"from": sender, "text": text},
+            {
+                "X-Mesh-Timestamp": str(time.time()),
+                "X-Hub-Signature-256": "sha256=badcafe",
+            },
+        )
+        with patch("hermes_mesh.adapter.get_raw_agent_identity") as mock_raw, \
+             patch("hermes_mesh.adapter._transport") as mock_transport, \
+             patch("hermes_mesh.adapter._transport_auth_value", return_value="sender-secret"):
+            mock_raw.return_value = {"id": sender}
+            mock_transport.return_value = {"auth": {"secret": "sender-secret"}}
+            resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 401
+
+
+class TestPinnedRequest:
+    """_pinned_request should try every resolved IP, not just the first."""
+
+    def test_tries_multiple_resolved_ips(self):
+        import socket as _socket
+
+        addrinfo = [
+            (_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("1.2.3.4", 80)),
+            (_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("1.2.3.5", 80)),
+        ]
+
+        conn1 = MagicMock()
+        conn1.request.side_effect = ConnectionRefusedError("refused")
+        conn2 = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.reason = "OK"
+        fake_resp.headers = {}
+        fake_resp.read.return_value = b'{"status":"ok"}'
+        conn2.getresponse.return_value = fake_resp
+
+        with patch("hermes_mesh.session_relay.socket.getaddrinfo", return_value=addrinfo), \
+             patch("hermes_mesh.session_relay.http.client.HTTPConnection") as MockConn:
+            MockConn.side_effect = [conn1, conn2]
+            data = _pinned_request("http://example.com/webhook", b"body", {}, 5.0, allow_local=False)
+
+        assert data == b'{"status":"ok"}'
+        assert MockConn.call_count == 2
+        assert conn1.request.called
+        assert conn2.request.called
+
+    def test_blocks_private_ip_immediately(self):
+        import socket as _socket
+
+        addrinfo = [
+            (_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("192.168.1.1", 80)),
+        ]
+        with patch("hermes_mesh.session_relay.socket.getaddrinfo", return_value=addrinfo), \
+             patch("hermes_mesh.session_relay.http.client.HTTPConnection"):
+            with pytest.raises(ValueError, match="Private"):
+                _pinned_request("http://example.com/webhook", b"body", {}, 5.0, allow_local=False)
+
+
+class TestIdentityFilePermissions:
+    """Identity files should be 0o600 and parent directories 0o700."""
+
+    def test_write_agent_identity_sets_secure_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
+                mock_mesh.return_value = Path(tmpdir)
+                path = write_agent_identity("testagent", {"id": "testagent"})
+                assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+                assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
+
+
+class TestFloatTokenRedaction:
+    """Telegram bot token must not appear in float logs."""
+
+    def test_http_error_logs_redact_token(self, caplog):
+        with patch.dict(os.environ, {"HERMES_TELEGRAM_BOT_TOKEN": "secret-token-123", "HERMES_TELEGRAM_DEFAULT_CHAT_ID": "987654"}), \
+             patch("urllib.request.urlopen") as mock_open:
+            err = urllib.error.HTTPError(
+                "https://api.telegram.org/botsecret-token-123/sendMessage",
+                401,
+                "Forbidden",
+                None,
+                None,
+            )
+            mock_open.side_effect = err
+            with caplog.at_level("ERROR", logger="hermes_mesh.float"):
+                float_module.send("hello", sender_name="test")
+        assert "secret-token-123" not in caplog.text
+
+    def test_generic_exception_logs_redact_token(self, caplog):
+        with patch.dict(os.environ, {"HERMES_TELEGRAM_BOT_TOKEN": "secret-token-123", "HERMES_TELEGRAM_DEFAULT_CHAT_ID": "987654"}), \
+             patch("urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = Exception(
+                "failed: https://api.telegram.org/botsecret-token-123/sendMessage"
+            )
+            with caplog.at_level("ERROR", logger="hermes_mesh.float"):
+                float_module.send("hello", sender_name="test")
+        assert "secret-token-123" not in caplog.text

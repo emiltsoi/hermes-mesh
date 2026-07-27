@@ -53,6 +53,10 @@ def send(text: str, sender_name: str = "hermes-agent") -> None:
                      bool(bot), bool(chat))
         return
 
+    # NOTE: Telegram's HTTP API requires the bot token in the request path.
+    # This is a residual limitation of Telegram itself; traffic between the
+    # gateway and Telegram is HTTPS, but proxies/TLS inspection that terminate
+    # the connection can still observe the token. We redact it from logs below.
     url = f"https://api.telegram.org/bot{bot}/sendMessage"
     payload = {
         "chat_id": chat,

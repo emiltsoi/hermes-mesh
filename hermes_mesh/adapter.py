@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import errno
@@ -134,7 +135,7 @@ class MeshAdapter(BasePlatformAdapter):
             config.extra.get("agent_name")
             or os.getenv("MESH_AGENT_NAME")
             or os.getenv("A2A_AGENT_NAME", "hermes-agent")
-        ).strip()
+        ).strip().lower()
         # GatewayRunner uses this to decide whether the adapter's intake gating
         # is an allowlist (trustworthy) rather than open/pairing.
         self._dm_policy: str = "allowlist"
@@ -243,6 +244,9 @@ class MeshAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             logger.warning("[mesh] Missing or invalid X-Mesh-Timestamp header")
             return web.json_response({"status": "unauthorized"}, status=401)
+        if not math.isfinite(msg_ts):
+            logger.warning("[mesh] X-Mesh-Timestamp is NaN or infinite")
+            return web.json_response({"status": "unauthorized"}, status=401)
         now = time.time()
         if abs(now - msg_ts) > 300:
             logger.warning("[mesh] X-Mesh-Timestamp outside replay window")
@@ -286,6 +290,34 @@ class MeshAdapter(BasePlatformAdapter):
             return web.json_response({"status": "bad request"}, status=400)
 
         sender, recipient, msg_id, action, reply, ref = m.groups()
+
+        # Validate extracted envelope fields before using them in logs, headers, or metadata.
+        try:
+            sender = _validate_agent_name(sender)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid envelope sender: %s", exc)
+            return web.json_response({"status": "bad request"}, status=400)
+        try:
+            recipient = _validate_agent_name(recipient)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid envelope recipient: %s", exc)
+            return web.json_response({"status": "bad request"}, status=400)
+        if action not in {"do", "info"}:
+            logger.warning("[mesh] Invalid envelope action: %s", action)
+            return web.json_response({"status": "bad request"}, status=400)
+        if reply not in {"yes", "no"}:
+            logger.warning("[mesh] Invalid envelope reply: %s", reply)
+            return web.json_response({"status": "bad request"}, status=400)
+        _ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+        if not _ENVELOPE_TOKEN_RE.match(msg_id):
+            logger.warning("[mesh] Invalid envelope message id: %s", msg_id)
+            return web.json_response({"status": "bad request"}, status=400)
+        if ref is not None and ref != "":
+            if not _ENVELOPE_TOKEN_RE.match(ref):
+                logger.warning("[mesh] Invalid envelope ref: %s", ref)
+                return web.json_response({"status": "bad request"}, status=400)
+        else:
+            ref = None
 
         if msg_id in self._seen_message_ids:
             logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
