@@ -1,5 +1,5 @@
 name: hermes-mesh
-version: 0.1.8
+version: 0.1.9
 description: |
   Session-aware mesh relay for Hermes fleet agents.
   Registers mesh_list, mesh_register, mesh_send and a receive-side mesh platform adapter.

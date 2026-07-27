@@ -114,11 +114,17 @@ def _is_local_url(url: str) -> bool:
     return bool(ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local)
 
 
-def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
-    """Validate a target URL for SSRF protection.
+def _resolve_target_url(url: str, allow_loopback: bool = False) -> tuple[str, list[ipaddress.IPv4Address | ipaddress.IPv6Address]]:
+    """Resolve a target URL once for SSRF protection.
+
+    Returns the cleaned URL and the list of IP addresses that are allowed by
+    the given policy.  This separates resolution from connection so the same
+    getaddrinfo result can be reused across attempts, closing the DNS-rebinding
+    / TOCTOU window.
 
     Blocks loopback/non-routable addresses by default.
-    When allow_loopback=True, permits loopback and local addresses.
+    When allow_loopback=True, permits loopback and local addresses and drops
+    non-local reserved/multicast/CGNAT/benchmark addresses from the list.
     """
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
@@ -127,15 +133,27 @@ def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
     parsed = urlparse(url)
     host = parsed.hostname or ""
     ip_objs, _ = _resolve_host(host)
+    allowed: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for ip_obj in ip_objs:
         if _is_ip_blocked(ip_obj, allow_local=allow_loopback):
             if allow_loopback:
-                scope = "Private/reserved"
-            elif ip_obj.is_loopback:
+                # In loopback-allowed mode a blocked address is reserved/
+                # multicast/CGNAT/benchmark; skip it and try other addresses.
+                continue
+            if ip_obj.is_loopback:
                 scope = "Loopback"
             else:
                 scope = "Private/reserved"
             raise ValueError(f"{scope} address blocked: {ip_obj}")
+        allowed.append(ip_obj)
+    if not allowed:
+        raise ValueError(f"No valid IP addresses for host {host}")
+    return url, allowed
+
+
+def _validate_target_url(url: str, allow_loopback: bool = False) -> str:
+    """Validate a target URL for SSRF protection."""
+    url, _ = _resolve_target_url(url, allow_loopback=allow_loopback)
     return url
 
 
@@ -145,14 +163,18 @@ def _pinned_request(
     headers: dict,
     timeout: float,
     allow_local: bool,
+    resolved_ip_objs: Optional[list[ipaddress.IPv4Address | ipaddress.IPv6Address]] = None,
 ) -> bytes:
-    """Make a single POST to the resolved IP while preserving SNI/Host.
+    """Make a single POST to a resolved IP while preserving SNI/Host.
 
     This closes the DNS-rebinding/TOCTOU window: the hostname is resolved once,
     all returned IPs are validated, and the connection is opened to one of the
     validated IPs while the TLS certificate is still checked against the original
     hostname. The caller is responsible for deciding whether loopback/private
     targets are expected.
+
+    If the first resolved IP is unreachable, the remaining IPs are tried in
+    getaddrinfo order (commonly IPv6 first, then IPv4 fallback).
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -165,48 +187,55 @@ def _pinned_request(
     if parsed.query:
         path = f"{path}?{parsed.query}"
 
-    ip_objs, _ = _resolve_host(host)
-    if not ip_objs:
+    if resolved_ip_objs is None:
+        _, resolved_ip_objs = _resolve_target_url(url, allow_loopback=allow_local)
+    if not resolved_ip_objs:
         raise ValueError(f"No valid IP addresses for host {host}")
-    for ip_obj in ip_objs:
-        if _is_ip_blocked(ip_obj, allow_local=allow_local):
-            if allow_local:
-                scope = "Private/reserved"
-            elif ip_obj.is_loopback:
-                scope = "Loopback"
-            else:
-                scope = "Private/reserved"
-            raise ValueError(f"{scope} address blocked: {ip_obj}")
 
-    resolved_ip = str(ip_objs[0])
     host_header = host if parsed.port is None else f"{host}:{port}"
     req_headers = dict(headers)
     req_headers.setdefault("Host", host_header)
 
-    if parsed.scheme == "https":
-        if allow_local:
-            # Local/self-signed testing: disable verification to avoid hostname
-            # mismatch errors for 127.0.0.1 / localhost certificates.
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-        else:
-            context = ssl.create_default_context()
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-            resolved_ip, port, timeout=timeout, context=context, server_hostname=host
-        )
-    else:
-        conn = http.client.HTTPConnection(resolved_ip, port, timeout=timeout)
+    last_exc: Optional[Exception] = None
+    for ip_obj in resolved_ip_objs:
+        if _is_ip_blocked(ip_obj, allow_local=allow_local):
+            if allow_local:
+                continue
+            scope = "Loopback" if ip_obj.is_loopback else "Private/reserved"
+            raise ValueError(f"{scope} address blocked: {ip_obj}")
 
-    try:
-        conn.request("POST", path, body=body, headers=req_headers)
-        resp = conn.getresponse()
-        data = resp.read()
-        if resp.status >= 400:
-            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, resp)
-        return data
-    finally:
-        conn.close()
+        resolved_ip = str(ip_obj)
+        if parsed.scheme == "https":
+            if allow_local:
+                # Local/self-signed testing: disable verification to avoid hostname
+                # mismatch errors for 127.0.0.1 / localhost certificates.
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            else:
+                context = ssl.create_default_context()
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                resolved_ip, port, timeout=timeout, context=context, server_hostname=host
+            )
+        else:
+            conn = http.client.HTTPConnection(resolved_ip, port, timeout=timeout)
+
+        try:
+            conn.request("POST", path, body=body, headers=req_headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            if resp.status >= 400:
+                raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, resp)
+            return data
+        except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            last_exc = exc
+            continue
+        finally:
+            conn.close()
+
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError(f"Could not connect to any resolved IP for {host}")
 
 
 # ---------------------------------------------------------------------------
@@ -274,12 +303,19 @@ def _deliver_webhook(
 ) -> Optional[str]:
     """Deliver an HMAC-signed webhook POST with retry.
 
-    The hostname is resolved once per attempt and the connection is pinned to
-    the validated IP. This prevents DNS-rebinding / TOCTOU races where a TTL
-    flip returns a loopback/private address after validation passed.
+    The hostname is resolved once per delivery and the connection is pinned to
+    a validated IP. This prevents DNS-rebinding / TOCTOU races where a TTL flip
+    returns a loopback/private address after validation passed. If the first
+    resolved IP is unreachable, the remaining getaddrinfo results are tried.
 
     Returns the delivery_id on success, or None if all retries fail.
     """
+    try:
+        _, resolved_ip_objs = _resolve_target_url(url, allow_loopback=allow_loopback)
+    except ValueError as exc:
+        logger.error("Mesh relay: invalid target URL %s: %s", url, exc)
+        return None
+
     sig = hmac.new(
         secret.encode(),
         body.encode(),
@@ -311,6 +347,7 @@ def _deliver_webhook(
                 headers,
                 attempt_timeout,
                 allow_local=allow_loopback,
+                resolved_ip_objs=resolved_ip_objs,
             )
             result = json.loads(data.decode())
             delivery_id = result.get("delivery_id", "unknown")
