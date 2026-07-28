@@ -43,20 +43,19 @@ _BENCHMARK = ipaddress.ip_network("198.18.0.0/15")
 
 
 def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_local: bool) -> bool:
-    """Return True when `ip_obj` must be rejected for the given policy."""
-    if allow_local:
-        if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
-            return False
-    else:
-        if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
-            return True
-    return (
-        ip_obj.is_multicast
-        or ip_obj.is_reserved
-        or ip_obj.is_unspecified
-        or ip_obj in _CGNAT
-        or ip_obj in _BENCHMARK
-    )
+    """Return True when `ip_obj` must be rejected for the given policy.
+
+    CGNAT and benchmark ranges, reserved, multicast, and unspecified addresses
+    are always rejected — even in loopback-allowed mode — because Python's
+    `is_private` short-circuits on them otherwise.
+    """
+    if ip_obj in _CGNAT or ip_obj in _BENCHMARK:
+        return True
+    if ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
+        return True
+    if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+        return not allow_local
+    return False
 
 
 def _resolve_host(host: str) -> tuple[list[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]:

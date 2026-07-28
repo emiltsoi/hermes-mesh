@@ -321,6 +321,26 @@ intent, and thread id. Replies flow back the same way. Both agents keep the
 session context — who asked, what they asked for, and whether a reply is
 expected — across the Hermes/OpenClaw boundary.
 
+## Testing
+
+`hermes-mesh` is a Hermes plugin and its adapter imports `gateway.*` modules from the
+`hermes-agent` package. When running the test suite outside the agent repository, add
+the `hermes-agent` source tree to `PYTHONPATH`:
+
+```bash
+PYTHONPATH=/path/to/hermes-mesh:/path/to/hermes-agent pytest tests/test_mesh.py -q
+```
+
+For example, with a default install:
+
+```bash
+PYTHONPATH=/home/emil/CascadeProjects/hermes-mesh:/home/emil/.hermes/hermes-agent \
+  pytest tests/test_mesh.py -q
+```
+
+This coupling is expected while the project remains a plugin rather than a
+standalone library.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
