@@ -97,6 +97,21 @@ def _load_identity_yaml(path: Path) -> Optional[dict]:
     return raw
 
 
+def _webhook_url(identity: dict) -> str:
+    """Return the canonical mesh webhook URL for an agent identity.
+
+    Prefers the hermes_webhook transport, falls back to the legacy a2a_rpc
+    transport, and finally to the old top-level a2a_url field.
+    """
+    if not isinstance(identity, dict):
+        return ""
+    return (
+        (identity.get("transports", {}).get("hermes_webhook", {}) or {}).get("url", "")
+        or (identity.get("transports", {}).get("a2a_rpc", {}) or {}).get("url", "")
+        or identity.get("a2a_url", "")
+    )
+
+
 def _identity_file_for_agent(agent_key: str) -> Optional[Path]:
     """Return the identity.yaml path for an agent, preferring mesh over legacy a2a."""
     for root in (_mesh_agents_root(), _legacy_a2a_agents_root()):
@@ -126,11 +141,7 @@ def resolve_agent(name: str) -> Optional[dict]:
         "name": identity.get("name", ""),
         "description": identity.get("description", ""),
         "role": identity.get("role", ""),
-        "a2a_url": (
-            (identity.get("transports", {}).get("hermes_webhook", {}) or {}).get("url", "")
-            or (identity.get("transports", {}).get("a2a_rpc", {}) or {}).get("url", "")
-            or identity.get("a2a_url", "")
-        ),
+        "a2a_url": _webhook_url(identity),
     }
 
 
@@ -172,11 +183,7 @@ def list_agents() -> list[dict]:
             if name in seen:
                 continue
             seen.add(name)
-            a2a_url = (
-                (identity.get("transports", {}).get("hermes_webhook", {}) or {}).get("url", "")
-                or (identity.get("transports", {}).get("a2a_rpc", {}) or {}).get("url", "")
-                or identity.get("a2a_url", "")
-            )
+            a2a_url = _webhook_url(identity)
             agents.append({
                 "name": name,
                 "description": identity.get("description", ""),

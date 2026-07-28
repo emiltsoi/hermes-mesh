@@ -35,6 +35,7 @@ except ImportError:
 
 from .identity import get_raw_agent_identity
 from .session_relay import _validate_agent_name
+from .network import is_loopback_bind_host
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -45,7 +46,11 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 
-from .common import transport as _transport, transport_auth_value as _transport_auth_value
+from .common import (
+    transport as _transport,
+    transport_auth_value as _transport_auth_value,
+    validate_envelope_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,14 +65,6 @@ _MESH_ENVELOPE_RE = re.compile(
     r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
     r'(?:\[ref:([^\]]+)\])?\s*'
 )
-_ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-
-
-def _is_loopback_host(host: Optional[str]) -> bool:
-    """True when `host` binds only to the local machine."""
-    if not host:
-        return False
-    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
 
 
 def check_mesh_requirements() -> bool:
@@ -128,7 +125,10 @@ class MeshAdapter(BasePlatformAdapter):
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._route: str = config.extra.get("route", "receive")
-        self._secret: str = config.extra.get("secret", "")
+        # `secret` is an auth-enable sentinel, not the actual HMAC key. The
+        # actual per-sender HMAC secret is looked up from the fleet vault.
+        # Any non-empty value enables HMAC; "INSECURE_NO_AUTH" disables it.
+        self._auth_sentinel: str = str(config.extra.get("secret", ""))
         self._target_session: Optional[str] = config.extra.get("target_session")
         if not self._target_session:
             self._target_session = _global_mesh_target_session()
@@ -153,13 +153,14 @@ class MeshAdapter(BasePlatformAdapter):
             logger.error("[mesh] aiohttp is not installed")
             return False
 
-        if not self._secret:
+        if not self._auth_sentinel:
             raise ValueError(
-                "[mesh] HMAC secret is required. Set platforms.mesh.extra.secret "
-                "in config.yaml or use INSECURE_NO_AUTH for local testing."
+                "[mesh] HMAC auth sentinel is required. Set platforms.mesh.extra.secret "
+                "to any non-empty value to enable HMAC, or 'INSECURE_NO_AUTH' "
+                "for local loopback-only testing."
             )
 
-        if self._secret == "INSECURE_NO_AUTH" and not _is_loopback_host(self._host):
+        if self._auth_sentinel == "INSECURE_NO_AUTH" and not is_loopback_bind_host(self._host):
             raise ValueError(
                 f"[mesh] INSECURE_NO_AUTH is only allowed on loopback interfaces, "
                 f"not '{self._host}'."
@@ -242,86 +243,25 @@ class MeshAdapter(BasePlatformAdapter):
         text = str(payload.get("text", ""))
         from_field = payload.get("from")
 
-        # H4: require a replay timestamp and reject messages outside a 5-minute window.
-        timestamp_str = request.headers.get("X-Mesh-Timestamp", "")
-        try:
-            msg_ts = float(timestamp_str)
-        except (TypeError, ValueError):
-            logger.warning("[mesh] Missing or invalid X-Mesh-Timestamp header")
-            return web.json_response({"status": "unauthorized"}, status=401)
-        if not math.isfinite(msg_ts):
-            logger.warning("[mesh] X-Mesh-Timestamp is NaN or infinite")
-            return web.json_response({"status": "unauthorized"}, status=401)
-        now = time.time()
-        if abs(now - msg_ts) > 300:
-            logger.warning("[mesh] X-Mesh-Timestamp outside replay window")
-            return web.json_response({"status": "unauthorized"}, status=401)
+        msg_ts, err = self._validate_timestamp(request)
+        if err:
+            return err
 
-        # S1/S2: per-agent HMAC. Require a valid, non-empty `from` field and
-        # verify the signature with the sender's own webhook secret. Never fall
-        # back to the receiver's secret: knowing the receiver's secret must not
-        # let an attacker spoof an arbitrary sender.
-        provided = request.headers.get("X-Hub-Signature-256", "")
-        if self._secret != "INSECURE_NO_AUTH":
-            if not from_field or not isinstance(from_field, str):
-                logger.warning("[mesh] Missing sender 'from' field")
-                return web.json_response({"status": "unauthorized"}, status=401)
-            try:
-                from_field = _validate_agent_name(from_field)
-            except ValueError as exc:
-                logger.warning("[mesh] Invalid sender name: %s", exc)
-                return web.json_response({"status": "unauthorized"}, status=401)
+        from_field, err = self._verify_hmac(request, body, from_field)
+        if err:
+            return err
 
-            sender_info = get_raw_agent_identity(from_field)
-            if not sender_info:
-                logger.warning("[mesh] Unknown sender '%s'", from_field)
-                return web.json_response({"status": "unauthorized"}, status=401)
-            sender_secret = _transport_auth_value(
-                _transport(sender_info, "hermes_webhook"), "secret"
-            )
-            if not sender_secret:
-                logger.warning("[mesh] Sender '%s' has no webhook secret", from_field)
-                return web.json_response({"status": "unauthorized"}, status=401)
+        parsed, err = self._parse_envelope(text)
+        if err:
+            return err
 
-            expected = "sha256=" + hmac.new(
-                sender_secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(provided.encode(), expected.encode()):
-                logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
-                return web.json_response({"status": "unauthorized"}, status=401)
-
-        m = _MESH_ENVELOPE_RE.match(text)
-        if not m:
-            return web.json_response({"status": "bad request"}, status=400)
-
-        sender, recipient, msg_id, action, reply, ref = m.groups()
-
-        # Validate extracted envelope fields before using them in logs, headers, or metadata.
-        try:
-            sender = _validate_agent_name(sender)
-        except ValueError as exc:
-            logger.warning("[mesh] Invalid envelope sender: %s", exc)
-            return web.json_response({"status": "bad request"}, status=400)
-        try:
-            recipient = _validate_agent_name(recipient)
-        except ValueError as exc:
-            logger.warning("[mesh] Invalid envelope recipient: %s", exc)
-            return web.json_response({"status": "bad request"}, status=400)
-        if action not in {"do", "info"}:
-            logger.warning("[mesh] Invalid envelope action: %s", action)
-            return web.json_response({"status": "bad request"}, status=400)
-        if reply not in {"yes", "no"}:
-            logger.warning("[mesh] Invalid envelope reply: %s", reply)
-            return web.json_response({"status": "bad request"}, status=400)
-        if not _ENVELOPE_TOKEN_RE.match(msg_id):
-            logger.warning("[mesh] Invalid envelope message id: %s", msg_id)
-            return web.json_response({"status": "bad request"}, status=400)
-        if ref is not None and ref != "":
-            if not _ENVELOPE_TOKEN_RE.match(ref):
-                logger.warning("[mesh] Invalid envelope ref: %s", ref)
-                return web.json_response({"status": "bad request"}, status=400)
-        else:
-            ref = None
+        sender = parsed["sender"]
+        recipient = parsed["recipient"]
+        msg_id = parsed["msg_id"]
+        action = parsed["action"]
+        reply = parsed["reply"]
+        ref = parsed["ref"]
+        body_text = parsed["body_text"]
 
         if msg_id in self._seen_message_ids:
             logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
@@ -337,7 +277,6 @@ class MeshAdapter(BasePlatformAdapter):
                 from_field,
             )
             return web.json_response({"status": "unauthorized"}, status=401)
-        body_text = text[m.end():].lstrip()
 
         if recipient != self._agent_name:
             logger.warning(
@@ -347,14 +286,160 @@ class MeshAdapter(BasePlatformAdapter):
             )
             return web.json_response({"status": "not found"}, status=404)
 
-        # Render the message with routing CTA so the agent sees the mesh context.
+        event, err = self._build_event(
+            payload, sender, recipient, msg_id, action, reply, ref, body_text
+        )
+        if err:
+            return err
+
+        logger.info(
+            "[mesh] received from=%s to=%s action=%s reply=%s id=%s",
+            sender,
+            recipient,
+            action,
+            reply,
+            msg_id,
+        )
+
+        try:
+            self._mesh_inbox.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("[mesh] Inbox full; rejecting message %s", msg_id)
+            return web.json_response(
+                {"status": "busy", "delivery_id": msg_id},
+                status=503,
+            )
+
+        return web.json_response(
+            {"status": "accepted", "delivery_id": msg_id},
+            status=202,
+        )
+
+    def _validate_timestamp(
+        self, request: "web.Request"
+    ) -> tuple[Optional[float], Optional["web.Response"]]:
+        """Validate X-Mesh-Timestamp and reject messages outside the replay window."""
+        timestamp_str = request.headers.get("X-Mesh-Timestamp", "")
+        try:
+            msg_ts = float(timestamp_str)
+        except (TypeError, ValueError):
+            logger.warning("[mesh] Missing or invalid X-Mesh-Timestamp header")
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+        if not math.isfinite(msg_ts):
+            logger.warning("[mesh] X-Mesh-Timestamp is NaN or infinite")
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+        now = time.time()
+        if abs(now - msg_ts) > 300:
+            logger.warning("[mesh] X-Mesh-Timestamp outside replay window")
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+        return msg_ts, None
+
+    def _verify_hmac(
+        self, request: "web.Request", body: bytes, from_field: Any
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Verify the sender's HMAC signature against the sender's own secret."""
+        if self._auth_sentinel == "INSECURE_NO_AUTH":
+            return from_field, None
+
+        if not from_field or not isinstance(from_field, str):
+            logger.warning("[mesh] Missing sender 'from' field")
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        try:
+            from_field = _validate_agent_name(from_field)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid sender name: %s", exc)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        sender_info = get_raw_agent_identity(from_field)
+        if not sender_info:
+            logger.warning("[mesh] Unknown sender '%s'", from_field)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        sender_secret = _transport_auth_value(
+            _transport(sender_info, "hermes_webhook"), "secret"
+        )
+        if not sender_secret:
+            logger.warning("[mesh] Sender '%s' has no webhook secret", from_field)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        provided = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(
+            sender_secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(provided.encode(), expected.encode()):
+            logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+        return from_field, None
+
+    def _parse_envelope(self, text: str) -> tuple[Optional[dict], Optional["web.Response"]]:
+        """Parse and validate the bracketed [mesh] envelope header."""
+        m = _MESH_ENVELOPE_RE.match(text)
+        if not m:
+            return None, web.json_response({"status": "bad request"}, status=400)
+
+        sender, recipient, msg_id, action, reply, ref = m.groups()
+
+        try:
+            sender = _validate_agent_name(sender)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid envelope sender: %s", exc)
+            return None, web.json_response({"status": "bad request"}, status=400)
+        try:
+            recipient = _validate_agent_name(recipient)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid envelope recipient: %s", exc)
+            return None, web.json_response({"status": "bad request"}, status=400)
+        if action not in {"do", "info"}:
+            logger.warning("[mesh] Invalid envelope action: %s", action)
+            return None, web.json_response({"status": "bad request"}, status=400)
+        if reply not in {"yes", "no"}:
+            logger.warning("[mesh] Invalid envelope reply: %s", reply)
+            return None, web.json_response({"status": "bad request"}, status=400)
+
+        try:
+            msg_id = validate_envelope_token(msg_id)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid envelope message id: %s", exc)
+            return None, web.json_response({"status": "bad request"}, status=400)
+
+        if ref:
+            try:
+                ref = validate_envelope_token(ref)
+            except ValueError as exc:
+                logger.warning("[mesh] Invalid envelope ref: %s", exc)
+                return None, web.json_response({"status": "bad request"}, status=400)
+        else:
+            ref = None
+
+        body_text = text[m.end():].lstrip()
+        return {
+            "sender": sender,
+            "recipient": recipient,
+            "msg_id": msg_id,
+            "action": action,
+            "reply": reply,
+            "ref": ref,
+            "body_text": body_text,
+        }, None
+
+    def _build_event(
+        self,
+        payload: dict,
+        sender: str,
+        recipient: str,
+        msg_id: str,
+        action: str,
+        reply: str,
+        ref: Optional[str],
+        body_text: str,
+    ) -> tuple[Optional["MessageEvent"], Optional["web.Response"]]:
+        """Build a MessageEvent with the correct platform source and metadata."""
         cta = ""
         if action and reply:
             cta = f" [Reply via mesh to {sender} — action: {action}, reply: {reply}]"
         display_text = f"⬡ [Mesh from:{sender}] {body_text}{cta}"
 
-        # Build session source. Prefer target_session routing into an existing
-        # platform session (e.g. Telegram DM) so the agent has full context.
         if self._target_session:
             parts = self._target_session.split(":", 2)
             target_platform_str = parts[0]
@@ -368,10 +453,6 @@ class MeshAdapter(BasePlatformAdapter):
                 target_chat_type = "dm"
                 target_chat_id = parts[0]
 
-            # For DM target sessions, use the chat_id as user_id so platform
-            # env allowlists (e.g. TELEGRAM_ALLOWED_USERS) match the intended
-            # recipient. Keep the mesh sender identity in user_name and
-            # user_id_alt for logging and any downstream fallback.
             if target_chat_type == "dm":
                 user_id = target_chat_id
                 user_id_alt = f"mesh:{sender}"
@@ -412,29 +493,8 @@ class MeshAdapter(BasePlatformAdapter):
             "ref": ref,
             "message_id": msg_id,
         }
+        return event, None
 
-        logger.info(
-            "[mesh] received from=%s to=%s action=%s reply=%s id=%s",
-            sender,
-            recipient,
-            action,
-            reply,
-            msg_id,
-        )
-
-        try:
-            self._mesh_inbox.put_nowait(event)
-        except asyncio.QueueFull:
-            logger.warning("[mesh] Inbox full; rejecting message %s", msg_id)
-            return web.json_response(
-                {"status": "busy", "delivery_id": msg_id},
-                status=503,
-            )
-
-        return web.json_response(
-            {"status": "accepted", "delivery_id": msg_id},
-            status=202,
-        )
 
     async def _mesh_processor_loop(self) -> None:
         """Serialize mesh deliveries so each message gets its own gateway turn.
@@ -515,7 +575,14 @@ class MeshAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Mesh is one-way inbound; log any agent response locally."""
+        """Mesh is intentionally one-way inbound.
+
+        The mesh adapter only receives HMAC-signed messages from peers and
+        routes them into the local agent's session. Replies are not sent back
+        through the mesh automatically; the local agent must explicitly call
+        ``mesh_send`` to respond. We log the response locally and report
+        success so the gateway does not treat the no-op as a delivery failure.
+        """
         logger.info("[mesh] Response for %s: %s", chat_id, content[:200])
         return SendResult(success=True)
 
