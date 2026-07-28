@@ -29,8 +29,13 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from . import float as _float
-from .common import transport as _transport, transport_auth_value as _transport_auth_value
+from .common import (
+    transport as _transport,
+    transport_auth_value as _transport_auth_value,
+    validate_envelope_token,
+)
 from .identity import get_raw_agent_identity, list_agents, write_agent_identity
+from .network import is_local_target_host
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +47,7 @@ _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _BENCHMARK = ipaddress.ip_network("198.18.0.0/15")
 
 
-def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_local: bool) -> bool:
+def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> bool:
     """Return True when `ip_obj` must be rejected for the given policy.
 
     CGNAT and benchmark ranges, reserved, multicast, and unspecified addresses
@@ -54,17 +59,12 @@ def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, all
     if ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
         return True
     if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
-        return not allow_local
+        return not allow_loopback
     return False
 
 
-def _resolve_host(host: str) -> tuple[list[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]:
-    """Resolve a hostname and validate all returned addresses.
-
-    Returns a list of parsed IP objects plus a flag that is True when *every*
-    returned address is loopback/private/link-local. A mixed set (e.g. DNS
-    rebinding returning both 127.0.0.1 and a public IP) is treated as untrusted.
-    """
+def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a hostname and validate all returned addresses."""
     if not host:
         raise ValueError("Empty host")
     try:
@@ -83,34 +83,13 @@ def _resolve_host(host: str) -> tuple[list[ipaddress.IPv4Address | ipaddress.IPv
     if not ip_objs:
         raise ValueError(f"No valid IP addresses for host {host}")
 
-    all_local = all(
-        ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local for ip_obj in ip_objs
-    )
-    return ip_objs, all_local
+    return ip_objs
 
 
 def _is_local_url(url: str) -> bool:
-    """Return True when the URL's host is a known local/loopback endpoint.
-
-    This is used by callers (e.g. mesh_send) to decide whether loopback/private
-    addresses are expected for a target. Literal IPs are classified with
-    ipaddress; hostnames must be localhost/loopback literals to avoid treating
-    an attacker-controlled public domain as local.
-    """
+    """Return True when the URL's host is a known local/loopback/private endpoint."""
     parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return False
-    if host in {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}:
-        return True
-    # Handle bracketed IPv6 and literal IPs.
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    try:
-        ip_obj = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return bool(ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local)
+    return is_local_target_host(parsed.hostname or "")
 
 
 def _resolve_target_url(url: str, allow_loopback: bool = False) -> tuple[str, list[ipaddress.IPv4Address | ipaddress.IPv6Address]]:
@@ -131,10 +110,10 @@ def _resolve_target_url(url: str, allow_loopback: bool = False) -> tuple[str, li
 
     parsed = urlparse(url)
     host = parsed.hostname or ""
-    ip_objs, _ = _resolve_host(host)
+    ip_objs = _resolve_host(host)
     allowed: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for ip_obj in ip_objs:
-        if _is_ip_blocked(ip_obj, allow_local=allow_loopback):
+        if _is_ip_blocked(ip_obj, allow_loopback=allow_loopback):
             if allow_loopback:
                 # In loopback-allowed mode a blocked address is reserved/
                 # multicast/CGNAT/benchmark; skip it and try other addresses.
@@ -161,7 +140,7 @@ def _pinned_request(
     body: bytes,
     headers: dict,
     timeout: float,
-    allow_local: bool,
+    allow_loopback: bool,
     resolved_ip_objs: Optional[list[ipaddress.IPv4Address | ipaddress.IPv6Address]] = None,
 ) -> bytes:
     """Make a single POST to a resolved IP while preserving SNI/Host.
@@ -187,7 +166,7 @@ def _pinned_request(
         path = f"{path}?{parsed.query}"
 
     if resolved_ip_objs is None:
-        _, resolved_ip_objs = _resolve_target_url(url, allow_loopback=allow_local)
+        resolved_ip_objs = _resolve_target_url(url, allow_loopback=allow_loopback)[1]
     if not resolved_ip_objs:
         raise ValueError(f"No valid IP addresses for host {host}")
 
@@ -197,15 +176,15 @@ def _pinned_request(
 
     last_exc: Optional[Exception] = None
     for ip_obj in resolved_ip_objs:
-        if _is_ip_blocked(ip_obj, allow_local=allow_local):
-            if allow_local:
+        if _is_ip_blocked(ip_obj, allow_loopback=allow_loopback):
+            if allow_loopback:
                 continue
             scope = "Loopback" if ip_obj.is_loopback else "Private/reserved"
             raise ValueError(f"{scope} address blocked: {ip_obj}")
 
         resolved_ip = str(ip_obj)
         if parsed.scheme == "https":
-            if allow_local:
+            if allow_loopback:
                 # Local/self-signed testing: disable verification to avoid hostname
                 # mismatch errors for 127.0.0.1 / localhost certificates.
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -345,7 +324,7 @@ def _deliver_webhook(
                 body.encode(),
                 headers,
                 attempt_timeout,
-                allow_local=allow_loopback,
+                allow_loopback=allow_loopback,
                 resolved_ip_objs=resolved_ip_objs,
             )
             result = json.loads(data.decode())
@@ -448,10 +427,18 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     if reply not in {"yes", "no"}:
         return {"error": f"Invalid reply '{reply}'; must be 'yes' or 'no'"}
     if ref is not None and ref != "":
-        if not isinstance(ref, str) or not re.fullmatch(r"^[A-Za-z0-9_.:-]*$", ref):
-            return {"error": "Invalid ref; must be alphanumeric, dots, dashes, underscores, colons or periods"}
+        try:
+            ref = validate_envelope_token(ref)
+        except ValueError as e:
+            return {"error": f"Invalid ref: {e}"}
     else:
         ref = None
+
+    if task_id is not None and task_id != "":
+        try:
+            task_id = validate_envelope_token(task_id)
+        except ValueError as e:
+            return {"error": f"Invalid task_id: {e}"}
 
     # Resolve target identity once (A1: get_raw_agent_identity is enough).
     raw_info = get_raw_agent_identity(agent)

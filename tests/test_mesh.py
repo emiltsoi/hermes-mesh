@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_mesh.adapter import MeshAdapter, _is_loopback_host
+from hermes_mesh.adapter import MeshAdapter
+from hermes_mesh.network import is_loopback_bind_host
+from hermes_mesh.common import validate_envelope_token
 from hermes_mesh.identity import (
     resolve_agent,
     get_raw_agent_identity,
@@ -23,6 +25,8 @@ from hermes_mesh.identity import (
 )
 from hermes_mesh.session_relay import (
     handle_mesh_send,
+    handle_mesh_list,
+    handle_mesh_register,
     _validate_target_url,
     _validate_agent_webhook_config,
     _validate_agent_name,
@@ -138,7 +142,7 @@ class TestSEC02_AgentNameValidation:
             _validate_agent_name("..")
 
     def test_injection_characters_rejected(self):
-        for name in ["agent;", "agent\nbritney", "agent]", "agent]", "linda?"]:
+        for name in ["agent;", "agent\nbritney", "agent]", "linda?"]:
             with pytest.raises(ValueError):
                 _validate_agent_name(name)
 
@@ -191,8 +195,8 @@ class TestSSRF:
 
     def test_ip_blocked_blocks_benchmark_even_in_local_mode(self):
         import ipaddress
-        assert _is_ip_blocked(ipaddress.ip_address("198.18.0.1"), allow_local=True)
-        assert _is_ip_blocked(ipaddress.ip_address("100.64.0.1"), allow_local=True)
+        assert _is_ip_blocked(ipaddress.ip_address("198.18.0.1"), allow_loopback=True)
+        assert _is_ip_blocked(ipaddress.ip_address("100.64.0.1"), allow_loopback=True)
 
 
 class TestWebhookValidation:
@@ -393,13 +397,14 @@ class TestAdapterHandleMesh:
     """Adapter intake: replay window, envelope validation, per-agent HMAC."""
 
     @staticmethod
-    def _make_adapter(secret="INSECURE_NO_AUTH", agent_name="ada", target_session="telegram:dm:123"):
+    def _make_adapter(secret="INSECURE_NO_AUTH", agent_name="ada", target_session="telegram:dm:123", host=None):
         return MeshAdapter(
             PlatformConfig(
                 extra={
                     "secret": secret,
                     "agent_name": agent_name,
                     "target_session": target_session,
+                    "host": host,
                 }
             )
         )
@@ -547,8 +552,8 @@ class TestAdapterHandleMesh:
 
     def test_rejects_unspecified_ipv6_for_insecure_mode(self):
         # :: is the unspecified (all-interfaces) address, not loopback.
-        assert not _is_loopback_host("::")
-        assert _is_loopback_host("::1")
+        assert not is_loopback_bind_host("::")
+        assert is_loopback_bind_host("::1")
 
 
 class TestPinnedRequest:
@@ -575,7 +580,7 @@ class TestPinnedRequest:
         with patch("hermes_mesh.session_relay.socket.getaddrinfo", return_value=addrinfo), \
              patch("hermes_mesh.session_relay.http.client.HTTPConnection") as MockConn:
             MockConn.side_effect = [conn1, conn2]
-            data = _pinned_request("http://example.com/webhook", b"body", {}, 5.0, allow_local=False)
+            data = _pinned_request("http://example.com/webhook", b"body", {}, 5.0, allow_loopback=False)
 
         assert data == b'{"status":"ok"}'
         assert MockConn.call_count == 2
@@ -591,7 +596,7 @@ class TestPinnedRequest:
         with patch("hermes_mesh.session_relay.socket.getaddrinfo", return_value=addrinfo), \
              patch("hermes_mesh.session_relay.http.client.HTTPConnection"):
             with pytest.raises(ValueError, match="Private"):
-                _pinned_request("http://example.com/webhook", b"body", {}, 5.0, allow_local=False)
+                _pinned_request("http://example.com/webhook", b"body", {}, 5.0, allow_loopback=False)
 
 
 class TestIdentityFilePermissions:
@@ -633,3 +638,143 @@ class TestFloatTokenRedaction:
             with caplog.at_level("ERROR", logger="hermes_mesh.float"):
                 float_module.send("hello", sender_name="test")
         assert "secret-token-123" not in caplog.text
+
+
+class TestMeshRegister:
+    """mesh_register should create and optionally overwrite identities."""
+
+    def test_refuses_overwrite_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
+                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+                mock_mesh.return_value = Path(tmpdir)
+                mock_legacy.return_value = Path("/nonexistent/path")
+
+                handle_mesh_register({
+                    "name": "daji",
+                    "url": "http://127.0.0.1:8645/mesh/receive",
+                    "secret": "daji-secret",
+                })
+                result = handle_mesh_register({
+                    "name": "daji",
+                    "url": "http://127.0.0.1:8646/mesh/receive",
+                    "secret": "new-secret",
+                })
+                assert result["registered"] is False
+                assert "overwrite=True" in result["error"]
+
+    def test_allows_overwrite_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
+                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+                mock_mesh.return_value = Path(tmpdir)
+                mock_legacy.return_value = Path("/nonexistent/path")
+
+                handle_mesh_register({
+                    "name": "daji",
+                    "url": "http://127.0.0.1:8645/mesh/receive",
+                    "secret": "daji-secret",
+                })
+                result = handle_mesh_register({
+                    "name": "daji",
+                    "url": "http://127.0.0.1:8646/mesh/receive",
+                    "secret": "new-secret",
+                    "overwrite": True,
+                })
+                assert result["registered"] is True
+
+
+class TestEnvelopeToken:
+    """Shared envelope-token validator."""
+
+    def test_accepts_valid_tokens(self):
+        assert validate_envelope_token("msg-123") == "msg-123"
+        assert validate_envelope_token("a.b_c:1-2") == "a.b_c:1-2"
+
+    def test_rejects_empty_or_too_long(self):
+        with pytest.raises(ValueError):
+            validate_envelope_token("")
+        with pytest.raises(ValueError):
+            validate_envelope_token("x" * 129)
+
+    def test_rejects_invalid_characters(self):
+        with pytest.raises(ValueError):
+            validate_envelope_token("bad token")
+        with pytest.raises(ValueError):
+            validate_envelope_token("bad\nchar")
+
+
+class TestMeshSendValidation:
+    """handle_mesh_send validates envelope tokens including task_id."""
+
+    def test_rejects_invalid_task_id(self):
+        with pytest.raises(ValueError):
+            validate_envelope_token("bad id")
+
+    def test_uses_custom_task_id_in_envelope(self):
+        import os
+
+        target_identity = {
+            "id": "target",
+            "name": "target",
+            "transports": {
+                "hermes_webhook": {
+                    "url": "http://127.0.0.1:8645/mesh/receive",
+                    "auth": {"type": "hmac-sha256", "secret": "target-secret"},
+                },
+            },
+        }
+        sender_identity = {
+            "id": "sender",
+            "name": "sender",
+            "transports": {
+                "hermes_webhook": {
+                    "url": "http://127.0.0.1:8645/mesh/receive",
+                    "auth": {"type": "hmac-sha256", "secret": "sender-secret"},
+                },
+            },
+        }
+
+        def _raw(name):
+            if name == "sender":
+                return sender_identity
+            return target_identity
+
+        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}), \
+             patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw), \
+             patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver, \
+             patch("hermes_mesh.session_relay._float.send"):
+            result = handle_mesh_send({"message": "hi", "agent": "target", "task_id": "custom-123"})
+            assert result.get("status") == "delivered"
+            assert result.get("task_id") == "custom-123"
+            body = mock_deliver.call_args[0][1]
+            assert "[id:custom-123]" in body
+
+
+class TestMeshAdapterLifecycle:
+    """MeshAdapter send/connect behavior."""
+
+    def test_send_is_no_op(self):
+        adapter = TestAdapterHandleMesh._make_adapter()
+        result = self._run(adapter.send("mesh:sender:123", "reply text"))
+        assert result.success is True
+
+    def test_insecure_no_auth_blocks_non_loopback_bind(self):
+        with patch("hermes_mesh.adapter.web"):
+            adapter = TestAdapterHandleMesh._make_adapter(host="0.0.0.0")
+            with pytest.raises(ValueError, match="INSECURE_NO_AUTH"):
+                self._run(adapter.connect())
+
+    def test_insecure_no_auth_allows_loopback_bind(self):
+        with patch("hermes_mesh.adapter.web") as mock_web:
+            mock_web.AppRunner.return_value.setup = AsyncMock()
+            site = MagicMock()
+            site.start = AsyncMock()
+            mock_web.TCPSite.return_value = site
+            adapter = TestAdapterHandleMesh._make_adapter(host="127.0.0.1")
+            ok = self._run(adapter.connect())
+            assert ok is True
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)

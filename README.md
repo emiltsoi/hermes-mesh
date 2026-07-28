@@ -68,7 +68,7 @@ platforms:
     enabled: true
     extra:
       port: 8744
-      secret: <mesh-adapter-hmac-secret>
+      secret: true            # auth-enable sentinel; HMAC keys are per-agent in the fleet vault
       route: receive          # listens on /mesh/receive
       agent_name: agent0      # local agent name
       target_session: "telegram:dm:<chat_id>"  # optional session routing
@@ -100,6 +100,11 @@ The `hermes_webhook.url` must point at the target agent's mesh adapter
 endpoint (`/mesh/<route>`). The `hermes_webhook.auth.secret` is the
 **target's** adapter secret; messages are signed with the **sender's**
 own secret for per-agent HMAC authentication.
+
+Mesh delivery is one-way inbound into the target agent's session. If the
+agent generates a reply, the platform `send()` call is intentionally a
+no-op; the agent must explicitly call `mesh_send(agent="...", message="...")`
+to send a response back through the mesh.
 
 ### 3. Register local agents
 
