@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_mesh.adapter import MeshAdapter
+from hermes_mesh.adapter import MeshAdapter, _is_loopback_host
 from hermes_mesh.identity import (
     resolve_agent,
     get_raw_agent_identity,
@@ -27,6 +27,7 @@ from hermes_mesh.session_relay import (
     _validate_agent_webhook_config,
     _validate_agent_name,
     _pinned_request,
+    _is_ip_blocked,
 )
 from gateway.config import PlatformConfig
 from hermes_mesh import float as float_module
@@ -182,6 +183,16 @@ class TestSSRF:
     def test_rejects_non_http(self):
         with pytest.raises(ValueError, match="http/https"):
             _validate_target_url("ftp://example.com")
+
+    def test_blocks_benchmark_when_loopback_allowed(self):
+        # 198.18.0.0/15 is benchmark; it must not be treated as a local target.
+        with pytest.raises(ValueError):
+            _validate_target_url("http://198.18.0.1/admin", allow_loopback=True)
+
+    def test_ip_blocked_blocks_benchmark_even_in_local_mode(self):
+        import ipaddress
+        assert _is_ip_blocked(ipaddress.ip_address("198.18.0.1"), allow_local=True)
+        assert _is_ip_blocked(ipaddress.ip_address("100.64.0.1"), allow_local=True)
 
 
 class TestWebhookValidation:
@@ -527,6 +538,17 @@ class TestAdapterHandleMesh:
             mock_transport.return_value = {"auth": {"secret": "sender-secret"}}
             resp = self._run(adapter._handle_mesh(req))
         assert resp.status == 401
+
+    def test_rejects_non_object_json_body(self):
+        adapter = self._make_adapter()
+        req = self._make_request("plain string", {"X-Mesh-Timestamp": str(time.time())})
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 400
+
+    def test_rejects_unspecified_ipv6_for_insecure_mode(self):
+        # :: is the unspecified (all-interfaces) address, not loopback.
+        assert not _is_loopback_host("::")
+        assert _is_loopback_host("::1")
 
 
 class TestPinnedRequest:

@@ -60,13 +60,14 @@ _MESH_ENVELOPE_RE = re.compile(
     r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
     r'(?:\[ref:([^\]]+)\])?\s*'
 )
+_ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 def _is_loopback_host(host: Optional[str]) -> bool:
     """True when `host` binds only to the local machine."""
     if not host:
         return False
-    return host.strip().lower() in {"127.0.0.1", "localhost", "::1", "::"}
+    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
 
 
 def check_mesh_requirements() -> bool:
@@ -234,6 +235,10 @@ class MeshAdapter(BasePlatformAdapter):
         except json.JSONDecodeError:
             return web.json_response({"status": "invalid json"}, status=400)
 
+        if not isinstance(payload, dict):
+            logger.warning("[mesh] JSON body is not an object")
+            return web.json_response({"status": "invalid json"}, status=400)
+
         text = str(payload.get("text", ""))
         from_field = payload.get("from")
 
@@ -308,7 +313,6 @@ class MeshAdapter(BasePlatformAdapter):
         if reply not in {"yes", "no"}:
             logger.warning("[mesh] Invalid envelope reply: %s", reply)
             return web.json_response({"status": "bad request"}, status=400)
-        _ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
         if not _ENVELOPE_TOKEN_RE.match(msg_id):
             logger.warning("[mesh] Invalid envelope message id: %s", msg_id)
             return web.json_response({"status": "bad request"}, status=400)
