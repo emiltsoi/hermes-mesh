@@ -9,6 +9,7 @@ requires_env: []
 provides_tools:
   - mesh_list
   - mesh_register
+  - mesh_deregister
   - mesh_send
 provides_platforms:
   - mesh

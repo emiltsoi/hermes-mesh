@@ -247,9 +247,19 @@ class MeshAdapter(BasePlatformAdapter):
         if err:
             return err
 
-        from_field, err = self._verify_hmac(request, body, from_field)
-        if err:
-            return err
+        if self._auth_sentinel == "INSECURE_NO_AUTH":
+            pass
+        elif request.headers.get("X-Hub-Signature-256"):
+            from_field, err = self._verify_hmac(request, body, from_field)
+            if err:
+                return err
+        elif request.headers.get("X-Mesh-Signature"):
+            from_field, err = await self._verify_ed25519(request, body, from_field)
+            if err:
+                return err
+        else:
+            logger.warning("[mesh] Missing signature header")
+            return web.json_response({"status": "unauthorized"}, status=401)
 
         parsed, err = self._parse_envelope(text)
         if err:
@@ -369,6 +379,45 @@ class MeshAdapter(BasePlatformAdapter):
         ).hexdigest()
         if not hmac.compare_digest(provided.encode(), expected.encode()):
             logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+        return from_field, None
+
+    async def _verify_ed25519(
+        self, request: "web.Request", body: bytes, from_field: Any
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Verify the sender's Ed25519 signature using the registry."""
+        if not from_field or not isinstance(from_field, str):
+            logger.warning("[mesh] Missing sender 'from' field")
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        try:
+            from_field = _validate_agent_name(from_field)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid sender name: %s", exc)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        from . import registry_bridge as _registry_bridge
+
+        if not _registry_bridge.MESH_PEER_REGISTRY_AVAILABLE:
+            logger.warning(
+                "[mesh] Ed25519 signature received but mesh-peer-registry is not installed"
+            )
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        try:
+            ok, err = await asyncio.to_thread(
+                _registry_bridge.verify_ed25519_signature,
+                dict(request.headers),
+                body,
+                from_field,
+                self.config.extra,
+            )
+        except Exception as exc:
+            logger.warning("[mesh] Ed25519 verification error: %s", exc)
+            return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        if not ok:
+            logger.warning("[mesh] Ed25519 verification failed: %s", err)
             return None, web.json_response({"status": "unauthorized"}, status=401)
         return from_field, None
 
