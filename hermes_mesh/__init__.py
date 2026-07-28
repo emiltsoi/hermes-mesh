@@ -41,7 +41,12 @@ def _json_dump_handler(handler):
 
 def register(ctx) -> None:
     """Register the mesh tools and platform adapter with Hermes."""
-    from .session_relay import handle_mesh_list, handle_mesh_register, handle_mesh_send
+    from .session_relay import (
+        handle_mesh_deregister,
+        handle_mesh_list,
+        handle_mesh_register,
+        handle_mesh_send,
+    )
 
     ctx.register_tool(
         name="mesh_list",
@@ -97,10 +102,33 @@ def register(ctx) -> None:
                         "default": False,
                     },
                 },
-                "required": ["url", "secret"],
+                "required": ["url"],
             },
         },
         handler=_json_dump_handler(handle_mesh_register),
+    )
+
+    ctx.register_tool(
+        name="mesh_deregister",
+        toolset="mesh",
+        schema={
+            "name": "mesh_deregister",
+            "description": (
+                "Deregister an agent from the fleet mesh vault or registry. "
+                "Requires name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Agent name (defaults to MESH_AGENT_NAME env var)",
+                    },
+                },
+                "required": [],
+            },
+        },
+        handler=_json_dump_handler(handle_mesh_deregister),
     )
 
     ctx.register_tool(

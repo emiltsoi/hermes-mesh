@@ -276,15 +276,19 @@ _DELIVERY_TIMEOUT = int(
 def _deliver_webhook(
     url: str,
     body: str,
-    secret: str,
+    signing_material: str,
+    *,
     allow_loopback: bool = False,
+    auth_type: str = "hmac-sha256",
 ) -> Optional[str]:
-    """Deliver an HMAC-signed webhook POST with retry.
+    """Deliver a signed webhook POST with retry.
 
-    The hostname is resolved once per delivery and the connection is pinned to
-    a validated IP. This prevents DNS-rebinding / TOCTOU races where a TTL flip
-    returns a loopback/private address after validation passed. If the first
-    resolved IP is unreachable, the remaining getaddrinfo results are tried.
+    Supports HMAC-SHA256 (auth_type='hmac-sha256') and Ed25519
+    (auth_type='ed25519'). The hostname is resolved once per delivery and the
+    connection is pinned to a validated IP. This prevents DNS-rebinding /
+    TOCTOU races where a TTL flip returns a loopback/private address after
+    validation passed. If the first resolved IP is unreachable, the remaining
+    getaddrinfo results are tried.
 
     Returns the delivery_id on success, or None if all retries fail.
     """
@@ -294,16 +298,23 @@ def _deliver_webhook(
         logger.error("Mesh relay: invalid target URL %s: %s", url, exc)
         return None
 
-    sig = hmac.new(
-        secret.encode(),
-        body.encode(),
-        hashlib.sha256,
-    ).hexdigest()
+    timestamp = str(time.time())
     headers = {
         "Content-Type": "application/json",
-        "X-Hub-Signature-256": f"sha256={sig}",
-        "X-Mesh-Timestamp": str(time.time()),
+        "X-Mesh-Timestamp": timestamp,
     }
+    if auth_type == "ed25519":
+        from .registry_bridge import sign_message as _ed25519_sign
+
+        sig = _ed25519_sign(signing_material, body.encode())
+        headers["X-Mesh-Signature"] = sig
+    else:
+        sig = hmac.new(
+            signing_material.encode(),
+            body.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        headers["X-Hub-Signature-256"] = f"sha256={sig}"
 
     # Enforce a single total deadline across all attempts instead of letting
     # each attempt run for the full _DELIVERY_TIMEOUT and accumulate linearly.
@@ -440,14 +451,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         except ValueError as e:
             return {"error": f"Invalid task_id: {e}"}
 
-    # Resolve target identity once (A1: get_raw_agent_identity is enough).
-    raw_info = get_raw_agent_identity(agent)
-    if not raw_info:
-        return {"error": f"Agent '{agent}' not found in fleet vault"}
-    is_valid, error = _validate_agent_webhook_config(raw_info)
-    if not is_valid:
-        return {"error": f"Agent '{agent}' webhook config invalid: {error}"}
-
     # Build mesh metadata header
     from_agent = os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "hermes-agent")
     try:
@@ -462,32 +465,58 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     padded_message = f"{header} {message}"
 
     # Part 1: Webhook to target
-    webhook = _transport(raw_info, "hermes_webhook")
-    target_url = webhook.get("url", "")
-    webhook_secret = _transport_auth_value(webhook, "secret")
+    from . import registry_bridge as _registry_bridge
 
-    if not target_url:
-        return {"error": f"Agent '{agent}' has no webhook URL in vault"}
-    if not webhook_secret:
-        return {"error": "Webhook delivery failed — no shared secret"}
+    if _registry_bridge.identity_source() == "registry":
+        target = _registry_bridge.resolve_target(agent)
+        if not target:
+            return {"error": f"Agent '{agent}' not found in registry"}
+        target_url = target.get("url", "")
+        auth = target.get("auth", {})
+        if not target_url:
+            return {"error": f"Agent '{agent}' has no webhook URL in registry"}
+        if auth.get("type") != "ed25519" or not auth.get("public_key"):
+            return {"error": f"Agent '{agent}' has no Ed25519 public key in registry"}
+        signing_material, auth_type, _ = _registry_bridge.resolve_sender(from_agent)
+        if not signing_material or auth_type != "ed25519":
+            return {"error": f"Sender '{from_agent}' has no Ed25519 private key"}
+    else:
+        # File / legacy HMAC path
+        raw_info = get_raw_agent_identity(agent)
+        if not raw_info:
+            return {"error": f"Agent '{agent}' not found in fleet vault"}
+        is_valid, error = _validate_agent_webhook_config(raw_info)
+        if not is_valid:
+            return {"error": f"Agent '{agent}' webhook config invalid: {error}"}
 
-    # C5: per-agent HMAC — sign with the sender's own webhook secret only.
-    # Never fall back to the target's secret; that would let a sender that the
-    # receiver does not know claim an arbitrary identity.
-    sender_info = get_raw_agent_identity(from_agent)
-    if not sender_info:
-        return {"error": f"Sender '{from_agent}' has no identity in fleet vault"}
-    sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret")
-    if not sender_secret:
-        return {"error": f"Sender '{from_agent}' has no webhook secret configured"}
-    signing_secret = sender_secret
+        webhook = _transport(raw_info, "hermes_webhook")
+        target_url = webhook.get("url", "")
+        webhook_secret = _transport_auth_value(webhook, "secret")
+
+        if not target_url:
+            return {"error": f"Agent '{agent}' has no webhook URL in vault"}
+        if not webhook_secret:
+            return {"error": "Webhook delivery failed — no shared secret"}
+
+        # C5: per-agent HMAC — sign with the sender's own webhook secret only.
+        # Never fall back to the target's secret; that would let a sender that the
+        # receiver does not know claim an arbitrary identity.
+        sender_info = get_raw_agent_identity(from_agent)
+        if not sender_info:
+            return {"error": f"Sender '{from_agent}' has no identity in fleet vault"}
+        sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret")
+        if not sender_secret:
+            return {"error": f"Sender '{from_agent}' has no webhook secret configured"}
+        signing_material = sender_secret
+        auth_type = "hmac-sha256"
 
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
     delivery_id = _deliver_webhook(
         target_url,
         body,
-        signing_secret,
+        signing_material,
         allow_loopback=_is_local_url(target_url),
+        auth_type=auth_type,
     )
 
     if delivery_id is None:
@@ -512,22 +541,29 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 # ---------------------------------------------------------------------------
 
 def handle_mesh_list(args: dict | None = None, **kwargs) -> dict:
-    """List all agents registered in the fleet mesh vault."""
+    """List all agents registered in the fleet mesh vault or registry."""
+    from . import registry_bridge as _registry_bridge
+
+    if _registry_bridge.identity_source() == "registry":
+        agents = _registry_bridge.list_peers()
+        return {"agents": agents, "count": len(agents)}
     agents = list_agents()
     return {"agents": agents, "count": len(agents)}
 
 
 def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
-    """Register or update an agent identity in the fleet mesh vault.
+    """Register or update an agent identity in the fleet mesh vault or registry.
 
     Args:
         name: Agent name (defaults to MESH_AGENT_NAME env var).
         url: Hermes webhook URL for this agent.
-        secret: Shared HMAC secret for this agent.
+        secret: Shared HMAC secret for this agent (file backend only).
         role: Optional role description (default "agent").
         description: Optional human-readable description.
         overwrite: Whether to overwrite an existing identity (default False).
     """
+    from . import registry_bridge as _registry_bridge
+
     merged = dict(args) if args else {}
     merged.update(kwargs)
 
@@ -549,6 +585,21 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
         return {"error": "'url' is required"}
     if not url.startswith(("http://", "https://")):
         return {"error": f"URL must use http/https: {url}"}
+
+    if _registry_bridge.identity_source() == "registry":
+        if not overwrite:
+            try:
+                existing = _registry_bridge.resolve_target(name)
+            except Exception:
+                existing = None
+            if existing:
+                return {"registered": False, "error": f"Agent '{name}' already exists; set overwrite=True to replace"}
+        try:
+            _registry_bridge.register_peer(name, url, role, description)
+        except Exception as e:
+            return {"registered": False, "error": f"Failed to register on registry: {e}"}
+        return {"registered": True, "name": name, "source": "registry"}
+
     if not secret:
         return {"error": "'secret' is required for HMAC webhook auth"}
 
@@ -573,4 +624,43 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
         return {"registered": False, "error": f"Failed to write identity: {e}"}
 
     return {"registered": True, "name": name, "path": str(path)}
+
+
+def handle_mesh_deregister(args: dict | None = None, **kwargs) -> dict:
+    """Deregister an agent from the fleet mesh vault or registry.
+
+    Args:
+        name: Agent name (defaults to MESH_AGENT_NAME env var).
+    """
+    from . import registry_bridge as _registry_bridge
+
+    merged = dict(args) if args else {}
+    merged.update(kwargs)
+
+    name = merged.get("name") or os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "")
+    if not name:
+        return {"error": "'name' is required (or set MESH_AGENT_NAME)"}
+    try:
+        name = _validate_agent_name(name)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    if _registry_bridge.identity_source() == "registry":
+        try:
+            _registry_bridge.deregister_peer(name)
+        except Exception as e:
+            return {"deregistered": False, "error": f"Failed to deregister from registry: {e}"}
+        return {"deregistered": True, "name": name, "source": "registry"}
+
+    import shutil
+    from .identity import _mesh_agents_root
+
+    agent_dir = _mesh_agents_root() / name
+    if not agent_dir.exists():
+        return {"deregistered": False, "error": f"Agent '{name}' not found in fleet vault"}
+    try:
+        shutil.rmtree(agent_dir)
+    except Exception as e:
+        return {"deregistered": False, "error": f"Failed to remove identity: {e}"}
+    return {"deregistered": True, "name": name, "path": str(agent_dir)}
 

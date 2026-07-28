@@ -35,6 +35,8 @@ from hermes_mesh.session_relay import (
 )
 from gateway.config import PlatformConfig
 from hermes_mesh import float as float_module
+from hermes_mesh import signatures as signatures_module
+from hermes_mesh.registry_client import PeerInfo, RegistryClient
 
 
 class TestIdentity:
@@ -778,3 +780,138 @@ class TestMeshAdapterLifecycle:
     @staticmethod
     def _run(coro):
         return asyncio.run(coro)
+
+
+class TestEd25519Signatures:
+    """Ed25519 key generation, signing, and verification."""
+
+    def test_generate_keypair(self):
+        private, public = signatures_module.generate_keypair()
+        assert "BEGIN PRIVATE KEY" in private
+        assert "BEGIN PUBLIC KEY" in public
+
+    def test_sign_and_verify(self):
+        private, public = signatures_module.generate_keypair()
+        message = "hello mesh"
+        sig = signatures_module.sign_message(private, message)
+        assert signatures_module.verify_message(public, message, sig)
+
+    def test_verify_fails_for_wrong_key(self):
+        private, public = signatures_module.generate_keypair()
+        _, wrong_public = signatures_module.generate_keypair()
+        sig = signatures_module.sign_message(private, "hello")
+        assert not signatures_module.verify_message(wrong_public, "hello", sig)
+
+    def test_verify_fails_for_tampered_message(self):
+        private, public = signatures_module.generate_keypair()
+        sig = signatures_module.sign_message(private, "hello")
+        assert not signatures_module.verify_message(public, "tampered", sig)
+
+    def test_sign_and_verify_json(self):
+        private, public = signatures_module.generate_keypair()
+        payload = {"from": "linda", "to": "britney", "id": "msg-123"}
+        sig = signatures_module.sign_json(private, payload)
+        assert signatures_module.verify_json(public, payload, sig)
+        assert not signatures_module.verify_json(public, {"from": "linda"}, sig)
+
+
+class TestRegistryClientSchema:
+    """Registry client data shape (Phase 1 stubs only)."""
+
+    def test_peer_info_from_dict(self):
+        data = {
+            "name": "britney",
+            "url": "http://127.0.0.1:8645/mesh/receive",
+            "public_key": "-----BEGIN PUBLIC KEY-----...",
+            "role": "swe",
+            "description": "Principal SWE",
+        }
+        peer = PeerInfo(**data)
+        assert peer.name == "britney"
+        assert peer.role == "swe"
+
+    def test_peer_info_defaults(self):
+        peer = PeerInfo(name="linda", url="http://...", public_key="pk")
+        assert peer.role == "agent"
+        assert peer.description == ""
+
+    def test_registry_client_stubs_raise(self):
+        client = RegistryClient("http://127.0.0.1:8646", "private-key")
+        with pytest.raises(NotImplementedError):
+            client.list_peers()
+        with pytest.raises(NotImplementedError):
+            client.resolve_peer("britney")
+
+
+class TestRegistrySend:
+    """mesh_send using mesh-peer-registry for identity and Ed25519 signing."""
+
+    def test_registry_send_signs_with_ed25519(self, tmp_path, monkeypatch):
+        import yaml
+        from mesh_peer_registry.crypto import (
+            generate_keypair,
+            verify_message,
+        )
+        from mesh_peer_registry.models import PeerInfo
+        from cryptography.hazmat.primitives import serialization
+
+        hermes_home = tmp_path
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("MESH_AGENT_NAME", "sender")
+
+        # Pre-generate sender keypair so handle_mesh_send can load it
+        private_pem, public_pem = generate_keypair()
+        key_dir = hermes_home / ".mesh" / "keys"
+        key_dir.mkdir(parents=True)
+        key_path = key_dir / "sender.pem"
+        key_path.write_text(private_pem)
+
+        # Agent config: identity_source = registry
+        config = {
+            "platforms": {
+                "mesh": {
+                    "extra": {
+                        "identity_source": "registry",
+                        "registry_url": "http://127.0.0.1:8646",
+                        "private_key_path": str(key_path),
+                    }
+                }
+            }
+        }
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump(config))
+
+        # Public key for verification
+        priv_key = serialization.load_pem_private_key(
+            private_pem.encode("utf-8"), password=None
+        )
+        sender_public = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+
+        fake_peer = PeerInfo(
+            name="target",
+            url="http://127.0.0.1:8646/mock-receive",
+            public_key=sender_public,
+        )
+
+        with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned, \
+             patch("hermes_mesh.registry_bridge.RegistryClient") as MockClient:
+            mock_pinned.return_value = b'{"delivery_id":"d1"}'
+            MockClient.return_value.get_peer.return_value = fake_peer
+
+            result = handle_mesh_send({"message": "hello registry", "agent": "target"})
+
+        assert result.get("status") == "delivered"
+        assert result.get("message_id") == "d1"
+        assert mock_pinned.call_count == 1
+
+        url, body, headers, *_ = mock_pinned.call_args[0]
+        assert url == "http://127.0.0.1:8646/mock-receive"
+        assert "hello registry" in body.decode("utf-8")
+        assert headers.get("X-Mesh-Signature")
+        assert headers.get("X-Mesh-Timestamp")
+        assert "X-Hub-Signature-256" not in headers
+
+        sig = headers["X-Mesh-Signature"]
+        assert verify_message(sender_public, body, sig)
