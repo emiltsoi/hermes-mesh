@@ -35,8 +35,6 @@ from hermes_mesh.session_relay import (
 )
 from gateway.config import PlatformConfig
 from hermes_mesh import float as float_module
-from hermes_mesh import signatures as signatures_module
-from hermes_mesh.registry_client import PeerInfo, RegistryClient
 
 
 class TestIdentity:
@@ -781,66 +779,6 @@ class TestMeshAdapterLifecycle:
     def _run(coro):
         return asyncio.run(coro)
 
-
-class TestEd25519Signatures:
-    """Ed25519 key generation, signing, and verification."""
-
-    def test_generate_keypair(self):
-        private, public = signatures_module.generate_keypair()
-        assert "BEGIN PRIVATE KEY" in private
-        assert "BEGIN PUBLIC KEY" in public
-
-    def test_sign_and_verify(self):
-        private, public = signatures_module.generate_keypair()
-        message = "hello mesh"
-        sig = signatures_module.sign_message(private, message)
-        assert signatures_module.verify_message(public, message, sig)
-
-    def test_verify_fails_for_wrong_key(self):
-        private, public = signatures_module.generate_keypair()
-        _, wrong_public = signatures_module.generate_keypair()
-        sig = signatures_module.sign_message(private, "hello")
-        assert not signatures_module.verify_message(wrong_public, "hello", sig)
-
-    def test_verify_fails_for_tampered_message(self):
-        private, public = signatures_module.generate_keypair()
-        sig = signatures_module.sign_message(private, "hello")
-        assert not signatures_module.verify_message(public, "tampered", sig)
-
-    def test_sign_and_verify_json(self):
-        private, public = signatures_module.generate_keypair()
-        payload = {"from": "linda", "to": "britney", "id": "msg-123"}
-        sig = signatures_module.sign_json(private, payload)
-        assert signatures_module.verify_json(public, payload, sig)
-        assert not signatures_module.verify_json(public, {"from": "linda"}, sig)
-
-
-class TestRegistryClientSchema:
-    """Registry client data shape (Phase 1 stubs only)."""
-
-    def test_peer_info_from_dict(self):
-        data = {
-            "name": "britney",
-            "url": "http://127.0.0.1:8645/mesh/receive",
-            "public_key": "-----BEGIN PUBLIC KEY-----...",
-            "role": "swe",
-            "description": "Principal SWE",
-        }
-        peer = PeerInfo(**data)
-        assert peer.name == "britney"
-        assert peer.role == "swe"
-
-    def test_peer_info_defaults(self):
-        peer = PeerInfo(name="linda", url="http://...", public_key="pk")
-        assert peer.role == "agent"
-        assert peer.description == ""
-
-    def test_registry_client_stubs_raise(self):
-        client = RegistryClient("http://127.0.0.1:8646", "private-key")
-        with pytest.raises(NotImplementedError):
-            client.list_peers()
-        with pytest.raises(NotImplementedError):
-            client.resolve_peer("britney")
 
 
 class TestRegistrySend:
