@@ -246,6 +246,16 @@ def list_peers(extra: dict | None = None) -> list[dict]:
     return list_agents()
 
 
+def _lower_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Return a copy of headers with lower-cased keys.
+
+    HTTP header names are case-insensitive; Node's fetch in particular sends
+    lower-case header names, so signature verification must not depend on the
+    original casing.
+    """
+    return {k.lower(): v for k, v in headers.items()}
+
+
 def verify_request_signature(
     request_headers: dict[str, str],
     body: bytes,
@@ -256,14 +266,15 @@ def verify_request_signature(
 
     Returns (from_field, "") on success or (None, error_message) on failure.
     """
-    hub_sig = request_headers.get("X-Hub-Signature-256", "")
-    mesh_sig = request_headers.get("X-Mesh-Signature", "")
+    headers = _lower_headers(request_headers)
+    hub_sig = headers.get("x-hub-signature-256", "")
+    mesh_sig = headers.get("x-mesh-signature", "")
 
     if hub_sig:
-        return _verify_hmac(request_headers, body, from_field, extra)
+        return _verify_hmac(headers, body, from_field, extra)
 
     if mesh_sig:
-        return _verify_ed25519(request_headers, body, from_field, extra)
+        return _verify_ed25519(headers, body, from_field, extra)
 
     return None, "missing signature header"
 
@@ -291,7 +302,7 @@ def _verify_hmac(
         secret.encode("utf-8"), body, hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(
-        request_headers.get("X-Hub-Signature-256", "").encode("utf-8"),
+        request_headers.get("x-hub-signature-256", "").encode("utf-8"),
         expected.encode("utf-8"),
     ):
         return None, "HMAC verification failed"
@@ -306,7 +317,8 @@ def verify_ed25519_signature(
 ) -> tuple[str | None, str]:
     """Verify an Ed25519 mesh request signature using the registry."""
     _ensure_registry()
-    timestamp_str = request_headers.get("X-Mesh-Timestamp", "")
+    headers = _lower_headers(request_headers)
+    timestamp_str = headers.get("x-mesh-timestamp", "")
     try:
         msg_ts = float(timestamp_str)
     except (TypeError, ValueError):
@@ -324,7 +336,7 @@ def verify_ed25519_signature(
     if not peer:
         return None, f"unknown sender in registry: {from_field}"
 
-    sig = request_headers.get("X-Mesh-Signature", "")
+    sig = headers.get("x-mesh-signature", "")
     if not verify_message(peer.public_key, body, sig):
         return None, "Ed25519 verification failed"
     return from_field, ""
