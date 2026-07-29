@@ -3,7 +3,9 @@
 Fire-and-forget notification to the sender's Telegram DM. Best-effort —
 failures are logged and swallowed; the tool result is the source of truth.
 
-Env var chain: HERMES_TELEGRAM_BOT_TOKEN → A2A_TELEGRAM_BOT_TOKEN → TELEGRAM_BOT_TOKEN
+Credential chain (highest to lowest priority):
+  1. config dict passed to send() / configure()
+  2. Env var chain: HERMES_TELEGRAM_BOT_TOKEN → A2A_TELEGRAM_BOT_TOKEN → TELEGRAM_BOT_TOKEN
 """
 from __future__ import annotations
 
@@ -14,19 +16,38 @@ import os
 import re
 import urllib.error
 import urllib.request
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_credentials() -> tuple[str, str]:
-    """Resolve bot_token and chat_id from env vars. Returns ("", "") if absent."""
+# Module-level config set by the platform adapter from config.extra.
+_config: dict[str, Any] = {}
+
+
+def configure(config: dict[str, Any] | None) -> None:
+    """Set module-level float config (usually platforms.mesh.extra)."""
+    global _config
+    _config = dict(config) if config else {}
+
+
+def _resolve_credentials(config: dict[str, Any] | None = None) -> tuple[str, str]:
+    """Resolve bot_token and chat_id from config then env vars.
+
+    Returns ("", "") if absent.
+    """
+    cfg = config if config is not None else _config
     bot = (
-        os.getenv("HERMES_TELEGRAM_BOT_TOKEN")
+        cfg.get("telegram_bot_token")
+        or cfg.get("bot_token")
+        or os.getenv("HERMES_TELEGRAM_BOT_TOKEN")
         or os.getenv("A2A_TELEGRAM_BOT_TOKEN")
         or os.getenv("TELEGRAM_BOT_TOKEN", "")
     )
     chat = (
-        os.getenv("HERMES_TELEGRAM_DEFAULT_CHAT_ID")
+        cfg.get("telegram_default_chat_id")
+        or cfg.get("chat_id")
+        or os.getenv("HERMES_TELEGRAM_DEFAULT_CHAT_ID")
         or os.getenv("A2A_TELEGRAM_DEFAULT_CHAT_ID")
         or os.getenv("TELEGRAM_HOME_CHANNEL", "")
     )
@@ -40,14 +61,15 @@ def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "<redacted>")
 
 
-def send(text: str, sender_name: str = "hermes-agent") -> None:
+def send(text: str, sender_name: str = "hermes-agent", config: dict[str, Any] | None = None) -> None:
     """Send a float message to the sender's Telegram DM.
 
     Args:
         text: The message text to send (already padded with mesh header).
         sender_name: The calling agent's name (for diagnostics, not delivery).
+        config: Optional config dict with telegram_bot_token / telegram_default_chat_id.
     """
-    bot, chat = _resolve_credentials()
+    bot, chat = _resolve_credentials(config)
     if not bot or not chat:
         logger.debug("Float skipped: missing Telegram credentials (bot=%s, chat=%s)",
                      bool(bot), bool(chat))

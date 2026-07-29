@@ -15,10 +15,23 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# TTL cache keyed by absolute path. Each entry stores (load_time, mtime, data).
+# Invalidation happens on mtime change and/or TTL expiry. TTL can be tuned via
+# MESH_IDENTITY_CACHE_TTL / A2A_IDENTITY_CACHE_TTL (seconds); 0 disables caching.
+_raw_ttl = os.getenv("MESH_IDENTITY_CACHE_TTL") or os.getenv("A2A_IDENTITY_CACHE_TTL") or "1.0"
+try:
+    _IDENTITY_CACHE_TTL = max(0.0, float(_raw_ttl))
+except ValueError:
+    _IDENTITY_CACHE_TTL = 1.0
+
+_IDENTITY_CACHE: dict[Path, tuple[float, Optional[float], Optional[dict]]] = {}
 
 
 def _hermes_root() -> Path:
@@ -50,6 +63,14 @@ def _legacy_a2a_agents_root() -> Path:
     return _fleet_root() / "a2a" / "agents"
 
 
+def _file_mtime(path: Path) -> Optional[float]:
+    """Return the mtime of a path, or None if it does not exist."""
+    try:
+        return path.stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
 def _resolve_env(value: Any) -> str:
     """Resolve ${ENV_VAR} interpolations and coerce values to strings.
 
@@ -71,8 +92,8 @@ def _resolve_env(value: Any) -> str:
     return value
 
 
-def _load_identity_yaml(path: Path) -> Optional[dict]:
-    """Load and normalize an identity.yaml file."""
+def _do_load_identity_yaml(path: Path) -> Optional[dict]:
+    """Load and normalize an identity.yaml file from disk."""
     if not path.exists():
         return None
     import yaml
@@ -95,6 +116,20 @@ def _load_identity_yaml(path: Path) -> Optional[dict]:
                 if key in auth:
                     auth[key] = _resolve_env(auth[key])
     return raw
+
+
+def _load_identity_yaml(path: Path) -> Optional[dict]:
+    """Load and normalize an identity.yaml file, with TTL+mtime caching."""
+    now = time.monotonic()
+    mtime = _file_mtime(path)
+    cached = _IDENTITY_CACHE.get(path)
+    if cached is not None:
+        cached_time, cached_mtime, cached_data = cached
+        if (now - cached_time) < _IDENTITY_CACHE_TTL and cached_mtime == mtime:
+            return cached_data
+    data = _do_load_identity_yaml(path)
+    _IDENTITY_CACHE[path] = (now, mtime, data)
+    return data
 
 
 def _webhook_url(identity: dict) -> str:

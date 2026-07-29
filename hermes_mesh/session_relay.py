@@ -47,6 +47,22 @@ _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _BENCHMARK = ipaddress.ip_network("198.18.0.0/15")
 
 
+def _register_allow_loopback() -> bool:
+    """Return True when mesh_register should accept loopback/private URLs.
+
+    By default mesh_register rejects loopback and private-network targets to
+    prevent SSRF-registration of malicious locally-routed URLs. Set
+    MESH_REGISTER_ALLOW_LOOPBACK=1 (or A2A_REGISTER_ALLOW_LOOPBACK=1) to allow
+    local testing and single-machine deployments.
+    """
+    env = (
+        os.getenv("MESH_REGISTER_ALLOW_LOOPBACK")
+        or os.getenv("A2A_REGISTER_ALLOW_LOOPBACK")
+        or ""
+    )
+    return env.lower() in ("1", "true", "yes")
+
+
 def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> bool:
     """Return True when `ip_obj` must be rejected for the given policy.
 
@@ -585,6 +601,11 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
         return {"error": "'url' is required"}
     if not url.startswith(("http://", "https://")):
         return {"error": f"URL must use http/https: {url}"}
+
+    try:
+        _validate_target_url(url, allow_loopback=_register_allow_loopback())
+    except ValueError as exc:
+        return {"registered": False, "error": f"Invalid URL: {exc}"}
 
     if _registry_bridge.identity_source() == "registry":
         if not overwrite:
