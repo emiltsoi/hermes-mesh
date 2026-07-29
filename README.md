@@ -72,6 +72,9 @@ platforms:
       route: receive          # listens on /mesh/receive
       agent_name: agent0      # local agent name
       target_session: "telegram:dm:<chat_id>"  # optional session routing
+      telegram_bot_token: "..."            # optional: source for float messages
+      telegram_default_chat_id: "..."     # optional: source for float messages
+      allow_a2a_envelope: false           # optional: accept legacy [a2a] envelopes
 ```
 
 Each agent's gateway should listen on its own mesh port. The default port
@@ -123,10 +126,23 @@ export MESH_WEBHOOK_DELIVERY_BACKOFF=1  # Initial retry backoff in seconds
 export MESH_WEBHOOK_DELIVERY_TIMEOUT=5  # Per-attempt timeout
 export TELEGRAM_BOT_TOKEN=...           # For float delivery
 export TELEGRAM_HOME_CHANNEL=...        # Where floats go
+export MESH_REGISTER_ALLOW_LOOPBACK=0   # Set to 1 to let mesh_register store loopback URLs
+export MESH_ALLOW_A2A_ENVELOPE=0        # Set to 1 to accept legacy [a2a] envelopes
+export MESH_IDENTITY_CACHE_TTL=1.0      # Identity YAML cache TTL in seconds
 ```
 
 `A2A_*` names (`A2A_AGENT_NAME`, `A2A_WEBHOOK_DELIVERY_RETRIES`, etc.) are
 still accepted as fallbacks for backward compatibility.
+
+## Envelope format
+
+Every `mesh_send` carries a `[mesh]` header on the wire:
+
+```text
+[mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no>] ...
+```
+
+The `[mesh]` prefix is the canonical format. OpenClaw peers should be configured to send `[mesh]`. Hermes can also accept legacy `[a2a]` envelopes when `allow_a2a_envelope: true` is set in `platforms.mesh.extra` or `MESH_ALLOW_A2A_ENVELOPE=1` is set in the environment.
 
 ## Use Cases
 

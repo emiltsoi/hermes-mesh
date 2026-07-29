@@ -39,6 +39,23 @@ def _json_dump_handler(handler):
     return wrapper
 
 
+def _mesh_adapter_factory(cfg):
+    """Lazily import MeshAdapter only when the platform is instantiated."""
+    from .adapter import MeshAdapter
+
+    return MeshAdapter(cfg)
+
+
+def check_mesh_requirements() -> bool:
+    """Check if mesh adapter dependencies are available, fail-closed."""
+    try:
+        from .adapter import check_mesh_requirements as _check
+
+        return _check()
+    except Exception:
+        return False
+
+
 def register(ctx) -> None:
     """Register the mesh tools and platform adapter with Hermes."""
     from .session_relay import (
@@ -181,12 +198,10 @@ def register(ctx) -> None:
     )
     logger.info("Hermes Mesh: registered mesh tools")
 
-    from .adapter import MeshAdapter, check_mesh_requirements
-
     ctx.register_platform(
         name="mesh",
         label="Hermes Mesh",
-        adapter_factory=lambda cfg: MeshAdapter(cfg),
+        adapter_factory=_mesh_adapter_factory,
         check_fn=check_mesh_requirements,
         validate_config=validate_config,
         emoji="🕸️",

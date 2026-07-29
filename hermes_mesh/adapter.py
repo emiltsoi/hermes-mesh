@@ -33,6 +33,7 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
+from . import float as _float
 from .identity import get_raw_agent_identity
 from .session_relay import _validate_agent_name
 from .network import is_loopback_bind_host
@@ -60,11 +61,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8645
 
-_MESH_ENVELOPE_RE = re.compile(
-    r'^\s*\[mesh\]\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
-    r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
-    r'(?:\[ref:([^\]]+)\])?\s*'
-)
+def _envelope_regex(allow_a2a: bool = False) -> re.Pattern:
+    """Return the mesh envelope regex, optionally accepting legacy [a2a]."""
+    prefix = r"(?:mesh|a2a)" if allow_a2a else "mesh"
+    return re.compile(
+        rf'^\s*\[{prefix}\]\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
+        rf'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
+        rf'(?:\[ref:([^\]]+)\])?\s*'
+    )
+
+
+_MESH_ENVELOPE_RE = _envelope_regex()
+
+
+def _allow_a2a_envelope(extra: dict) -> bool:
+    """Return True when the adapter should accept legacy [a2a] envelopes.
+
+    Controlled by `allow_a2a_envelope` in `platforms.mesh.extra` or the
+    `MESH_ALLOW_A2A_ENVELOPE` / `A2A_COMPATIBLE_ENVELOPE` environment variables.
+    """
+    val = extra.get("allow_a2a_envelope") if isinstance(extra, dict) else None
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        if val.lower() in ("1", "true", "yes"):
+            return True
+    env = os.getenv("MESH_ALLOW_A2A_ENVELOPE") or os.getenv("A2A_COMPATIBLE_ENVELOPE", "")
+    return env.lower() in ("1", "true", "yes")
 
 
 def check_mesh_requirements() -> bool:
@@ -141,6 +164,11 @@ class MeshAdapter(BasePlatformAdapter):
         # is an allowlist (trustworthy) rather than open/pairing.
         self._dm_policy: str = "allowlist"
         self._runner = None
+        # Make float credentials available from platforms.mesh.extra.
+        _float.configure(config.extra)
+        # Accept legacy [a2a] envelopes when explicitly enabled.
+        self._allow_a2a = _allow_a2a_envelope(config.extra)
+        self._envelope_re = _envelope_regex(self._allow_a2a)
         # Ordered dict used as an insertion-ordered bounded set. Evict the
         # oldest id when the cap is exceeded instead of nuking the whole set
         # (which would let an attacker replay previously-seen messages).
@@ -423,7 +451,7 @@ class MeshAdapter(BasePlatformAdapter):
 
     def _parse_envelope(self, text: str) -> tuple[Optional[dict], Optional["web.Response"]]:
         """Parse and validate the bracketed [mesh] envelope header."""
-        m = _MESH_ENVELOPE_RE.match(text)
+        m = self._envelope_re.match(text)
         if not m:
             return None, web.json_response({"status": "bad request"}, status=400)
 

@@ -329,7 +329,9 @@ class TestMeshListRegister:
 
     def test_mesh_register(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh,                  patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+            with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
+                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
+                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
                 mock_mesh.return_value = Path(tmpdir)
                 mock_legacy.return_value = Path("/nonexistent/path")
 
@@ -645,7 +647,8 @@ class TestMeshRegister:
 
     def test_refuses_overwrite_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
+            with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
+                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
                  patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
                 mock_mesh.return_value = Path(tmpdir)
                 mock_legacy.return_value = Path("/nonexistent/path")
@@ -665,7 +668,8 @@ class TestMeshRegister:
 
     def test_allows_overwrite_when_requested(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
+            with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
+                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
                  patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
                 mock_mesh.return_value = Path(tmpdir)
                 mock_legacy.return_value = Path("/nonexistent/path")
