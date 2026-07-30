@@ -60,7 +60,9 @@ def register(ctx) -> None:
     """Register the mesh tools and platform adapter with Hermes."""
     from .session_relay import (
         handle_mesh_deregister,
+        handle_mesh_health,
         handle_mesh_list,
+        handle_mesh_refresh_identities,
         handle_mesh_register,
         handle_mesh_send,
     )
@@ -123,6 +125,38 @@ def register(ctx) -> None:
             },
         },
         handler=_json_dump_handler(handle_mesh_register),
+    )
+
+    ctx.register_tool(
+        name="mesh_health",
+        toolset="mesh",
+        schema={
+            "name": "mesh_health",
+            "description": (
+                "Return mesh health and metrics summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        handler=_json_dump_handler(handle_mesh_health),
+    )
+
+    ctx.register_tool(
+        name="mesh_refresh_identities",
+        toolset="mesh",
+        schema={
+            "name": "mesh_refresh_identities",
+            "description": (
+                "Clear the identity cache and force the next lookup to read from disk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        handler=_json_dump_handler(handle_mesh_refresh_identities),
     )
 
     ctx.register_tool(

@@ -89,7 +89,7 @@ The wire envelope is a bracketed header that carries sender, recipient, message 
 [mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no>] ...
 ```
 
-`[mesh]` is the canonical prefix. For backward compatibility during migration, Hermes can also accept legacy `[a2a]` envelopes when `allow_a2a_envelope: true` is set in `platforms.mesh.extra` or `MESH_ALLOW_A2A_ENVELOPE=1` is set in the environment. OpenClaw peers should be configured to send `[mesh]`.
+`[mesh]` is the canonical prefix. All mesh peers, including OpenClaw, must send `[mesh]` envelopes.
 
 ## Scope Boundaries
 

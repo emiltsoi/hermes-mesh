@@ -5,7 +5,7 @@ failures are logged and swallowed; the tool result is the source of truth.
 
 Credential chain (highest to lowest priority):
   1. config dict passed to send() / configure()
-  2. Env var chain: HERMES_TELEGRAM_BOT_TOKEN → A2A_TELEGRAM_BOT_TOKEN → TELEGRAM_BOT_TOKEN
+  2. Env var chain: HERMES_TELEGRAM_BOT_TOKEN → TELEGRAM_BOT_TOKEN
 """
 from __future__ import annotations
 
@@ -41,14 +41,12 @@ def _resolve_credentials(config: dict[str, Any] | None = None) -> tuple[str, str
         cfg.get("telegram_bot_token")
         or cfg.get("bot_token")
         or os.getenv("HERMES_TELEGRAM_BOT_TOKEN")
-        or os.getenv("A2A_TELEGRAM_BOT_TOKEN")
         or os.getenv("TELEGRAM_BOT_TOKEN", "")
     )
     chat = (
         cfg.get("telegram_default_chat_id")
         or cfg.get("chat_id")
         or os.getenv("HERMES_TELEGRAM_DEFAULT_CHAT_ID")
-        or os.getenv("A2A_TELEGRAM_DEFAULT_CHAT_ID")
         or os.getenv("TELEGRAM_HOME_CHANNEL", "")
     )
     return bot, chat

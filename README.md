@@ -74,7 +74,6 @@ platforms:
       target_session: "telegram:dm:<chat_id>"  # optional session routing
       telegram_bot_token: "..."            # optional: source for float messages
       telegram_default_chat_id: "..."     # optional: source for float messages
-      allow_a2a_envelope: false           # optional: accept legacy [a2a] envelopes
 ```
 
 Each agent's gateway should listen on its own mesh port. The default port
@@ -82,9 +81,7 @@ is `8645`.
 
 ### 2. Set up fleet identity
 
-Each agent needs an identity in `$HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml`
-(legacy `fleet/a2a/agents` is also checked, but `hermes-mesh` targets use the
-mesh adapter URL):
+Each agent needs an identity in `$HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml`:
 
 ```yaml
 id: britney
@@ -127,12 +124,10 @@ export MESH_WEBHOOK_DELIVERY_TIMEOUT=5  # Per-attempt timeout
 export TELEGRAM_BOT_TOKEN=...           # For float delivery
 export TELEGRAM_HOME_CHANNEL=...        # Where floats go
 export MESH_REGISTER_ALLOW_LOOPBACK=0   # Set to 1 to let mesh_register store loopback URLs
-export MESH_ALLOW_A2A_ENVELOPE=0        # Set to 1 to accept legacy [a2a] envelopes
 export MESH_IDENTITY_CACHE_TTL=1.0      # Identity YAML cache TTL in seconds
 ```
 
-`A2A_*` names (`A2A_AGENT_NAME`, `A2A_WEBHOOK_DELIVERY_RETRIES`, etc.) are
-still accepted as fallbacks for backward compatibility.
+
 
 ## Envelope format
 
@@ -142,7 +137,7 @@ Every `mesh_send` carries a `[mesh]` header on the wire:
 [mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no>] ...
 ```
 
-The `[mesh]` prefix is the canonical format. OpenClaw peers should be configured to send `[mesh]`. Hermes can also accept legacy `[a2a]` envelopes when `allow_a2a_envelope: true` is set in `platforms.mesh.extra` or `MESH_ALLOW_A2A_ENVELOPE=1` is set in the environment.
+The `[mesh]` prefix is the canonical format. All mesh peers, including OpenClaw, must send `[mesh]` envelopes.
 
 ## Use Cases
 
@@ -256,7 +251,7 @@ This is not a webhook relay. It's a session-to-session handoff where the envelop
 - Thread-preserving conversations between agents that outlive a single task
 - Mesh discipline: domain routing, reply accountability, full context preserved
 
-**Google A2A compatibility** is available from the separate [hermes-agent-a2a](https://github.com/emiltsoi/hermes-agent-a2a) plugin — it provides standard A2A JSON-RPC for external agent onboarding. But the mesh session relay is what you can't get elsewhere.
+**Google A2A support** is provided by the separate [hermes-agent-a2a](https://github.com/emiltsoi/hermes-agent-a2a) plugin for external A2A JSON-RPC onboarding. The mesh session relay is a separate transport layer.
 
 ### Mesh Discipline: The CTA Protocol
 
@@ -317,17 +312,14 @@ The primary session relay mechanism is webhook delivery: `mesh_send` POSTs the `
 
 ## Relationship to hermes-agent-a2a
 
-`hermes-mesh` replaces the mesh functionality of the now-archived `hermes-agent-a2a` plugin.
+`hermes-mesh` and `hermes-agent-a2a` are separate plugins.
 Standard A2A (discover, call, serve, Agent Cards, JSON-RPC, security) is
 provided by the [hermes-agent-a2a plugin](https://github.com/emiltsoi/hermes-agent-a2a);
 the upstream `hermes-agent` core does not include A2A support.
 
-The old plugin's `a2a_send_session_message` is the genesis of this project —
-a focused, dependency-light extraction of the only unique feature the old
-plugin had that the upstream standard doesn't cover. `hermes-mesh` carries the
-same `[mesh][from:...][to:...]` envelope, the same per-agent HMAC
-authentication, and the same shared `fleet/mesh/agents` vault that originated
-in `hermes-agent-a2a`, without the rest of the A2A protocol surface.
+`hermes-mesh` carries the `[mesh][from:...][to:...]` envelope, per-agent HMAC
+authentication, and the `fleet/mesh/agents` vault. The two identity stores
+are now fully independent.
 
 ## OpenClaw interoperability
 

@@ -48,6 +48,7 @@ from gateway.platforms.base import (
 from gateway.session import build_session_key
 
 from .common import (
+    record_metric,
     transport as _transport,
     transport_auth_value as _transport_auth_value,
     validate_envelope_token,
@@ -61,33 +62,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8645
 
-def _envelope_regex(allow_a2a: bool = False) -> re.Pattern:
-    """Return the mesh envelope regex, optionally accepting legacy [a2a]."""
-    prefix = r"(?:mesh|a2a)" if allow_a2a else "mesh"
+def _envelope_regex() -> re.Pattern:
+    """Return the mesh envelope regex."""
     return re.compile(
-        rf'^\s*\[{prefix}\]\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
-        rf'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
-        rf'(?:\[ref:([^\]]+)\])?\s*'
+        r'^\s*\[mesh\]\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
+        r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
+        r'(?:\[ref:([^\]]+)\])?\s*'
     )
 
 
 _MESH_ENVELOPE_RE = _envelope_regex()
-
-
-def _allow_a2a_envelope(extra: dict) -> bool:
-    """Return True when the adapter should accept legacy [a2a] envelopes.
-
-    Controlled by `allow_a2a_envelope` in `platforms.mesh.extra` or the
-    `MESH_ALLOW_A2A_ENVELOPE` / `A2A_COMPATIBLE_ENVELOPE` environment variables.
-    """
-    val = extra.get("allow_a2a_envelope") if isinstance(extra, dict) else None
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        if val.lower() in ("1", "true", "yes"):
-            return True
-    env = os.getenv("MESH_ALLOW_A2A_ENVELOPE") or os.getenv("A2A_COMPATIBLE_ENVELOPE", "")
-    return env.lower() in ("1", "true", "yes")
 
 
 def check_mesh_requirements() -> bool:
@@ -157,8 +141,7 @@ class MeshAdapter(BasePlatformAdapter):
             self._target_session = _global_mesh_target_session()
         self._agent_name: str = str(
             config.extra.get("agent_name")
-            or os.getenv("MESH_AGENT_NAME")
-            or os.getenv("A2A_AGENT_NAME", "hermes-agent")
+            or os.getenv("MESH_AGENT_NAME", "hermes-agent")
         ).strip().lower()
         # GatewayRunner uses this to decide whether the adapter's intake gating
         # is an allowlist (trustworthy) rather than open/pairing.
@@ -166,13 +149,25 @@ class MeshAdapter(BasePlatformAdapter):
         self._runner = None
         # Make float credentials available from platforms.mesh.extra.
         _float.configure(config.extra)
-        # Accept legacy [a2a] envelopes when explicitly enabled.
-        self._allow_a2a = _allow_a2a_envelope(config.extra)
-        self._envelope_re = _envelope_regex(self._allow_a2a)
-        # Ordered dict used as an insertion-ordered bounded set. Evict the
-        # oldest id when the cap is exceeded instead of nuking the whole set
-        # (which would let an attacker replay previously-seen messages).
-        self._seen_message_ids: Dict[str, None] = {}
+        self._envelope_re = _envelope_regex()
+        # Replay and rate-limiting configuration.
+        self._replay_window_size = int(
+            config.extra.get("replay_window_size")
+            or os.getenv("MESH_REPLAY_WINDOW_SIZE", "10000")
+        )
+        self._replay_window_ttl = float(
+            config.extra.get("replay_window_ttl")
+            or os.getenv("MESH_REPLAY_WINDOW_TTL", "300")
+        )
+        self._rate_limit_per_minute = int(
+            config.extra.get("rate_limit_per_minute")
+            or os.getenv("MESH_RATE_LIMIT_PER_MINUTE", "0")
+        )
+        # Ordered dict of message id -> insertion timestamp. Evict by TTL and cap
+        # instead of nuking the whole set (which would let an attacker replay
+        # previously-seen messages after a full cap eviction).
+        self._seen_message_ids: Dict[str, float] = {}
+        self._sender_rate_buckets: Dict[str, tuple[int, float]] = {}
         self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue(maxsize=256)
         self._mesh_processor: Optional[asyncio.Task] = None
 
@@ -301,12 +296,17 @@ class MeshAdapter(BasePlatformAdapter):
         ref = parsed["ref"]
         body_text = parsed["body_text"]
 
+        rate_err = self._check_rate_limit(sender)
+        if rate_err:
+            record_metric("receive", "rate_limited")
+            return rate_err
+
         if msg_id in self._seen_message_ids:
             logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
+            record_metric("receive", "duplicate")
             return web.json_response({"status": "duplicate"}, status=200)
-        self._seen_message_ids[msg_id] = None
-        while len(self._seen_message_ids) > 10000:
-            self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
+        self._seen_message_ids[msg_id] = time.time()
+        self._expire_seen_messages()
 
         if from_field and sender != from_field:
             logger.warning(
@@ -314,6 +314,7 @@ class MeshAdapter(BasePlatformAdapter):
                 sender,
                 from_field,
             )
+            record_metric("receive", "unauthorized")
             return web.json_response({"status": "unauthorized"}, status=401)
 
         if recipient != self._agent_name:
@@ -322,6 +323,7 @@ class MeshAdapter(BasePlatformAdapter):
                 recipient,
                 self._agent_name,
             )
+            record_metric("receive", "unauthorized")
             return web.json_response({"status": "not found"}, status=404)
 
         event, err = self._build_event(
@@ -348,6 +350,7 @@ class MeshAdapter(BasePlatformAdapter):
                 status=503,
             )
 
+        record_metric("receive", "total")
         return web.json_response(
             {"status": "accepted", "delivery_id": msg_id},
             status=202,
@@ -367,10 +370,40 @@ class MeshAdapter(BasePlatformAdapter):
             logger.warning("[mesh] X-Mesh-Timestamp is NaN or infinite")
             return None, web.json_response({"status": "unauthorized"}, status=401)
         now = time.time()
-        if abs(now - msg_ts) > 300:
+        if abs(now - msg_ts) > self._replay_window_ttl:
             logger.warning("[mesh] X-Mesh-Timestamp outside replay window")
             return None, web.json_response({"status": "unauthorized"}, status=401)
         return msg_ts, None
+
+    def _expire_seen_messages(self) -> None:
+        """Evict message ids older than the TTL and enforce the cap."""
+        now = time.time()
+        ttl = self._replay_window_ttl
+        cap = self._replay_window_size
+        expired = [mid for mid, ts in self._seen_message_ids.items() if now - ts > ttl]
+        for mid in expired:
+            del self._seen_message_ids[mid]
+        while len(self._seen_message_ids) > cap:
+            self._seen_message_ids.pop(next(iter(self._seen_message_ids)))
+
+    def _check_rate_limit(self, sender: str) -> Optional["web.Response"]:
+        """Return a 429 response if the sender exceeded the per-minute limit."""
+        if self._rate_limit_per_minute <= 0:
+            return None
+        if not sender:
+            return None
+        now = time.time()
+        bucket = self._sender_rate_buckets.get(sender)
+        if bucket is None or now - bucket[1] > 60:
+            self._sender_rate_buckets[sender] = (1, now)
+            return None
+        count, window_start = bucket
+        count += 1
+        self._sender_rate_buckets[sender] = (count, window_start)
+        if count > self._rate_limit_per_minute:
+            logger.warning("[mesh] rate limit exceeded for sender '%s'", sender)
+            return web.json_response({"status": "rate limited"}, status=429)
+        return None
 
     def _verify_hmac(
         self, request: "web.Request", body: bytes, from_field: Any

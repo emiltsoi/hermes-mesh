@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import re
+import time
+from collections import defaultdict
+from typing import Any
 
 _ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -41,3 +44,35 @@ def transport_auth_value(transport_info: dict, key: str) -> str:
         return ""
     value = auth.get(key, "")
     return value if value is not None else ""
+
+
+# ---------------------------------------------------------------------------
+# Lightweight metrics
+# ---------------------------------------------------------------------------
+
+_METRICS: dict[str, dict[str, Any]] = defaultdict(lambda: defaultdict(int))
+_METRICS_TIMES: dict[str, float] = {}
+
+
+def record_metric(category: str, name: str, value: int = 1) -> None:
+    """Record a counter metric under `category.name`."""
+    _METRICS[category][name] += value
+    _METRICS_TIMES[f"{category}.{name}"] = time.time()
+
+
+def get_metrics() -> dict[str, dict[str, Any]]:
+    """Return a copy of all recorded metrics."""
+    return {k: dict(v) for k, v in _METRICS.items()}
+
+
+def get_metrics_summary() -> dict[str, Any]:
+    """Return the canonical mesh health counters."""
+    return {
+        "mesh_send_total": _METRICS["send"].get("total", 0),
+        "mesh_send_failed": _METRICS["send"].get("failed", 0),
+        "mesh_receive_total": _METRICS["receive"].get("total", 0),
+        "mesh_receive_unauthorized": _METRICS["receive"].get("unauthorized", 0),
+        "mesh_receive_rate_limited": _METRICS["receive"].get("rate_limited", 0),
+        "mesh_receive_duplicate": _METRICS["receive"].get("duplicate", 0),
+        "last_event_time": _METRICS_TIMES,
+    }
