@@ -472,7 +472,8 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         try:
             ref = validate_envelope_token(ref)
         except ValueError as e:
-            return {"error": f"Invalid ref: {e}"}
+            logger.warning("[mesh_send] dropping invalid ref %r: %s", ref, e)
+            ref = None
     else:
         ref = None
 
