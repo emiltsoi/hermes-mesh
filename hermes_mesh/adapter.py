@@ -63,9 +63,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8645
 
 def _envelope_regex() -> re.Pattern:
-    """Return the mesh envelope regex."""
+    """Return the mesh envelope regex, with optional version field."""
     return re.compile(
-        r'^\s*\[mesh\]\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
+        r'^\s*\[mesh\](?:\[v:([^\]]+)\])?\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
         r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
         r'(?:\[ref:([^\]]+)\])?\s*'
     )
@@ -488,7 +488,7 @@ class MeshAdapter(BasePlatformAdapter):
         if not m:
             return None, web.json_response({"status": "bad request"}, status=400)
 
-        sender, recipient, msg_id, action, reply, ref = m.groups()
+        _version, sender, recipient, msg_id, action, reply, ref = m.groups()
 
         try:
             sender = _validate_agent_name(sender)

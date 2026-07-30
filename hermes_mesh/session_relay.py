@@ -481,7 +481,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         return {"error": f"Invalid sender name: {e}"}
 
     task_id = task_id or str(uuid.uuid4())
-    header = f"[mesh][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
+    header = f"[mesh][v:1][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
     if ref:
         header += f"[ref:{ref}]"
     padded_message = f"{header} {message}"
