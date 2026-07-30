@@ -288,7 +288,7 @@ class TestSessionRelay:
                 patch("hermes_mesh.session_relay._float.send") as mock_float,
             ):
                 mock_raw.return_value = identity
-                mock_deliver.return_value = "delivery-123"
+                mock_deliver.return_value = ("delivery-123", None)
 
                 result = handle_mesh_send(
                     {"message": "hello test", "agent": "testagent"}
@@ -395,6 +395,7 @@ class TestHMACSecretSelection:
             return target_identity
 
         with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}),              patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw),              patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver,              patch("hermes_mesh.session_relay._float.send"):
+            mock_deliver.return_value = ("delivered", None)
 
             result = handle_mesh_send({"message": "hi", "agent": "target"})
             assert result.get("status") == "delivered"
@@ -751,6 +752,7 @@ class TestMeshSendValidation:
              patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw), \
              patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver, \
              patch("hermes_mesh.session_relay._float.send"):
+            mock_deliver.return_value = ("delivered", None)
             result = handle_mesh_send({"message": "hi", "agent": "target", "task_id": "custom-123"})
             assert result.get("status") == "delivered"
             assert result.get("task_id") == "custom-123"
@@ -792,6 +794,7 @@ class TestRegistrySend:
     """mesh_send using mesh-peer-registry for identity and Ed25519 signing."""
 
     def test_registry_send_signs_with_ed25519(self, tmp_path, monkeypatch):
+        pytest.importorskip("mesh_peer_registry")
         import yaml
         from mesh_peer_registry.crypto import (
             generate_keypair,

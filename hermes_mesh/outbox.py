@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from .common import record_metric
+from .common import parse_mesh_header, record_metric, validate_envelope_token
 from .network import is_local_target_host
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,8 @@ def queue_message(
     body: str,
     *,
     attempt: int = 0,
+    ref: str | None = None,
+    is_dsn: bool = False,
 ) -> Path:
     """Persist a failed delivery to the outbox for later retry."""
     root = _outbox_root()
@@ -84,6 +86,8 @@ def queue_message(
         "attempt": attempt,
         "created_at": time.time(),
         "next_retry": time.time(),
+        "ref": ref,
+        "is_dsn": is_dsn,
     }
     path = root / f"{item['id']}.json"
     with open(path, "w", encoding="utf-8") as f:
@@ -181,7 +185,7 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
         logger.warning("Mesh outbox: cannot resolve %s -> %s: %s", from_agent, to_agent, error)
         return False
     sign_timestamp = bool(extra and extra.get("sign_timestamp")) or _sign_timestamp_enabled()
-    delivery_id = _deliver_webhook(
+    delivery_id, _ = _deliver_webhook(
         target_url,
         body,
         signing_material,
@@ -251,6 +255,26 @@ def retry_outbox(
                 "Mesh outbox: message %s exceeded max attempts, moved to dead letter",
                 item.get("id"),
             )
+            if not item.get("is_dsn"):
+                try:
+                    from .session_relay import _send_delivery_error
+                    header = parse_mesh_header(item.get("padded_message", ""))
+                    if header:
+                        original_from = header["sender"]
+                        original_to = header["recipient"]
+                        original_id = validate_envelope_token(header["msg_id"])
+                        ref = item.get("ref") or header.get("ref")
+                        dsn_to = original_to if ref else original_from
+                        _send_delivery_error(
+                            original_from,
+                            dsn_to,
+                            original_id,
+                            "dead-letter",
+                            original_from,
+                            original_to,
+                        )
+                except Exception as e:
+                    logger.warning("Mesh outbox: failed to send DSN for dead letter %s: %s", item.get("id"), e)
         else:
             item["next_retry"] = now + (backoff * (2 ** (item["attempt"] - 1)))
             try:
