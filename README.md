@@ -9,16 +9,19 @@ who asked, what they're responding to, and what action to take.
 
 ## Tools
 
-- `mesh_list` — list all agents in the fleet mesh vault.
-- `mesh_register` — register or update an agent identity in the fleet mesh vault.
+- `mesh_list` — list all agents in the fleet mesh vault or mesh-peer-registry.
+- `mesh_register` — register or update an agent identity in the fleet mesh vault or registry.
 - `mesh_send` — send a session-preserving message to another fleet agent.
+- `mesh_deregister` — remove an agent identity.
+- `mesh_health` — return mesh health and metrics summary.
+- `mesh_refresh_identities` — clear the identity cache.
 
 ```
 Caller: mesh_send(agent="britney", message="Review this plan")
   │
-  ├─ 1. Resolves Britney's identity from the fleet vault
+  ├─ 1. Resolves Britney's identity from the fleet vault or registry
   ├─ 2. Pads [mesh][from:linda][to:britney][id:uuid][action:do][reply:yes]
-  ├─ 3. HMAC-SHA256 signs with the sender's own secret
+  ├─ 3. HMAC-SHA256 or Ed25519 signs with the sender's own material
   └─ 4. POSTs to Britney's mesh adapter endpoint
 ```
 
@@ -26,8 +29,10 @@ Britney's gateway receives the message on its `mesh` platform adapter,
 routes it into her active session, and she sees it as an inbound mesh
 trigger with full sender context.
 
-`mesh_send` returns `{"state": "completed", "status": "delivered", ...}` on
-success, with `message_id` and `task_id` populated.
+`mesh_send` returns a delivery result with `state`, `status` (`delivered`,
+`queued`, or `error`), `message_id`, and `task_id`. When `MESH_OUTBOX_ENABLED=1`,
+a failed delivery can be queued and retried in the background instead of
+returning an immediate hard error.
 
 ## What it does NOT do
 
@@ -67,13 +72,28 @@ platforms:
   mesh:
     enabled: true
     extra:
+      host: 0.0.0.0
       port: 8744
-      secret: true            # auth-enable sentinel; HMAC keys are per-agent in the fleet vault
       route: receive          # listens on /mesh/receive
       agent_name: agent0      # local agent name
-      target_session: "telegram:dm:<chat_id>"  # optional session routing
-      telegram_bot_token: "..."            # optional: source for float messages
-      telegram_default_chat_id: "..."     # optional: source for float messages
+      # Authentication mode. "secret" is an on/off sentinel, not the HMAC key.
+      # Any non-empty value enables HMAC/Ed25519 verification; "INSECURE_NO_AUTH" disables it.
+      secret: true
+      # Identity source: "file" (default, fleet/mesh/agents YAML vault) or "registry".
+      identity_source: file
+      # For registry mode: URL of the mesh-peer-registry.
+      # registry_url: http://127.0.0.1:8646
+      # For registry mode: path to the Ed25519 private key PEM (default: ~/.mesh/keys/<agent_name>.pem).
+      # private_key_path: /path/to/key.pem
+      # Optional session routing and float source.
+      target_session: "telegram:dm:<chat_id>"
+      telegram_bot_token: "..."
+      telegram_default_chat_id: "..."
+      # Replay / rate-limit / outbox tuning.
+      replay_window_size: 10000
+      replay_window_ttl: 300
+      rate_limit_per_minute: 0
+      outbox_interval: 30
 ```
 
 Each agent's gateway should listen on its own mesh port. The default port
@@ -81,7 +101,7 @@ is `8645`.
 
 ### 2. Set up fleet identity
 
-Each agent needs an identity in `$HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml`:
+For `identity_source: file` (the default), each agent needs an identity in `$HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml`:
 
 ```yaml
 id: britney
@@ -101,6 +121,10 @@ endpoint (`/mesh/<route>`). The `hermes_webhook.auth.secret` is the
 **target's** adapter secret; messages are signed with the **sender's**
 own secret for per-agent HMAC authentication.
 
+For `identity_source: registry`, identities live in the mesh-peer-registry
+instead of YAML files. The adapter verifies inbound `X-Mesh-Signature`
+headers with Ed25519 public keys fetched from the registry.
+
 Mesh delivery is one-way inbound into the target agent's session. If the
 agent generates a reply, the platform `send()` call is intentionally a
 no-op; the agent must explicitly call `mesh_send(agent="...", message="...")`
@@ -117,14 +141,26 @@ mesh_register(name="britney", url="http://127.0.0.1:8745/mesh/receive", secret="
 ### 4. Environment
 
 ```bash
-export MESH_AGENT_NAME=linda            # Who the sender is
-export MESH_WEBHOOK_DELIVERY_RETRIES=3  # Delivery retry count
-export MESH_WEBHOOK_DELIVERY_BACKOFF=1  # Initial retry backoff in seconds
-export MESH_WEBHOOK_DELIVERY_TIMEOUT=5  # Per-attempt timeout
-export TELEGRAM_BOT_TOKEN=...           # For float delivery
-export TELEGRAM_HOME_CHANNEL=...        # Where floats go
-export MESH_REGISTER_ALLOW_LOOPBACK=0   # Set to 1 to let mesh_register store loopback URLs
-export MESH_IDENTITY_CACHE_TTL=1.0      # Identity YAML cache TTL in seconds
+export MESH_AGENT_NAME=linda                  # Who the sender is
+export MESH_WEBHOOK_DELIVERY_RETRIES=3        # Delivery retry count
+export MESH_WEBHOOK_DELIVERY_BACKOFF=1.0      # Initial retry backoff in seconds
+export MESH_WEBHOOK_DELIVERY_TIMEOUT=10       # Per-attempt timeout
+export MESH_WEBHOOK_ALLOW_LOOPBACK=0          # Set to 1 to allow deliveries to loopback/private targets
+export MESH_REGISTER_ALLOW_LOOPBACK=0         # Set to 1 to let mesh_register store loopback URLs
+export MESH_IDENTITY_CACHE_TTL=1.0            # Identity YAML cache TTL in seconds (0 disables)
+export MESH_IDENTITY_CACHE_MAXSIZE=256        # Identity cache max entries
+export MESH_VAULT_PATH=~/.hermes/fleet        # Custom mesh vault root
+export MESH_SIGN_TIMESTAMP=0                  # Set to 1 to include X-Mesh-Timestamp in HMAC payload
+export MESH_OUTBOX_ENABLED=0                  # Set to 1 to queue failed sends for retry
+export MESH_OUTBOX_PATH=~/.hermes/fleet/mesh/outbox
+export MESH_OUTBOX_MAX_ATTEMPTS=5
+export MESH_OUTBOX_BACKOFF=5.0
+export MESH_REPLAY_WINDOW_SIZE=10000
+export MESH_REPLAY_WINDOW_TTL=300
+export MESH_RATE_LIMIT_PER_MINUTE=0           # 0 disables
+export MESH_OUTBOX_INTERVAL=30                # Outbox retry sweep interval in seconds
+export TELEGRAM_BOT_TOKEN=...                 # For float delivery
+export TELEGRAM_HOME_CHANNEL=...              # Where floats go
 ```
 
 
@@ -134,10 +170,22 @@ export MESH_IDENTITY_CACHE_TTL=1.0      # Identity YAML cache TTL in seconds
 Every `mesh_send` carries a `[mesh]` header on the wire:
 
 ```text
-[mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no>] ...
+[mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no>][ref:<parent-id>] ...
 ```
 
 The `[mesh]` prefix is the canonical format. All mesh peers, including OpenClaw, must send `[mesh]` envelopes.
+
+## Security, replay protection, and durable delivery
+
+`hermes-mesh` verifies every inbound webhook before routing it into the agent session:
+
+- **HMAC mode (`identity_source: file`)**: verifies `X-Hub-Signature-256` against the sender's `hermes_webhook.auth.secret` from the local YAML vault.
+- **Registry mode (`identity_source: registry`)**: verifies `X-Mesh-Signature` (Ed25519) against the sender's public key in the mesh-peer-registry.
+- **Timestamp validation**: every inbound request must carry an `X-Mesh-Timestamp` header. The adapter rejects missing, non-numeric, or stale timestamps.
+- **Replay window**: a bounded TTL-based replay cache deduplicates message IDs and prevents replay attacks. Configured via `replay_window_size`, `replay_window_ttl`, `MESH_REPLAY_WINDOW_SIZE`, and `MESH_REPLAY_WINDOW_TTL`.
+- **Optional timestamp-included signing**: set `MESH_SIGN_TIMESTAMP=1` to include `X-Mesh-Timestamp` in the HMAC/Ed25519 signed payload. Receivers accept both legacy body-only and timestamp-prefixed signatures for backward compatibility.
+- **Durable outbox**: when `MESH_OUTBOX_ENABLED=1`, failed `mesh_send` deliveries are written to disk and retried by a background reaper. After `MESH_OUTBOX_MAX_ATTEMPTS` failures, items move to a `dead/` folder.
+- **Rate limiting**: optional per-sender rate limiting via `rate_limit_per_minute` / `MESH_RATE_LIMIT_PER_MINUTE`.
 
 ## Use Cases
 
@@ -334,6 +382,20 @@ intent, and thread id. Replies flow back the same way. Both agents keep the
 session context — who asked, what they asked for, and whether a reply is
 expected — across the Hermes/OpenClaw boundary.
 
+### Known OpenClaw wake caveat
+
+OpenClaw agents receive the inbound webhook through the `openclaw-mesh`
+plugin, which calls `api.runtime.agent.runEmbeddedAgent(...)` to inject the
+message into the configured session. When the OpenClaw session is **idle**,
+this can deadlock in the OpenClaw two-level lane queue, and the webhook may
+return an error. The `openclaw-mesh` plugin now wraps the call with a
+cancellable timeout and returns HTTP 500 on failure so the sender's outbox
+can retry. A real fix requires OpenClaw gateway/runtime support for
+waking an idle session from a plugin. The workarounds are:
+
+1. Keep the OpenClaw session warm before sending, or
+2. Send an explicit user turn to wake it, then send the mesh message.
+
 ## Testing
 
 `hermes-mesh` is a Hermes plugin and its adapter imports `gateway.*` modules from the
@@ -347,7 +409,9 @@ PYTHONPATH=/path/to/hermes-mesh:/path/to/hermes-agent pytest tests/test_mesh.py 
 For example, with a default install:
 
 ```bash
-PYTHONPATH=/home/emil/CascadeProjects/hermes-mesh:/home/emil/.hermes/hermes-agent \
+PYTHONPATH=/home/emil/CascadeProjects/hermes-mesh:\
+/home/emil/.hermes/hermes-agent:\
+/home/emil/CascadeProjects/mesh-peer-registry \
   pytest tests/test_mesh.py -q
 ```
 
