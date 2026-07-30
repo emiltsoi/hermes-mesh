@@ -209,13 +209,14 @@ def register_peer(
     role: str,
     description: str,
     extra: dict | None = None,
+    ttl: int | None = None,
 ) -> dict:
     """Register this agent on the mesh peer registry."""
     _ensure_registry()
     agent_name = _this_agent_name()
     private_pem, public_pem = load_or_generate_keypair(agent_name, extra)
     client = registry_client(agent_name, extra)
-    return client.register(name, url, role=role, description=description)
+    return client.register(name, url, role=role, description=description, ttl=ttl)
 
 
 def deregister_peer(name: str, extra: dict | None = None) -> dict:

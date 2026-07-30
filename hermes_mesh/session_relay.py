@@ -588,47 +588,50 @@ def handle_mesh_list(args: dict | None = None, **kwargs) -> dict:
     return {"agents": agents, "count": len(agents)}
 
 
-def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
-    """Register or update an agent identity in the fleet mesh vault or registry.
-
-    Args:
-        name: Agent name (defaults to MESH_AGENT_NAME env var).
-        url: Hermes webhook URL for this agent.
-        secret: Shared HMAC secret for this agent (file backend only).
-        role: Optional role description (default "agent").
-        description: Optional human-readable description.
-        overwrite: Whether to overwrite an existing identity (default False).
-    """
+def _register_one(
+    item: dict,
+    registry: bool,
+    overwrite: bool,
+    dry_run: bool,
+    source: str,
+) -> dict:
+    """Register a single agent from a bulk or single registration request."""
     from . import registry_bridge as _registry_bridge
 
-    merged = dict(args) if args else {}
-    merged.update(kwargs)
-
-    name = merged.get("name") or os.getenv("MESH_AGENT_NAME", "")
-    url = merged.get("url", "")
-    secret = merged.get("secret", "")
-    role = merged.get("role", "agent")
-    description = merged.get("description", "")
-    overwrite = bool(merged.get("overwrite", False))
+    name = item.get("name") or os.getenv("MESH_AGENT_NAME", "")
+    url = item.get("url", "")
+    secret = item.get("secret", "")
+    role = item.get("role") or ("mesh_peer" if registry else "agent")
+    description = item.get("description", "")
+    ttl = item.get("ttl")
 
     if not name:
-        return {"error": "'name' is required (or set MESH_AGENT_NAME)"}
+        return {"registered": False, "error": "'name' is required (or set MESH_AGENT_NAME)"}
     try:
         name = _validate_agent_name(name)
     except ValueError as e:
-        return {"error": str(e)}
+        return {"registered": False, "error": str(e)}
 
     if not url:
-        return {"error": "'url' is required"}
+        return {"registered": False, "error": "'url' is required"}
     if not url.startswith(("http://", "https://")):
-        return {"error": f"URL must use http/https: {url}"}
+        return {"registered": False, "error": f"URL must use http/https: {url}"}
 
     try:
         _validate_target_url(url, allow_loopback=_register_allow_loopback())
     except ValueError as exc:
         return {"registered": False, "error": f"Invalid URL: {exc}"}
 
-    if _registry_bridge.identity_source() == "registry":
+    if dry_run:
+        return {
+            "registered": False,
+            "dry_run": True,
+            "would_register": True,
+            "name": name,
+            "source": source,
+        }
+
+    if registry:
         if not overwrite:
             try:
                 existing = _registry_bridge.resolve_target(name)
@@ -637,13 +640,13 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
             if existing:
                 return {"registered": False, "error": f"Agent '{name}' already exists; set overwrite=True to replace"}
         try:
-            _registry_bridge.register_peer(name, url, role, description)
+            _registry_bridge.register_peer(name, url, role, description, ttl=ttl)
         except Exception as e:
             return {"registered": False, "error": f"Failed to register on registry: {e}"}
         return {"registered": True, "name": name, "source": "registry"}
 
     if not secret:
-        return {"error": "'secret' is required for HMAC webhook auth"}
+        return {"registered": False, "error": "'secret' is required for HMAC webhook auth"}
 
     if not overwrite and get_raw_agent_identity(name):
         return {"registered": False, "error": f"Agent '{name}' already exists; set overwrite=True to replace"}
@@ -666,6 +669,38 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
         return {"registered": False, "error": f"Failed to write identity: {e}"}
 
     return {"registered": True, "name": name, "path": str(path)}
+
+
+def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
+    """Register or update an agent identity in the fleet mesh vault or registry.
+
+    Args:
+        name: Agent name (defaults to MESH_AGENT_NAME env var).
+        url: Hermes webhook URL for this agent.
+        secret: Shared HMAC secret for this agent (file backend only).
+        role: Optional role description (default "agent" / "mesh_peer" for registry).
+        description: Optional human-readable description.
+        overwrite: Whether to overwrite an existing identity (default False).
+        dry_run: Validate and return without writing.
+        ttl: Optional TTL in seconds for registry entries.
+        bulk: Optional list of registration objects to process in one call.
+    """
+    from . import registry_bridge as _registry_bridge
+
+    merged = dict(args) if args else {}
+    merged.update(kwargs)
+
+    overwrite = bool(merged.get("overwrite", False))
+    dry_run = bool(merged.get("dry_run", False))
+    source = "registry" if _registry_bridge.identity_source() == "registry" else "file"
+
+    bulk = merged.get("bulk")
+    if isinstance(bulk, list) and bulk:
+        results = [_register_one({**item, "ttl": item.get("ttl", merged.get("ttl"))}, source == "registry", overwrite, dry_run, source) for item in bulk]
+        ok = all(r.get("registered") or r.get("would_register") for r in results)
+        return {"ok": ok, "count": len(results), "results": results}
+
+    return _register_one({**merged}, source == "registry", overwrite, dry_run, source)
 
 
 def handle_mesh_health(args: dict | None = None, **kwargs) -> dict:
