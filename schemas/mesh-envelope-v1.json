@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/emiltsoi/hermes-mesh/schemas/mesh-envelope-v1.json",
+  "title": "Hermes Mesh Envelope v1",
+  "description": "Wire envelope for session-aware Hermes mesh messages.",
+  "type": "object",
+  "required": ["from", "to", "id", "action", "reply"],
+  "properties": {
+    "prefix": {
+      "type": "string",
+      "const": "mesh"
+    },
+    "v": {
+      "type": "string",
+      "description": "Envelope version. Defaults to 1.",
+      "const": "1"
+    },
+    "from": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+      "description": "Sender agent name."
+    },
+    "to": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+      "description": "Recipient agent name or '*' for broadcast."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+      "description": "Unique message id."
+    },
+    "action": {
+      "type": "string",
+      "enum": ["do", "info"],
+      "description": "Whether the recipient should take action or just acknowledge."
+    },
+    "reply": {
+      "type": "string",
+      "enum": ["yes", "no"],
+      "description": "Whether the sender expects a reply."
+    },
+    "ref": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+      "description": "Optional message id being replied to."
+    },
+    "body": {
+      "type": "string",
+      "description": "Free-form message body after the bracketed header."
+    }
+  },
+  "additionalProperties": false
+}
