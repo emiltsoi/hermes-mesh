@@ -30,6 +30,8 @@ from urllib.parse import urlparse
 
 from . import float as _float
 from .common import (
+    get_metrics_summary,
+    record_metric,
     transport as _transport,
     transport_auth_value as _transport_auth_value,
     validate_envelope_token,
@@ -52,12 +54,23 @@ def _register_allow_loopback() -> bool:
 
     By default mesh_register rejects loopback and private-network targets to
     prevent SSRF-registration of malicious locally-routed URLs. Set
-    MESH_REGISTER_ALLOW_LOOPBACK=1 (or A2A_REGISTER_ALLOW_LOOPBACK=1) to allow
-    local testing and single-machine deployments.
+    MESH_REGISTER_ALLOW_LOOPBACK=1 to allow local testing and single-machine
+    deployments.
+    """
+    env = os.getenv("MESH_REGISTER_ALLOW_LOOPBACK", "")
+    return env.lower() in ("1", "true", "yes")
+
+
+def _webhook_allow_loopback() -> bool:
+    """Return True when mesh_send should deliver to loopback/private URLs.
+
+    By default delivery still rejects private/loopback targets unless the
+    stored URL itself is local. Set MESH_WEBHOOK_ALLOW_LOOPBACK=1 (or
+    A2A_WEBHOOK_ALLOW_LOOPBACK=1) to override for single-machine deployments.
     """
     env = (
-        os.getenv("MESH_REGISTER_ALLOW_LOOPBACK")
-        or os.getenv("A2A_REGISTER_ALLOW_LOOPBACK")
+        os.getenv("MESH_WEBHOOK_ALLOW_LOOPBACK")
+        or os.getenv("A2A_WEBHOOK_ALLOW_LOOPBACK")
         or ""
     )
     return env.lower() in ("1", "true", "yes")
@@ -275,18 +288,9 @@ def _validate_agent_webhook_config(agent_info: dict) -> tuple[bool, str]:
 # Delivery
 # ---------------------------------------------------------------------------
 
-_DELIVERY_RETRIES = int(
-    os.getenv("MESH_WEBHOOK_DELIVERY_RETRIES")
-    or os.getenv("A2A_WEBHOOK_DELIVERY_RETRIES", "3")
-)
-_DELIVERY_BACKOFF = float(
-    os.getenv("MESH_WEBHOOK_DELIVERY_BACKOFF")
-    or os.getenv("A2A_WEBHOOK_DELIVERY_BACKOFF", "1.0")
-)
-_DELIVERY_TIMEOUT = int(
-    os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT")
-    or os.getenv("A2A_WEBHOOK_DELIVERY_TIMEOUT", "10")
-)
+_DELIVERY_RETRIES = int(os.getenv("MESH_WEBHOOK_DELIVERY_RETRIES", "3"))
+_DELIVERY_BACKOFF = float(os.getenv("MESH_WEBHOOK_DELIVERY_BACKOFF", "1.0"))
+_DELIVERY_TIMEOUT = int(os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT", "10"))
 
 
 def _deliver_webhook(
@@ -361,6 +365,7 @@ def _deliver_webhook(
                     "Mesh relay: delivery succeeded on attempt %d/%d",
                     attempt + 1, _DELIVERY_RETRIES,
                 )
+            record_metric("send", "total")
             return delivery_id
         except Exception as exc:
             remaining = deadline - time.monotonic()
@@ -379,6 +384,7 @@ def _deliver_webhook(
                     "Mesh relay: delivery failed after %d attempts: %s",
                     _DELIVERY_RETRIES, exc,
                 )
+                record_metric("send", "failed")
                 return None
     return None
 
@@ -468,7 +474,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             return {"error": f"Invalid task_id: {e}"}
 
     # Build mesh metadata header
-    from_agent = os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "hermes-agent")
+    from_agent = os.getenv("MESH_AGENT_NAME", "hermes-agent")
     try:
         from_agent = _validate_agent_name(from_agent)
     except ValueError as e:
@@ -497,7 +503,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         if not signing_material or auth_type != "ed25519":
             return {"error": f"Sender '{from_agent}' has no Ed25519 private key"}
     else:
-        # File / legacy HMAC path
+        # File-based HMAC path
         raw_info = get_raw_agent_identity(agent)
         if not raw_info:
             return {"error": f"Agent '{agent}' not found in fleet vault"}
@@ -527,15 +533,17 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         auth_type = "hmac-sha256"
 
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
+    allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
     delivery_id = _deliver_webhook(
         target_url,
         body,
         signing_material,
-        allow_loopback=_is_local_url(target_url),
+        allow_loopback=allow_loopback,
         auth_type=auth_type,
     )
 
     if delivery_id is None:
+        record_metric("send", "failed")
         return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}
 
     # Part 2: Telegram float (best-effort, non-blocking)
@@ -583,7 +591,7 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
     merged = dict(args) if args else {}
     merged.update(kwargs)
 
-    name = merged.get("name") or os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "")
+    name = merged.get("name") or os.getenv("MESH_AGENT_NAME", "")
     url = merged.get("url", "")
     secret = merged.get("secret", "")
     role = merged.get("role", "agent")
@@ -647,6 +655,25 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
     return {"registered": True, "name": name, "path": str(path)}
 
 
+def handle_mesh_health(args: dict | None = None, **kwargs) -> dict:
+    """Return mesh health and metrics summary."""
+    from . import identity as _identity
+    metrics = get_metrics_summary()
+    metrics["identity_cache_size"] = len(_identity._IDENTITY_CACHE)
+    return {"status": "healthy", "metrics": metrics}
+
+
+def handle_mesh_refresh_identities(args: dict | None = None, **kwargs) -> dict:
+    """Clear the identity cache so the next lookup reads from disk or registry.
+
+    Useful after bulk changes to the fleet vault or when an identity was
+    edited outside of mesh_register.
+    """
+    from . import identity as _identity
+    _identity.refresh_identities()
+    return {"refreshed": True, "cache_size": 0}
+
+
 def handle_mesh_deregister(args: dict | None = None, **kwargs) -> dict:
     """Deregister an agent from the fleet mesh vault or registry.
 
@@ -658,7 +685,7 @@ def handle_mesh_deregister(args: dict | None = None, **kwargs) -> dict:
     merged = dict(args) if args else {}
     merged.update(kwargs)
 
-    name = merged.get("name") or os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "")
+    name = merged.get("name") or os.getenv("MESH_AGENT_NAME", "")
     if not name:
         return {"error": "'name' is required (or set MESH_AGENT_NAME)"}
     try:

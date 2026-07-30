@@ -200,7 +200,7 @@ def resolve_sender(name: str, extra: dict | None = None) -> tuple[str, str, str 
 
 
 def _this_agent_name() -> str:
-    return os.getenv("MESH_AGENT_NAME") or os.getenv("A2A_AGENT_NAME", "hermes-agent")
+    return os.getenv("MESH_AGENT_NAME", "hermes-agent")
 
 
 def register_peer(
@@ -237,13 +237,13 @@ def list_peers(extra: dict | None = None) -> list[dict]:
                 "name": p.name,
                 "description": p.description,
                 "role": p.role,
-                "a2a_url": p.url,
+                "url": p.url,
             }
             for p in client.list_peers()
         ]
     from .identity import list_agents
 
-    return list_agents()
+    return list_agents()  # already returns `url`
 
 
 def _lower_headers(headers: dict[str, str]) -> dict[str, str]:

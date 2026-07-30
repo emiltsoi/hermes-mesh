@@ -39,26 +39,20 @@ from hermes_mesh import float as float_module
 
 class TestIdentity:
     def test_resolve_agent_not_found(self):
-        with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-             patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+        with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
             mock_mesh.return_value = Path("/nonexistent/path")
-            mock_legacy.return_value = Path("/nonexistent2/path")
             result = resolve_agent("nonexistent")
             assert result is None
 
     def test_get_raw_agent_not_found(self):
-        with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-             patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+        with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
             mock_mesh.return_value = Path("/nonexistent/path")
-            mock_legacy.return_value = Path("/nonexistent2/path")
             result = get_raw_agent_identity("nonexistent")
             assert result is None
 
     def test_list_agents_empty(self):
-        with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-             patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+        with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
             mock_mesh.return_value = Path("/nonexistent/path")
-            mock_legacy.return_value = Path("/nonexistent2/path")
             result = list_agents()
             assert result == []
 
@@ -73,10 +67,6 @@ class TestIdentity:
                 "description": "Test agent",
                 "role": "tester",
                 "transports": {
-                    "a2a_rpc": {
-                        "url": "http://127.0.0.1:9999",
-                        "auth": {"type": "none"},
-                    },
                     "hermes_webhook": {
                         "url": "http://127.0.0.1:9999/webhook",
                         "auth": {"type": "hmac-sha256", "secret": "test-secret"},
@@ -87,19 +77,39 @@ class TestIdentity:
                 import yaml
                 yaml.safe_dump(identity, f)
 
-            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
                 mock_mesh.return_value = Path(tmpdir)
-                mock_legacy.return_value = Path("/nonexistent/path")
 
                 resolved = resolve_agent("testagent")
                 assert resolved is not None
                 assert resolved["name"] == "testagent"
-                assert resolved["a2a_url"] == "http://127.0.0.1:9999/webhook"
+                assert resolved["url"] == "http://127.0.0.1:9999/webhook"
 
                 raw = get_raw_agent_identity("testagent")
                 assert raw is not None
                 assert raw["transports"]["hermes_webhook"]["auth"]["secret"] == "test-secret"
+
+    def test_resolve_agent_without_webhook_returns_empty_url(self):
+        """Regression: identity without hermes_webhook should return no mesh url."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent_dir = Path(tmpdir) / "notarget"
+            agent_dir.mkdir()
+            identity = {
+                "id": "notarget",
+                "name": "notarget",
+                "description": "No webhook",
+                "role": "tester",
+                "transports": {},
+            }
+            import yaml
+            with open(agent_dir / "identity.yaml", "w") as f:
+                yaml.safe_dump(identity, f)
+
+            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
+                mock_mesh.return_value = Path(tmpdir)
+                resolved = resolve_agent("notarget")
+                assert resolved is not None
+                assert resolved["url"] == ""
 
 
 class TestSEC01_EnvVarProtection:
@@ -318,9 +328,8 @@ class TestMeshListRegister:
             with open(agent_dir / "identity.yaml", "w") as f:
                 yaml.safe_dump(identity, f)
 
-            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh,                  patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+            with patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
                 mock_mesh.return_value = Path(tmpdir)
-                mock_legacy.return_value = Path("/nonexistent/path")
 
                 from hermes_mesh.session_relay import handle_mesh_list
                 result = handle_mesh_list()
@@ -330,10 +339,8 @@ class TestMeshListRegister:
     def test_mesh_register(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
-                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
                 mock_mesh.return_value = Path(tmpdir)
-                mock_legacy.return_value = Path("/nonexistent/path")
 
                 from hermes_mesh.session_relay import handle_mesh_register
                 result = handle_mesh_register({
@@ -648,10 +655,8 @@ class TestMeshRegister:
     def test_refuses_overwrite_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
-                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
                 mock_mesh.return_value = Path(tmpdir)
-                mock_legacy.return_value = Path("/nonexistent/path")
 
                 handle_mesh_register({
                     "name": "daji",
@@ -669,10 +674,8 @@ class TestMeshRegister:
     def test_allows_overwrite_when_requested(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
-                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh, \
-                 patch("hermes_mesh.identity._legacy_a2a_agents_root") as mock_legacy:
+                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
                 mock_mesh.return_value = Path(tmpdir)
-                mock_legacy.return_value = Path("/nonexistent/path")
 
                 handle_mesh_register({
                     "name": "daji",
