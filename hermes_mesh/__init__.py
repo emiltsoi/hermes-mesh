@@ -120,6 +120,31 @@ def register(ctx) -> None:
                         "description": "Overwrite existing identity",
                         "default": False,
                     },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Validate the request without writing",
+                        "default": False,
+                    },
+                    "ttl": {
+                        "type": "integer",
+                        "description": "Optional TTL in seconds for registry entries",
+                    },
+                    "bulk": {
+                        "type": "array",
+                        "description": "Bulk register multiple agents at once",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Agent name"},
+                                "url": {"type": "string", "description": "Hermes webhook URL"},
+                                "secret": {"type": "string", "description": "HMAC secret (file backend)"},
+                                "role": {"type": "string", "description": "Role"},
+                                "description": {"type": "string", "description": "Description"},
+                                "ttl": {"type": "integer", "description": "Optional TTL in seconds"},
+                            },
+                            "required": ["name", "url"],
+                        },
+                    },
                 },
                 "required": ["url"],
             },
