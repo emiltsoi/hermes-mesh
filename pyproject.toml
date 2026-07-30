@@ -27,3 +27,8 @@ packages = ["hermes_mesh"]
 
 [project.entry-points."hermes_agent.plugins"]
 hermes-mesh = "hermes_mesh"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["F401", "E501"]
+exclude = ["tests/stubs"]
