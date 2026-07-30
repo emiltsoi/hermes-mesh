@@ -37,6 +37,7 @@ from .common import (
     validate_envelope_token,
 )
 from .identity import get_raw_agent_identity, list_agents, write_agent_identity
+from . import outbox
 from .network import is_local_target_host
 
 logger = logging.getLogger(__name__)
@@ -544,6 +545,18 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     if delivery_id is None:
         record_metric("send", "failed")
+        if outbox.outbox_enabled():
+            outbox.queue_message(from_agent, agent, padded_message, body)
+            return {
+                "task_id": task_id,
+                "state": "queued",
+                "status": "queued for outbox retry",
+                "delivery": "queued",
+                "reply_expected": reply == "yes",
+                "message_id": task_id,
+                "agent": agent,
+                "gateway_delivery": False,
+            }
         return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}
 
     # Part 2: Telegram float (best-effort, non-blocking)
@@ -660,6 +673,7 @@ def handle_mesh_health(args: dict | None = None, **kwargs) -> dict:
     from . import identity as _identity
     metrics = get_metrics_summary()
     metrics["identity_cache_size"] = len(_identity._IDENTITY_CACHE)
+    metrics["outbox_count"] = outbox.outbox_count()
     return {"status": "healthy", "metrics": metrics}
 
 

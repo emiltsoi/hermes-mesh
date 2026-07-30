@@ -34,6 +34,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from . import float as _float
+from . import outbox as _outbox
 from .identity import get_raw_agent_identity
 from .session_relay import _validate_agent_name
 from .network import is_loopback_bind_host
@@ -163,6 +164,11 @@ class MeshAdapter(BasePlatformAdapter):
             config.extra.get("rate_limit_per_minute")
             or os.getenv("MESH_RATE_LIMIT_PER_MINUTE", "0")
         )
+        self._outbox_interval = float(
+            config.extra.get("outbox_interval")
+            or os.getenv("MESH_OUTBOX_INTERVAL", "30")
+        )
+        self._outbox_reaper: Optional[asyncio.Task] = None
         # Ordered dict of message id -> insertion timestamp. Evict by TTL and cap
         # instead of nuking the whole set (which would let an attacker replay
         # previously-seen messages after a full cap eviction).
@@ -219,6 +225,7 @@ class MeshAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         self._mesh_processor = asyncio.create_task(self._mesh_processor_loop())
+        self._outbox_reaper = asyncio.create_task(self._outbox_reaper_loop())
         logger.info(
             "[mesh] Listening on %s:%d — agent '%s'",
             self._host or "* (all interfaces, IPv4+IPv6)",
@@ -244,6 +251,13 @@ class MeshAdapter(BasePlatformAdapter):
                 except asyncio.CancelledError:
                     pass
             self._mesh_processor = None
+        if self._outbox_reaper:
+            self._outbox_reaper.cancel()
+            try:
+                await self._outbox_reaper
+            except asyncio.CancelledError:
+                pass
+            self._outbox_reaper = None
         await self.cancel_background_tasks()
         if self._runner:
             await self._runner.cleanup()
@@ -641,6 +655,21 @@ class MeshAdapter(BasePlatformAdapter):
                 logger.exception("[mesh] Failed to process queued message")
             finally:
                 self._mesh_inbox.task_done()
+
+    async def _outbox_reaper_loop(self) -> None:
+        """Periodically retry messages from the on-disk outbox."""
+        while True:
+            try:
+                await asyncio.sleep(self._outbox_interval)
+                if _outbox.outbox_enabled():
+                    await asyncio.to_thread(
+                        _outbox.retry_outbox,
+                        extra=self.config.extra,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[mesh] Outbox reaper failed")
 
     async def _process_mesh_event(self, event: MessageEvent) -> None:
         """Dispatch one mesh message as a fresh gateway turn."""
