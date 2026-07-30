@@ -299,15 +299,28 @@ def _verify_hmac(
     import hashlib
     import hmac
 
+    timestamp = request_headers.get("x-mesh-timestamp", "")
+    with_ts = f"{timestamp}\n".encode("utf-8") + body
+
     expected = "sha256=" + hmac.new(
-        secret.encode("utf-8"), body, hashlib.sha256
+        secret.encode("utf-8"), with_ts, hashlib.sha256
     ).hexdigest()
-    if not hmac.compare_digest(
+    if hmac.compare_digest(
         request_headers.get("x-hub-signature-256", "").encode("utf-8"),
         expected.encode("utf-8"),
     ):
-        return None, "HMAC verification failed"
-    return from_field, ""
+        return from_field, ""
+
+    expected_legacy = "sha256=" + hmac.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    if hmac.compare_digest(
+        request_headers.get("x-hub-signature-256", "").encode("utf-8"),
+        expected_legacy.encode("utf-8"),
+    ):
+        return from_field, ""
+
+    return None, "HMAC verification failed"
 
 
 def verify_ed25519_signature(
@@ -338,9 +351,12 @@ def verify_ed25519_signature(
         return None, f"unknown sender in registry: {from_field}"
 
     sig = headers.get("x-mesh-signature", "")
-    if not verify_message(peer.public_key, body, sig):
-        return None, "Ed25519 verification failed"
-    return from_field, ""
+    with_ts = f"{timestamp_str}\n".encode("utf-8") + body
+    if verify_message(peer.public_key, with_ts, sig):
+        return from_field, ""
+    if verify_message(peer.public_key, body, sig):
+        return from_field, ""
+    return None, "Ed25519 verification failed"
 
 
 # Backward-compatible alias for internal callers.

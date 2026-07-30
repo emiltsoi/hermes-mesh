@@ -449,13 +449,21 @@ class MeshAdapter(BasePlatformAdapter):
             return None, web.json_response({"status": "unauthorized"}, status=401)
 
         provided = request.headers.get("X-Hub-Signature-256", "")
-        expected = "sha256=" + hmac.new(
-            sender_secret.encode(), body, hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(provided.encode(), expected.encode()):
-            logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
-            return None, web.json_response({"status": "unauthorized"}, status=401)
-        return from_field, None
+        timestamp = request.headers.get("X-Mesh-Timestamp", "")
+        with_ts = f"{timestamp}\n".encode() + body
+
+        def _expected(data: bytes) -> str:
+            return "sha256=" + hmac.new(
+                sender_secret.encode(), data, hashlib.sha256
+            ).hexdigest()
+
+        if hmac.compare_digest(provided.encode(), _expected(with_ts).encode()):
+            return from_field, None
+        if hmac.compare_digest(provided.encode(), _expected(body).encode()):
+            return from_field, None
+
+        logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
+        return None, web.json_response({"status": "unauthorized"}, status=401)
 
     async def _verify_ed25519(
         self, request: "web.Request", body: bytes, from_field: Any
