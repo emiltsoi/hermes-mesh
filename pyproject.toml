@@ -1,6 +1,6 @@
 [project]
 name = "hermes-mesh"
-version = "0.1.12"
+version = "0.1.13"
 description = "Session-aware mesh relay for Hermes fleet agents — agent-to-agent communication, fleet identity, gateway hook float"
 readme = "README.md"
 license = {text = "MIT"}
