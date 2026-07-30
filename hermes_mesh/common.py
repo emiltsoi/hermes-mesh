@@ -8,6 +8,34 @@ from typing import Any
 
 _ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
+# DSN (Delivery-Status Notification) constants
+MESH_DSN_HEADER = "X-Mesh-DSN"
+MESH_DSN_VALUE = "1"
+
+_MESH_HEADER_RE = re.compile(
+    r'^\s*\[mesh\](?:\[v:[^\]]+\])?\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
+    r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
+    r'(?:\[ref:([^\]]+)\])?\s*'
+)
+
+
+def parse_mesh_header(text: str) -> dict | None:
+    """Parse the bracketed [mesh] envelope header into a dict, or None."""
+    m = _MESH_HEADER_RE.match(text)
+    if not m:
+        return None
+    sender, recipient, msg_id, action, reply, ref = m.groups()
+    body_text = text[m.end():].lstrip()
+    return {
+        "sender": sender,
+        "recipient": recipient,
+        "msg_id": msg_id,
+        "action": action,
+        "reply": reply,
+        "ref": ref,
+        "body_text": body_text,
+    }
+
 
 def validate_envelope_token(token: object) -> str:
     """Validate a message id, ref, or task id.

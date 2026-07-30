@@ -30,6 +30,8 @@ from urllib.parse import urlparse
 
 from . import float as _float
 from .common import (
+    MESH_DSN_HEADER,
+    MESH_DSN_VALUE,
     get_metrics_summary,
     record_metric,
     transport as _transport,
@@ -300,6 +302,35 @@ _DELIVERY_BACKOFF = float(os.getenv("MESH_WEBHOOK_DELIVERY_BACKOFF", "1.0"))
 _DELIVERY_TIMEOUT = int(os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT", "10"))
 
 
+_DSN_RATE_BUCKETS: dict[str, tuple[int, float]] = {}
+
+
+def _exception_to_reason(exc: Exception) -> str:
+    """Map a delivery exception to a short, stable reason code."""
+    from urllib.error import HTTPError
+
+    if isinstance(exc, HTTPError):
+        code = exc.code
+        if code in (401, 403):
+            return "unauthorized"
+        if code == 404:
+            return "not-found"
+        if code == 400:
+            return "bad-request"
+        if code == 429:
+            return "rate-limited"
+        if code == 503:
+            return "busy"
+        if code >= 500:
+            return "internal-error"
+    msg = str(exc).lower()
+    if "blocked" in msg or "private" in msg or "loopback" in msg:
+        return "loopback-blocked"
+    if "timeout" in msg:
+        return "unreachable"
+    return "unreachable"
+
+
 def _deliver_webhook(
     url: str,
     body: str,
@@ -308,7 +339,8 @@ def _deliver_webhook(
     allow_loopback: bool = False,
     auth_type: str = "hmac-sha256",
     sign_timestamp: bool = False,
-) -> Optional[str]:
+    extra_headers: dict | None = None,
+) -> tuple[str | None, str | None]:
     """Deliver a signed webhook POST with retry.
 
     Supports HMAC-SHA256 (auth_type='hmac-sha256') and Ed25519
@@ -318,19 +350,23 @@ def _deliver_webhook(
     validation passed. If the first resolved IP is unreachable, the remaining
     getaddrinfo results are tried.
 
-    Returns the delivery_id on success, or None if all retries fail.
+    Returns (delivery_id, None) on success, or (None, reason_code) if all
+    retries fail. The reason_code is a short token such as 'unreachable',
+    'unauthorized', or 'loopback-blocked'.
     """
     try:
         _, resolved_ip_objs = _resolve_target_url(url, allow_loopback=allow_loopback)
     except ValueError as exc:
         logger.error("Mesh relay: invalid target URL %s: %s", url, exc)
-        return None
+        return None, ("loopback-blocked" if "blocked" in str(exc).lower() else "unreachable")
 
     timestamp = str(time.time())
     headers = {
         "Content-Type": "application/json",
         "X-Mesh-Timestamp": timestamp,
     }
+    if extra_headers:
+        headers.update(extra_headers)
     signed_body = f"{timestamp}\n{body}".encode() if sign_timestamp else body.encode()
     if auth_type == "ed25519":
         from .registry_bridge import sign_message as _ed25519_sign
@@ -353,7 +389,7 @@ def _deliver_webhook(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             logger.error("Mesh relay: delivery exceeded total timeout budget")
-            return None
+            return None, "unreachable"
 
         try:
             # Give each attempt an equal share of the remaining budget so a
@@ -375,7 +411,7 @@ def _deliver_webhook(
                     attempt + 1, _DELIVERY_RETRIES,
                 )
             record_metric("send", "total")
-            return delivery_id
+            return delivery_id, None
         except Exception as exc:
             remaining = deadline - time.monotonic()
             if attempt < _DELIVERY_RETRIES - 1 and remaining > 0:
@@ -389,13 +425,182 @@ def _deliver_webhook(
                     )
                     time.sleep(sleep_time)
             else:
+                reason = _exception_to_reason(exc)
                 logger.error(
                     "Mesh relay: delivery failed after %d attempts: %s",
                     _DELIVERY_RETRIES, exc,
                 )
                 record_metric("send", "failed")
-                return None
-    return None
+                return None, reason
+    return None, "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# Delivery-Status Notifications (DSN)
+# ---------------------------------------------------------------------------
+
+_DSN_ENABLED: bool | None = None
+
+
+def _dsn_enabled() -> bool:
+    """Return True when DSN generation is enabled."""
+    global _DSN_ENABLED
+    if _DSN_ENABLED is None:
+        _DSN_ENABLED = os.getenv("MESH_DSN_ENABLED", "1").lower() in ("1", "true", "yes")
+    return _DSN_ENABLED
+
+
+def _dsn_rate_limit(auth_failure: bool = False) -> int:
+    """Return the per-minute DSN rate limit for a recipient."""
+    env = "MESH_DSN_AUTH_FAILURE_RATE_LIMIT" if auth_failure else "MESH_DSN_RATE_LIMIT"
+    default = "0" if auth_failure else "10"
+    raw = os.getenv(env, default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _check_dsn_rate_limit(to_agent: str, auth_failure: bool = False) -> bool:
+    """Return True if a DSN to this recipient is still allowed this minute."""
+    limit = _dsn_rate_limit(auth_failure=auth_failure)
+    if auth_failure and limit <= 0:
+        return False
+    if limit <= 0:
+        return True
+    now = time.time()
+    bucket = _DSN_RATE_BUCKETS.get(to_agent)
+    if bucket is None or now - bucket[1] > 60:
+        _DSN_RATE_BUCKETS[to_agent] = (1, now)
+        return True
+    count, window_start = bucket
+    count += 1
+    _DSN_RATE_BUCKETS[to_agent] = (count, window_start)
+    return count <= limit
+
+
+def _make_dsn_text(
+    dsn_from: str,
+    dsn_to: str,
+    original_id: str,
+    reason: str,
+    original_from: str,
+    original_to: str,
+) -> str:
+    """Build a DSN bracketed message body."""
+    dsn_id = str(uuid.uuid4())
+    safe_reason = re.sub(r"[^A-Za-z0-9_.:-]", "_", reason)[:32]
+    body = (
+        f"[mesh-dsn][status:failed][reason:{safe_reason}] "
+        f"Delivery of message {original_id} from {original_from} to {original_to} "
+        f"failed: {safe_reason}."
+    )
+    header = (
+        f"[mesh][v:1][from:{dsn_from}][to:{dsn_to}][id:{dsn_id}]"
+        f"[action:info][reply:no][ref:{original_id}]"
+    )
+    return f"{header} {body}"
+
+
+def _send_delivery_error(
+    dsn_from: str,
+    dsn_to: str,
+    original_id: str,
+    reason: str,
+    original_from: str,
+    original_to: str,
+    *,
+    is_dsn: bool = False,
+    auth_failure: bool = False,
+) -> None:
+    """Best-effort delivery of a DSN to the interested party."""
+    if not _dsn_enabled():
+        return
+    if is_dsn:
+        logger.debug("[mesh] not sending DSN for a DSN message %s", original_id)
+        return
+    if not _check_dsn_rate_limit(dsn_to, auth_failure=auth_failure):
+        logger.warning("[mesh] DSN rate limit exceeded for %s", dsn_to)
+        return
+
+    try:
+        dsn_from = _validate_agent_name(dsn_from)
+        dsn_to = _validate_agent_name(dsn_to)
+        original_id = validate_envelope_token(original_id)
+    except ValueError as e:
+        logger.warning("[mesh] DSN invalid envelope token: %s", e)
+        return
+
+    dsn_text = _make_dsn_text(dsn_from, dsn_to, original_id, reason, original_from, original_to)
+    dsn_body = json.dumps({"from": dsn_from, "text": dsn_text}, sort_keys=True)
+
+    from . import registry_bridge as _registry_bridge
+
+    if _registry_bridge.identity_source() == "registry":
+        target = _registry_bridge.resolve_target(dsn_to)
+        if not target:
+            logger.warning("[mesh] DSN target %s not found in registry", dsn_to)
+            return
+        target_url = target.get("url", "")
+        auth = target.get("auth", {})
+        if auth.get("type") != "ed25519" or not auth.get("public_key"):
+            logger.warning("[mesh] DSN target %s has no Ed25519 public key", dsn_to)
+            return
+        signing_material, auth_type, _ = _registry_bridge.resolve_sender(dsn_from)
+        if not signing_material or auth_type != "ed25519":
+            logger.warning("[mesh] DSN sender %s has no Ed25519 private key", dsn_from)
+            return
+    else:
+        raw_info = get_raw_agent_identity(dsn_to)
+        if not raw_info:
+            logger.warning("[mesh] DSN target %s not found in fleet vault", dsn_to)
+            return
+        is_valid, error = _validate_agent_webhook_config(raw_info)
+        if not is_valid:
+            logger.warning("[mesh] DSN target %s webhook config invalid: %s", dsn_to, error)
+            return
+        webhook = _transport(raw_info, "hermes_webhook")
+        target_url = webhook.get("url", "")
+        sender_info = get_raw_agent_identity(dsn_from)
+        if not sender_info:
+            logger.warning("[mesh] DSN sender %s has no identity in fleet vault", dsn_from)
+            return
+        sender_secret = _transport_auth_value(_transport(sender_info, "hermes_webhook"), "secret")
+        if not sender_secret:
+            logger.warning("[mesh] DSN sender %s has no webhook secret", dsn_from)
+            return
+        signing_material = sender_secret
+        auth_type = "hmac-sha256"
+
+    if not target_url:
+        logger.warning("[mesh] DSN target %s has no webhook URL", dsn_to)
+        return
+
+    extra_headers = {MESH_DSN_HEADER: MESH_DSN_VALUE}
+    allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
+    sign_timestamp = _sign_timestamp_enabled()
+    delivery_id, dsn_error = _deliver_webhook(
+        target_url,
+        dsn_body,
+        signing_material,
+        allow_loopback=allow_loopback,
+        auth_type=auth_type,
+        sign_timestamp=sign_timestamp,
+        extra_headers=extra_headers,
+    )
+    if delivery_id is None:
+        logger.warning("[mesh] DSN delivery to %s failed: %s", dsn_to, dsn_error)
+        if outbox.outbox_enabled():
+            outbox.queue_message(
+                dsn_from,
+                dsn_to,
+                dsn_text,
+                dsn_body,
+                is_dsn=True,
+                ref=original_id,
+            )
+    else:
+        logger.info("[mesh] DSN delivered to %s: %s", dsn_to, delivery_id)
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +750,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
     allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
     sign_timestamp = _sign_timestamp_enabled()
-    delivery_id = _deliver_webhook(
+    delivery_id, error = _deliver_webhook(
         target_url,
         body,
         signing_material,
@@ -557,7 +762,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     if delivery_id is None:
         record_metric("send", "failed")
         if outbox.outbox_enabled():
-            outbox.queue_message(from_agent, agent, padded_message, body)
+            outbox.queue_message(from_agent, agent, padded_message, body, ref=ref)
             return {
                 "task_id": task_id,
                 "state": "queued",
@@ -568,6 +773,16 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 "agent": agent,
                 "gateway_delivery": False,
             }
+        # Immediate final failure: send DSN to the interested party.
+        dsn_to = agent if ref else from_agent
+        _send_delivery_error(
+            from_agent,
+            dsn_to,
+            task_id,
+            error or "unreachable",
+            from_agent,
+            agent,
+        )
         return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}
 
     # Part 2: Telegram float (best-effort, non-blocking)

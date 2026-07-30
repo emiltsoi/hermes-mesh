@@ -36,7 +36,8 @@ except ImportError:
 from . import float as _float
 from . import outbox as _outbox
 from .identity import get_raw_agent_identity
-from .session_relay import _validate_agent_name
+from .common import MESH_DSN_HEADER, MESH_DSN_VALUE
+from .session_relay import _dsn_enabled, _send_delivery_error, _validate_agent_name
 from .network import is_loopback_bind_host
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -174,6 +175,7 @@ class MeshAdapter(BasePlatformAdapter):
         # previously-seen messages after a full cap eviction).
         self._seen_message_ids: Dict[str, float] = {}
         self._sender_rate_buckets: Dict[str, tuple[int, float]] = {}
+        self._dsn_rate_buckets: Dict[str, tuple[int, float]] = {}
         self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue(maxsize=256)
         self._mesh_processor: Optional[asyncio.Task] = None
 
@@ -313,6 +315,7 @@ class MeshAdapter(BasePlatformAdapter):
         rate_err = self._check_rate_limit(sender)
         if rate_err:
             record_metric("receive", "rate_limited")
+            self._send_receive_dsn(request, text, sender, msg_id, "rate-limited")
             return rate_err
 
         if msg_id in self._seen_message_ids:
@@ -329,6 +332,7 @@ class MeshAdapter(BasePlatformAdapter):
                 from_field,
             )
             record_metric("receive", "unauthorized")
+            self._send_receive_dsn(request, text, from_field or sender, msg_id, "unauthorized")
             return web.json_response({"status": "unauthorized"}, status=401)
 
         if recipient != self._agent_name:
@@ -338,12 +342,14 @@ class MeshAdapter(BasePlatformAdapter):
                 self._agent_name,
             )
             record_metric("receive", "unauthorized")
+            self._send_receive_dsn(request, text, sender, msg_id, "not-found")
             return web.json_response({"status": "not found"}, status=404)
 
         event, err = self._build_event(
             payload, sender, recipient, msg_id, action, reply, ref, body_text
         )
         if err:
+            self._send_receive_dsn(request, text, sender, msg_id, "internal-error")
             return err
 
         logger.info(
@@ -359,6 +365,7 @@ class MeshAdapter(BasePlatformAdapter):
             self._mesh_inbox.put_nowait(event)
         except asyncio.QueueFull:
             logger.warning("[mesh] Inbox full; rejecting message %s", msg_id)
+            self._send_receive_dsn(request, text, sender, msg_id, "busy")
             return web.json_response(
                 {"status": "busy", "delivery_id": msg_id},
                 status=503,
@@ -418,6 +425,40 @@ class MeshAdapter(BasePlatformAdapter):
             logger.warning("[mesh] rate limit exceeded for sender '%s'", sender)
             return web.json_response({"status": "rate limited"}, status=429)
         return None
+
+    def _is_dsn_request(self, request: "web.Request", text: str) -> bool:
+        """Return True if the request is itself a DSN; DSNs don't cause DSNs."""
+        if request.headers.get(MESH_DSN_HEADER) == MESH_DSN_VALUE:
+            return True
+        # Body-level fallback in case a DSN was relayed through a peer that
+        # strips custom headers.
+        if text.startswith("[mesh]") and text.find("[mesh-dsn]") != -1:
+            return True
+        return False
+
+    def _send_receive_dsn(
+        self,
+        request: "web.Request",
+        text: str,
+        sender: str,
+        msg_id: str,
+        reason: str,
+    ) -> None:
+        """Best-effort DSN back to the sender after a receive-side failure."""
+        if not _dsn_enabled():
+            return
+        if self._is_dsn_request(request, text):
+            return
+        if not sender or not msg_id:
+            return
+        _send_delivery_error(
+            self._agent_name,
+            sender,
+            msg_id,
+            reason,
+            sender,
+            self._agent_name,
+        )
 
     def _verify_hmac(
         self, request: "web.Request", body: bytes, from_field: Any
