@@ -169,7 +169,7 @@ def _webhook_allow_loopback() -> bool:
 
 def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     """Try to deliver one outbox item.  Return True on success."""
-    from .session_relay import _deliver_webhook
+    from .session_relay import _deliver_webhook, _sign_timestamp_enabled
 
     from_agent = item["from"]
     to_agent = item["to"]
@@ -180,12 +180,14 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     if error:
         logger.warning("Mesh outbox: cannot resolve %s -> %s: %s", from_agent, to_agent, error)
         return False
+    sign_timestamp = bool(extra and extra.get("sign_timestamp")) or _sign_timestamp_enabled()
     delivery_id = _deliver_webhook(
         target_url,
         body,
         signing_material,
         allow_loopback=_webhook_allow_loopback() or _is_local_url(target_url),
         auth_type=auth_type,
+        sign_timestamp=sign_timestamp,
     )
     if delivery_id is not None:
         record_metric("send", "outbox_delivered")

@@ -77,6 +77,12 @@ def _webhook_allow_loopback() -> bool:
     return env.lower() in ("1", "true", "yes")
 
 
+def _sign_timestamp_enabled() -> bool:
+    """Return True when mesh_send should include X-Mesh-Timestamp in the signed payload."""
+    env = os.getenv("MESH_SIGN_TIMESTAMP", "")
+    return env.lower() in ("1", "true", "yes")
+
+
 def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> bool:
     """Return True when `ip_obj` must be rejected for the given policy.
 
@@ -301,6 +307,7 @@ def _deliver_webhook(
     *,
     allow_loopback: bool = False,
     auth_type: str = "hmac-sha256",
+    sign_timestamp: bool = False,
 ) -> Optional[str]:
     """Deliver a signed webhook POST with retry.
 
@@ -324,15 +331,16 @@ def _deliver_webhook(
         "Content-Type": "application/json",
         "X-Mesh-Timestamp": timestamp,
     }
+    signed_body = f"{timestamp}\n{body}".encode() if sign_timestamp else body.encode()
     if auth_type == "ed25519":
         from .registry_bridge import sign_message as _ed25519_sign
 
-        sig = _ed25519_sign(signing_material, body.encode())
+        sig = _ed25519_sign(signing_material, signed_body)
         headers["X-Mesh-Signature"] = sig
     else:
         sig = hmac.new(
             signing_material.encode(),
-            body.encode(),
+            signed_body,
             hashlib.sha256,
         ).hexdigest()
         headers["X-Hub-Signature-256"] = f"sha256={sig}"
@@ -535,12 +543,14 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
     allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
+    sign_timestamp = _sign_timestamp_enabled()
     delivery_id = _deliver_webhook(
         target_url,
         body,
         signing_material,
         allow_loopback=allow_loopback,
         auth_type=auth_type,
+        sign_timestamp=sign_timestamp,
     )
 
     if delivery_id is None:
