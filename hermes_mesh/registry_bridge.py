@@ -46,8 +46,15 @@ def _registry_client(name: str, extra: dict | None = None) -> Any:
     url = _registry_url(extra)
     if not url:
         raise RuntimeError("registry_url is required for registry operations")
+    effective = mesh_extra(extra)
+    pin = effective.get("registry_pin", os.getenv("MESH_REGISTRY_PIN", "")).strip() or None
+    allow_insecure = effective.get("allow_insecure_registry") or os.getenv(
+        "MESH_REGISTRY_ALLOW_INSECURE", ""
+    ).lower() in ("1", "true", "yes")
     private_pem, public_pem = auth.load_or_generate_keypair(name, extra)
-    return RegistryClient(url, private_pem, public_pem)
+    return RegistryClient(
+        url, private_pem, public_pem, pin=pin, allow_insecure=allow_insecure
+    )
 
 
 def list_peers(extra: dict | None = None) -> list[Any]:
