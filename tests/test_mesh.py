@@ -924,3 +924,62 @@ class TestRegistrySend:
 
         sig = headers["X-Mesh-Signature"]
         assert verify_message(sender_public, body, sig)
+
+
+class TestRegistryClient:
+    """Registry client construction with pin and allow_insecure options."""
+
+    def test_registry_client_passes_pin_and_allow_insecure(self, monkeypatch):
+        pytest.importorskip("mesh_peer_registry")
+        from hermes_mesh import registry_bridge
+
+        monkeypatch.setenv("MESH_AGENT_NAME", "sender")
+        with patch("hermes_mesh.registry_bridge.auth.load_or_generate_keypair", return_value=("private", "public")), \
+             patch.object(registry_bridge, "RegistryClient") as MockClient:
+            MockClient.return_value.list_peers.return_value = []
+            extra = {
+                "registry_url": "http://127.0.0.1:8646",
+                "registry_pin": "deadbeef",
+                "allow_insecure_registry": True,
+            }
+            result = registry_bridge.list_peers(extra)
+            assert result == []
+            _, _, _, kwargs = MockClient.call_args
+            assert kwargs["pin"] == "deadbeef"
+            assert kwargs["allow_insecure"] is True
+
+    def test_registry_client_env_fallbacks(self, monkeypatch):
+        pytest.importorskip("mesh_peer_registry")
+        from hermes_mesh import registry_bridge
+
+        monkeypatch.setenv("MESH_AGENT_NAME", "sender")
+        monkeypatch.setenv("MESH_REGISTRY_PIN", "envpin")
+        monkeypatch.setenv("MESH_REGISTRY_ALLOW_INSECURE", "1")
+        with patch("hermes_mesh.registry_bridge.auth.load_or_generate_keypair", return_value=("private", "public")), \
+             patch.object(registry_bridge, "RegistryClient") as MockClient:
+            MockClient.return_value.list_peers.return_value = []
+            extra = {"registry_url": "http://127.0.0.1:8646"}
+            registry_bridge.list_peers(extra)
+            _, _, _, kwargs = MockClient.call_args
+            assert kwargs["pin"] == "envpin"
+            assert kwargs["allow_insecure"] is True
+
+    def test_registry_client_extra_overrides_env(self, monkeypatch):
+        pytest.importorskip("mesh_peer_registry")
+        from hermes_mesh import registry_bridge
+
+        monkeypatch.setenv("MESH_AGENT_NAME", "sender")
+        monkeypatch.setenv("MESH_REGISTRY_PIN", "envpin")
+        monkeypatch.setenv("MESH_REGISTRY_ALLOW_INSECURE", "0")
+        with patch("hermes_mesh.registry_bridge.auth.load_or_generate_keypair", return_value=("private", "public")), \
+             patch.object(registry_bridge, "RegistryClient") as MockClient:
+            MockClient.return_value.list_peers.return_value = []
+            extra = {
+                "registry_url": "http://127.0.0.1:8646",
+                "registry_pin": "overpin",
+                "allow_insecure_registry": True,
+            }
+            registry_bridge.list_peers(extra)
+            _, _, _, kwargs = MockClient.call_args
+            assert kwargs["pin"] == "overpin"
+            assert kwargs["allow_insecure"] is True
