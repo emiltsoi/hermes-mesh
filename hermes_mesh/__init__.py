@@ -1,6 +1,6 @@
 """Hermes Mesh — session-aware fleet relay plugin.
 
-Registers tools: mesh_list, mesh_register, mesh_send.
+Registers tools: mesh_list, mesh_register, mesh_send, mesh_deregister, mesh_sync, mesh_publish.
 Does NOT re-implement standard A2A — delegates to the upstream
 Hermes A2A platform adapter for discover/call/serve.
 """
@@ -15,14 +15,14 @@ __all__ = ["register"]
 
 
 def validate_config(config) -> bool:
-    """Require a mesh HMAC secret (or INSECURE_NO_AUTH for loopback testing)."""
+    """Require a mesh auth sentinel (or INSECURE_NO_AUTH for loopback testing)."""
     if config is None or not hasattr(config, "extra"):
         logger.error("Hermes Mesh: missing platform config")
         return False
     secret = config.extra.get("secret", "")
     if not secret:
         logger.error(
-            "Hermes Mesh: platforms.mesh.extra.secret is required; "
+            "Hermes Mesh: platforms.mesh.extra.secret is required as an auth-enable sentinel; "
             "use INSECURE_NO_AUTH only on loopback for local testing"
         )
         return False
@@ -62,9 +62,11 @@ def register(ctx) -> None:
         handle_mesh_deregister,
         handle_mesh_health,
         handle_mesh_list,
+        handle_mesh_publish,
         handle_mesh_refresh_identities,
         handle_mesh_register,
         handle_mesh_send,
+        handle_mesh_sync,
     )
 
     ctx.register_tool(
@@ -87,8 +89,9 @@ def register(ctx) -> None:
         schema={
             "name": "mesh_register",
             "description": (
-                "Register or update an agent identity in the fleet mesh vault. "
-                "Requires name, url, and secret."
+                "Register or update an agent identity in the local mesh cache. "
+                "Requires name and url. If public_key is omitted, an Ed25519 "
+                "keypair is generated automatically."
             ),
             "parameters": {
                 "type": "object",
@@ -101,9 +104,9 @@ def register(ctx) -> None:
                         "type": "string",
                         "description": "Hermes webhook URL for this agent",
                     },
-                    "secret": {
+                    "public_key": {
                         "type": "string",
-                        "description": "Shared HMAC secret for this agent",
+                        "description": "Optional Ed25519 public key PEM. If omitted, one is generated.",
                     },
                     "role": {
                         "type": "string",
@@ -125,10 +128,6 @@ def register(ctx) -> None:
                         "description": "Validate the request without writing",
                         "default": False,
                     },
-                    "ttl": {
-                        "type": "integer",
-                        "description": "Optional TTL in seconds for registry entries",
-                    },
                     "bulk": {
                         "type": "array",
                         "description": "Bulk register multiple agents at once",
@@ -137,10 +136,9 @@ def register(ctx) -> None:
                             "properties": {
                                 "name": {"type": "string", "description": "Agent name"},
                                 "url": {"type": "string", "description": "Hermes webhook URL"},
-                                "secret": {"type": "string", "description": "HMAC secret (file backend)"},
+                                "public_key": {"type": "string", "description": "Optional Ed25519 public key PEM"},
                                 "role": {"type": "string", "description": "Role"},
                                 "description": {"type": "string", "description": "Description"},
-                                "ttl": {"type": "integer", "description": "Optional TTL in seconds"},
                             },
                             "required": ["name", "url"],
                         },
@@ -254,6 +252,74 @@ def register(ctx) -> None:
             },
         },
         handler=_json_dump_handler(handle_mesh_send),
+    )
+
+    ctx.register_tool(
+        name="mesh_sync",
+        toolset="mesh",
+        schema={
+            "name": "mesh_sync",
+            "description": (
+                "Sync one or all peer identities from the mesh-peer-registry to the local cache. "
+                "If name is omitted, all peers are synced."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Optional agent name to sync",
+                    },
+                    "registry_url": {
+                        "type": "string",
+                        "description": "Optional registry URL override",
+                    },
+                },
+            },
+        },
+        handler=_json_dump_handler(handle_mesh_sync),
+    )
+
+    ctx.register_tool(
+        name="mesh_publish",
+        toolset="mesh",
+        schema={
+            "name": "mesh_publish",
+            "description": "Publish the local agent's identity to the mesh-peer-registry.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Agent name (defaults to MESH_AGENT_NAME env var)",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Hermes webhook URL for this agent",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role description",
+                        "default": "agent",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Human-readable agent description",
+                        "default": "",
+                    },
+                    "ttl": {
+                        "type": "integer",
+                        "description": "Optional TTL in seconds for registry entries",
+                    },
+                    "registry_url": {
+                        "type": "string",
+                        "description": "Optional registry URL override",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+        handler=_json_dump_handler(handle_mesh_publish),
     )
     logger.info("Hermes Mesh: registered mesh tools")
 

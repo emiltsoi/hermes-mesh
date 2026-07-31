@@ -108,7 +108,7 @@ def _do_load_identity_yaml(path: Path) -> Optional[dict]:
             continue
         auth = transport.get("auth")
         if isinstance(auth, dict):
-            for key in ("token", "secret", "value"):
+            for key in ("token", "public_key", "value"):
                 if key in auth:
                     auth[key] = _resolve_env(auth[key])
     return raw

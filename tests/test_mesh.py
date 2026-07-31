@@ -1,7 +1,5 @@
 """Tests for hermes-mesh session relay — includes SEC-01 and SEC-02 regression tests."""
 import asyncio
-import hashlib
-import hmac
 import json
 import os
 import stat
@@ -13,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hermes_mesh import auth as mesh_auth
 from hermes_mesh.adapter import MeshAdapter
 from hermes_mesh.network import is_loopback_bind_host
 from hermes_mesh.common import validate_envelope_token
@@ -27,8 +26,8 @@ from hermes_mesh.session_relay import (
     handle_mesh_send,
     handle_mesh_list,
     handle_mesh_register,
+    _deliver_webhook,
     _validate_target_url,
-    _validate_agent_webhook_config,
     _validate_agent_name,
     _pinned_request,
     _is_ip_blocked,
@@ -69,7 +68,7 @@ class TestIdentity:
                 "transports": {
                     "hermes_webhook": {
                         "url": "http://127.0.0.1:9999/webhook",
-                        "auth": {"type": "hmac-sha256", "secret": "test-secret"},
+                        "auth": {"public_key": "test-public-key-pem"},
                     },
                 },
             }
@@ -87,7 +86,7 @@ class TestIdentity:
 
                 raw = get_raw_agent_identity("testagent")
                 assert raw is not None
-                assert raw["transports"]["hermes_webhook"]["auth"]["secret"] == "test-secret"
+                assert raw["transports"]["hermes_webhook"]["auth"]["public_key"] == "test-public-key-pem"
 
     def test_resolve_agent_without_webhook_returns_empty_url(self):
         """Regression: identity without hermes_webhook should return no mesh url."""
@@ -209,35 +208,6 @@ class TestSSRF:
         assert _is_ip_blocked(ipaddress.ip_address("100.64.0.1"), allow_loopback=True)
 
 
-class TestWebhookValidation:
-    def test_missing_url(self):
-        ok, err = _validate_agent_webhook_config({"transports": {}})
-        assert not ok
-        assert "url" in err.lower()
-
-    def test_missing_secret(self):
-        ok, err = _validate_agent_webhook_config({
-            "transports": {
-                "hermes_webhook": {
-                    "url": "http://127.0.0.1:9999",
-                    "auth": {"type": "hmac-sha256"},
-                }
-            }
-        })
-        assert not ok
-        assert "secret" in err.lower()
-
-    def test_valid_config(self):
-        ok, err = _validate_agent_webhook_config({
-            "transports": {
-                "hermes_webhook": {
-                    "url": "http://127.0.0.1:9999/webhook",
-                    "auth": {"type": "hmac-sha256", "secret": "test-secret"},
-                }
-            }
-        })
-        assert ok
-        assert err == ""
 
 
 class TestSessionRelay:
@@ -252,7 +222,7 @@ class TestSessionRelay:
         assert "agent" in result["error"].lower()
 
     def test_agent_not_found(self):
-        with patch("hermes_mesh.session_relay.get_raw_agent_identity") as mock_raw:
+        with patch("hermes_mesh.identity.get_raw_agent_identity") as mock_raw:
             mock_raw.return_value = None
             result = handle_mesh_send(
                 {"message": "hello", "agent": "nonexistent"}
@@ -274,20 +244,27 @@ class TestSessionRelay:
                 "transports": {
                     "hermes_webhook": {
                         "url": "http://127.0.0.1:19999/webhook",
-                        "auth": {"type": "hmac-sha256", "secret": "test-secret"},
+                        "auth": {"public_key": "test-public-key-pem"},
                     },
                 },
             }
             with open(agent_dir / "identity.yaml", "w") as f:
                 yaml.safe_dump(identity, f)
 
+            private_pem, _ = mesh_auth.load_or_generate_keypair(
+                "testagent",
+                extra={"private_key_path": str(Path(tmpdir) / "testagent.pem")},
+            )
+
             with (
                 patch.dict(os.environ, {"MESH_AGENT_NAME": "testagent"}),
-                patch("hermes_mesh.session_relay.get_raw_agent_identity") as mock_raw,
+                patch("hermes_mesh.identity.get_raw_agent_identity") as mock_raw,
+                patch("hermes_mesh.auth.resolve_sender") as mock_resolve_sender,
                 patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver,
                 patch("hermes_mesh.session_relay._float.send") as mock_float,
             ):
                 mock_raw.return_value = identity
+                mock_resolve_sender.return_value = (private_pem, None)
                 mock_deliver.return_value = ("delivery-123", None)
 
                 result = handle_mesh_send(
@@ -320,7 +297,7 @@ class TestMeshListRegister:
                 "transports": {
                     "hermes_webhook": {
                         "url": "http://127.0.0.1:8645/mesh/receive",
-                        "auth": {"type": "hmac-sha256", "secret": "secret"},
+                        "auth": {"public_key": "agent0-public-key"},
                     },
                 },
             }
@@ -336,34 +313,38 @@ class TestMeshListRegister:
                 assert result["count"] == 1
                 assert result["agents"][0]["name"] == "agent0"
 
-    def test_mesh_register(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
-                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
-                mock_mesh.return_value = Path(tmpdir)
+    def test_mesh_register(self, tmp_path):
+        with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
+             patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
+            mock_mesh.return_value = tmp_path
 
-                from hermes_mesh.session_relay import handle_mesh_register
-                result = handle_mesh_register({
-                    "name": "daji",
-                    "url": "http://127.0.0.1:8645/mesh/receive",
-                    "secret": "daji-secret",
-                    "role": "operator",
-                })
-                assert result["registered"] is True
-                assert result["name"] == "daji"
+            _, public_pem = mesh_auth.load_or_generate_keypair(
+                "daji",
+                extra={"private_key_path": str(tmp_path / "daji.pem")},
+            )
 
-                # mesh_list should now include daji
-                from hermes_mesh.session_relay import handle_mesh_list
-                result2 = handle_mesh_list()
-                assert any(a["name"] == "daji" for a in result2["agents"])
+            from hermes_mesh.session_relay import handle_mesh_register
+            result = handle_mesh_register({
+                "name": "daji",
+                "url": "http://127.0.0.1:8645/mesh/receive",
+                "public_key": public_pem,
+                "role": "operator",
+            })
+            assert result["registered"] is True
+            assert result["name"] == "daji"
+
+            # mesh_list should now include daji
+            from hermes_mesh.session_relay import handle_mesh_list
+            result2 = handle_mesh_list()
+            assert any(a["name"] == "daji" for a in result2["agents"])
 
 
 
-class TestHMACSecretSelection:
-    """mesh_send signs with the sender's own secret for per-agent HMAC."""
+class TestEd25519Signing:
+    """mesh_send signs with the sender's Ed25519 private key."""
 
-    def test_uses_sender_secret(self):
-        """When a sender identity exists, mesh_send signs with that secret."""
+    def test_uses_sender_private_key(self, tmp_path):
+        """When a sender identity exists, mesh_send signs with that private key."""
         import os
         from unittest.mock import patch
         from hermes_mesh.session_relay import handle_mesh_send
@@ -374,37 +355,72 @@ class TestHMACSecretSelection:
             "transports": {
                 "hermes_webhook": {
                     "url": "http://127.0.0.1:8645/mesh/receive",
-                    "auth": {"type": "hmac-sha256", "secret": "target-secret"},
+                    "auth": {"public_key": "target-public-key"},
                 },
             },
         }
-        sender_identity = {
-            "id": "sender",
-            "name": "sender",
-            "transports": {
-                "hermes_webhook": {
-                    "url": "http://127.0.0.1:8645/mesh/receive",
-                    "auth": {"type": "hmac-sha256", "secret": "sender-secret"},
-                },
-            },
-        }
+
+        sender_private, sender_public = mesh_auth.load_or_generate_keypair(
+            "sender",
+            extra={"private_key_path": str(tmp_path / "sender.pem")},
+        )
 
         def _raw(name):
-            if name == "sender":
-                return sender_identity
-            return target_identity
+            if name == "target":
+                return target_identity
+            return None
 
-        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}),              patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw),              patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver,              patch("hermes_mesh.session_relay._float.send"):
+        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}), \
+             patch("hermes_mesh.identity.get_raw_agent_identity", side_effect=_raw), \
+             patch("hermes_mesh.auth.resolve_sender") as mock_resolve_sender, \
+             patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver, \
+             patch("hermes_mesh.session_relay._float.send"):
+            mock_resolve_sender.return_value = (sender_private, None)
             mock_deliver.return_value = ("delivered", None)
 
             result = handle_mesh_send({"message": "hi", "agent": "target"})
             assert result.get("status") == "delivered"
             mock_deliver.assert_called_once()
-            assert mock_deliver.call_args[0][2] == "sender-secret"
+            signing_material = mock_deliver.call_args[0][2]
+            assert "BEGIN PRIVATE KEY" in signing_material
+            body = mock_deliver.call_args[0][1]
+            sig = mesh_auth.sign_ed25519(signing_material, body.encode())
+            assert mesh_auth.verify_ed25519(sender_public, body.encode(), sig)
 
+    def test_deliver_webhook_signs_with_ed25519(self, tmp_path, monkeypatch):
+        """_deliver_webhook adds an X-Mesh-Signature header that verifies."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("MESH_WEBHOOK_ALLOW_LOOPBACK", "1")
+
+        private_pem, public_pem = mesh_auth.load_or_generate_keypair(
+            "sender",
+            extra={"private_key_path": str(tmp_path / "sender.pem")},
+        )
+        body = json.dumps({"from": "sender", "text": "[mesh] hello"})
+
+        with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned:
+            mock_pinned.return_value = b'{"delivery_id":"d1"}'
+            delivery_id, error = _deliver_webhook(
+                "http://127.0.0.1:8645/mesh/receive",
+                body,
+                private_pem,
+                allow_loopback=True,
+            )
+
+        assert delivery_id == "d1"
+        assert error is None
+        mock_pinned.assert_called_once()
+        url, sent_body, headers, *_ = mock_pinned.call_args[0]
+        assert "X-Mesh-Signature" in headers
+        assert "X-Mesh-Timestamp" in headers
+        assert "X-Hub-Signature-256" not in headers
+
+        sig = headers["X-Mesh-Signature"]
+        assert mesh_auth.verify_ed25519(public_pem, sent_body, sig)
 
 class TestAdapterHandleMesh:
-    """Adapter intake: replay window, envelope validation, per-agent HMAC."""
+    """Adapter intake: replay window, envelope validation, per-agent Ed25519."""
 
     @staticmethod
     def _make_adapter(secret="INSECURE_NO_AUTH", agent_name="ada", target_session="telegram:dm:123", host=None):
@@ -422,7 +438,7 @@ class TestAdapterHandleMesh:
     @staticmethod
     def _make_request(body, headers):
         request = MagicMock()
-        request.read = AsyncMock(return_value=json.dumps(body).encode())
+        request.read = AsyncMock(return_value=json.dumps(body, sort_keys=True).encode())
         request.headers = headers
         return request
 
@@ -514,43 +530,70 @@ class TestAdapterHandleMesh:
         resp = self._run(adapter._handle_mesh(req))
         assert resp.status in (400, 401)
 
-    def test_hmac_verifies_with_sender_secret(self):
-        adapter = self._make_adapter(secret="receiver-secret")
+    def test_ed25519_verifies_with_sender_key(self, tmp_path):
+        adapter = self._make_adapter(secret="ed25519", agent_name="ada")
         sender = "daji"
         text = self._envelope(sender=sender, recipient="ada")
-        body = json.dumps({"from": sender, "text": text}, sort_keys=True).encode()
-        sig = "sha256=" + hmac.new(b"sender-secret", body, hashlib.sha256).hexdigest()
+        body = {"from": sender, "text": text}
+        body_bytes = json.dumps(body, sort_keys=True).encode()
+        timestamp = str(time.time())
+        signed_payload = f"{timestamp}\n".encode() + body_bytes
+
+        private_pem, public_pem = mesh_auth.load_or_generate_keypair(
+            sender,
+            extra={"private_key_path": str(tmp_path / f"{sender}.pem")},
+        )
+        sig = mesh_auth.sign_ed25519(private_pem, signed_payload)
+
         req = self._make_request(
-            {"from": sender, "text": text},
+            body,
             {
-                "X-Mesh-Timestamp": str(time.time()),
-                "X-Hub-Signature-256": sig,
+                "X-Mesh-Timestamp": timestamp,
+                "X-Mesh-Signature": sig,
             },
         )
-        with patch("hermes_mesh.adapter.get_raw_agent_identity") as mock_raw, \
-             patch("hermes_mesh.adapter._transport") as mock_transport, \
-             patch("hermes_mesh.adapter._transport_auth_value", return_value="sender-secret"):
-            mock_raw.return_value = {"id": sender}
-            mock_transport.return_value = {"auth": {"secret": "sender-secret"}}
+        with patch("hermes_mesh.adapter.get_raw_agent_identity") as mock_raw:
+            mock_raw.return_value = {
+                "id": sender,
+                "transports": {
+                    "hermes_webhook": {
+                        "url": "http://127.0.0.1:9999",
+                        "auth": {"public_key": public_pem},
+                    },
+                },
+            }
             resp = self._run(adapter._handle_mesh(req))
         assert resp.status == 202
 
-    def test_hmac_rejects_bad_signature(self):
-        adapter = self._make_adapter(secret="receiver-secret")
+    def test_ed25519_rejects_bad_signature(self, tmp_path):
+        adapter = self._make_adapter(secret="ed25519", agent_name="ada")
         sender = "daji"
         text = self._envelope(sender=sender, recipient="ada")
+        body = {"from": sender, "text": text}
+        timestamp = str(time.time())
+
+        _, public_pem = mesh_auth.load_or_generate_keypair(
+            sender,
+            extra={"private_key_path": str(tmp_path / f"{sender}.pem")},
+        )
+
         req = self._make_request(
-            {"from": sender, "text": text},
+            body,
             {
-                "X-Mesh-Timestamp": str(time.time()),
-                "X-Hub-Signature-256": "sha256=badcafe",
+                "X-Mesh-Timestamp": timestamp,
+                "X-Mesh-Signature": "aW52YWxpZA==",
             },
         )
-        with patch("hermes_mesh.adapter.get_raw_agent_identity") as mock_raw, \
-             patch("hermes_mesh.adapter._transport") as mock_transport, \
-             patch("hermes_mesh.adapter._transport_auth_value", return_value="sender-secret"):
-            mock_raw.return_value = {"id": sender}
-            mock_transport.return_value = {"auth": {"secret": "sender-secret"}}
+        with patch("hermes_mesh.adapter.get_raw_agent_identity") as mock_raw:
+            mock_raw.return_value = {
+                "id": sender,
+                "transports": {
+                    "hermes_webhook": {
+                        "url": "http://127.0.0.1:9999",
+                        "auth": {"public_key": public_pem},
+                    },
+                },
+            }
             resp = self._run(adapter._handle_mesh(req))
         assert resp.status == 401
 
@@ -653,43 +696,51 @@ class TestFloatTokenRedaction:
 class TestMeshRegister:
     """mesh_register should create and optionally overwrite identities."""
 
-    def test_refuses_overwrite_by_default(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
-                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
-                mock_mesh.return_value = Path(tmpdir)
+    def test_refuses_overwrite_by_default(self, tmp_path):
+        with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
+             patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
+            mock_mesh.return_value = tmp_path
 
-                handle_mesh_register({
-                    "name": "daji",
-                    "url": "http://127.0.0.1:8645/mesh/receive",
-                    "secret": "daji-secret",
-                })
-                result = handle_mesh_register({
-                    "name": "daji",
-                    "url": "http://127.0.0.1:8646/mesh/receive",
-                    "secret": "new-secret",
-                })
-                assert result["registered"] is False
-                assert "overwrite=True" in result["error"]
+            _, public_pem = mesh_auth.load_or_generate_keypair(
+                "daji",
+                extra={"private_key_path": str(tmp_path / "daji.pem")},
+            )
 
-    def test_allows_overwrite_when_requested(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
-                 patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
-                mock_mesh.return_value = Path(tmpdir)
+            handle_mesh_register({
+                "name": "daji",
+                "url": "http://127.0.0.1:8645/mesh/receive",
+                "public_key": public_pem,
+            })
+            result = handle_mesh_register({
+                "name": "daji",
+                "url": "http://127.0.0.1:8646/mesh/receive",
+                "public_key": public_pem,
+            })
+            assert result["registered"] is False
+            assert "overwrite=True" in result["error"]
 
-                handle_mesh_register({
-                    "name": "daji",
-                    "url": "http://127.0.0.1:8645/mesh/receive",
-                    "secret": "daji-secret",
-                })
-                result = handle_mesh_register({
-                    "name": "daji",
-                    "url": "http://127.0.0.1:8646/mesh/receive",
-                    "secret": "new-secret",
-                    "overwrite": True,
-                })
-                assert result["registered"] is True
+    def test_allows_overwrite_when_requested(self, tmp_path):
+        with patch.dict(os.environ, {"MESH_REGISTER_ALLOW_LOOPBACK": "1"}), \
+             patch("hermes_mesh.identity._mesh_agents_root") as mock_mesh:
+            mock_mesh.return_value = tmp_path
+
+            _, public_pem = mesh_auth.load_or_generate_keypair(
+                "daji",
+                extra={"private_key_path": str(tmp_path / "daji.pem")},
+            )
+
+            handle_mesh_register({
+                "name": "daji",
+                "url": "http://127.0.0.1:8645/mesh/receive",
+                "public_key": public_pem,
+            })
+            result = handle_mesh_register({
+                "name": "daji",
+                "url": "http://127.0.0.1:8646/mesh/receive",
+                "public_key": public_pem,
+                "overwrite": True,
+            })
+            assert result["registered"] is True
 
 
 class TestEnvelopeToken:
@@ -719,7 +770,7 @@ class TestMeshSendValidation:
         with pytest.raises(ValueError):
             validate_envelope_token("bad id")
 
-    def test_uses_custom_task_id_in_envelope(self):
+    def test_uses_custom_task_id_in_envelope(self, tmp_path):
         import os
 
         target_identity = {
@@ -728,30 +779,26 @@ class TestMeshSendValidation:
             "transports": {
                 "hermes_webhook": {
                     "url": "http://127.0.0.1:8645/mesh/receive",
-                    "auth": {"type": "hmac-sha256", "secret": "target-secret"},
+                    "auth": {"public_key": "target-public-key"},
                 },
             },
         }
-        sender_identity = {
-            "id": "sender",
-            "name": "sender",
-            "transports": {
-                "hermes_webhook": {
-                    "url": "http://127.0.0.1:8645/mesh/receive",
-                    "auth": {"type": "hmac-sha256", "secret": "sender-secret"},
-                },
-            },
-        }
+        sender_private, _ = mesh_auth.load_or_generate_keypair(
+            "sender",
+            extra={"private_key_path": str(tmp_path / "sender.pem")},
+        )
 
         def _raw(name):
-            if name == "sender":
-                return sender_identity
-            return target_identity
+            if name == "target":
+                return target_identity
+            return None
 
         with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}), \
-             patch("hermes_mesh.session_relay.get_raw_agent_identity", side_effect=_raw), \
+             patch("hermes_mesh.identity.get_raw_agent_identity", side_effect=_raw), \
+             patch("hermes_mesh.auth.resolve_sender") as mock_resolve_sender, \
              patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver, \
              patch("hermes_mesh.session_relay._float.send"):
+            mock_resolve_sender.return_value = (sender_private, None)
             mock_deliver.return_value = ("delivered", None)
             result = handle_mesh_send({"message": "hi", "agent": "target", "task_id": "custom-123"})
             assert result.get("status") == "delivered"
@@ -814,7 +861,7 @@ class TestRegistrySend:
         key_path = key_dir / "sender.pem"
         key_path.write_text(private_pem)
 
-        # Agent config: identity_source = registry
+        # Agent config
         config = {
             "platforms": {
                 "mesh": {
@@ -842,6 +889,20 @@ class TestRegistrySend:
             url="http://127.0.0.1:8646/mock-receive",
             public_key=sender_public,
         )
+
+        # Seed the local cache so auth.resolve_target finds the target.
+        write_agent_identity("target", {
+            "id": "target",
+            "name": "target",
+            "description": "registry peer",
+            "role": "agent",
+            "transports": {
+                "hermes_webhook": {
+                    "url": fake_peer.url,
+                    "auth": {"public_key": sender_public},
+                },
+            },
+        })
 
         with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned, \
              patch("hermes_mesh.registry_bridge.RegistryClient") as MockClient:

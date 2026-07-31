@@ -5,6 +5,10 @@ import re
 import time
 from collections import defaultdict
 from typing import Any
+import os
+from pathlib import Path
+
+import yaml
 
 _ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -72,6 +76,23 @@ def transport_auth_value(transport_info: dict, key: str) -> str:
         return ""
     value = auth.get(key, "")
     return value if value is not None else ""
+
+def mesh_extra(extra: dict | None = None) -> dict:
+    """Return platforms.mesh.extra from the active Hermes profile config.
+
+    If `extra` is provided (e.g. from a PlatformConfig), use it directly.
+    """
+    if extra is not None:
+        return extra
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    cfg = home / "config.yaml"
+    if not cfg.exists():
+        return {}
+    try:
+        data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+    except (yaml.YAMLError, OSError):
+        return {}
+    return data.get("platforms", {}).get("mesh", {}).get("extra", {}) or {}
 
 
 # ---------------------------------------------------------------------------
