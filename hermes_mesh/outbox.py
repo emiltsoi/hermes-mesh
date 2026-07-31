@@ -111,46 +111,20 @@ def outbox_count() -> int:
 
 def _resolve_material_and_url(
     from_agent: str, to_agent: str, extra: dict | None = None
-) -> tuple[Optional[str], Optional[str], Optional[str], str]:
-    """Resolve signing material, target URL, and auth type for a retry.
+) -> tuple[Optional[str], Optional[str], str]:
+    """Resolve signing material and target URL for a retry.
 
-    Returns (signing_material, target_url, auth_type, error_message).
+    Returns (signing_material, target_url, error_message).
     """
-    from . import registry_bridge as _registry_bridge
-    from .identity import get_raw_agent_identity
-    from .session_relay import _transport, _transport_auth_value
+    from . import auth
 
-    if _registry_bridge.identity_source(extra) == "registry":
-        target = _registry_bridge.resolve_target(to_agent, extra)
-        if not target:
-            return None, None, None, f"Agent '{to_agent}' not found in registry"
-        target_url = target.get("url", "")
-        if not target_url:
-            return None, None, None, f"Agent '{to_agent}' has no webhook URL in registry"
-        auth = target.get("auth", {})
-        if auth.get("type") != "ed25519" or not auth.get("public_key"):
-            return None, None, None, f"Agent '{to_agent}' has no Ed25519 public key"
-        signing_material, auth_type, _ = _registry_bridge.resolve_sender(from_agent, extra)
-        if not signing_material or auth_type != "ed25519":
-            return None, None, None, f"Sender '{from_agent}' has no Ed25519 private key"
-        return signing_material, target_url, auth_type, ""
-
-    raw_info = get_raw_agent_identity(to_agent)
-    if not raw_info:
-        return None, None, None, f"Agent '{to_agent}' not found in fleet vault"
-    sender_info = get_raw_agent_identity(from_agent)
-    if not sender_info:
-        return None, None, None, f"Sender '{from_agent}' has no identity in fleet vault"
-    sender_secret = _transport_auth_value(
-        _transport(sender_info, "hermes_webhook"), "secret"
-    )
-    if not sender_secret:
-        return None, None, None, f"Sender '{from_agent}' has no webhook secret"
-    webhook = _transport(raw_info, "hermes_webhook")
-    target_url = webhook.get("url", "")
-    if not target_url:
-        return None, None, None, f"Agent '{to_agent}' has no webhook URL in vault"
-    return sender_secret, target_url, "hmac-sha256", ""
+    target_url, error = auth.resolve_target(to_agent)
+    if error:
+        return None, None, error
+    signing_material, error = auth.resolve_sender(from_agent, extra)
+    if error:
+        return None, None, error
+    return signing_material, target_url, ""
 
 
 def _is_local_url(url: str) -> bool:
@@ -178,7 +152,7 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     from_agent = item["from"]
     to_agent = item["to"]
     body = item["body"]
-    signing_material, target_url, auth_type, error = _resolve_material_and_url(
+    signing_material, target_url, error = _resolve_material_and_url(
         from_agent, to_agent, extra
     )
     if error:
@@ -190,7 +164,6 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
         body,
         signing_material,
         allow_loopback=_webhook_allow_loopback() or _is_local_url(target_url),
-        auth_type=auth_type,
         sign_timestamp=sign_timestamp,
     )
     if delivery_id is not None:

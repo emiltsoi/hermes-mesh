@@ -1,14 +1,12 @@
-"""Mesh platform adapter — receive HMAC-signed Mesh messages.
+"""Mesh platform adapter — receive Ed25519-signed Mesh messages.
 
 Runs an aiohttp HTTP server that receives one-way mesh pings from other
-Hermes fleet agents, validates HMAC-SHA256 signatures, parses the mesh
+Hermes fleet agents, validates Ed25519 signatures, parses the mesh
 metadata envelope, and routes the message into the configured platform
 session (e.g. the local agent's Telegram DM).
 """
 import asyncio
 import functools
-import hashlib
-import hmac
 import json
 import logging
 import math
@@ -116,13 +114,13 @@ def _global_mesh_target_session() -> Optional[str]:
 
 
 class MeshAdapter(BasePlatformAdapter):
-    """Receive HMAC-signed Mesh messages into a configured platform session."""
+    """Receive Ed25519-signed Mesh messages into a configured platform session."""
 
     # Mesh deliveries are event-triggered; never prompt for session restoration.
     interactive_resume: bool = False
 
-    # HMAC signature verification at intake acts as an allowlist: only peers
-    # whose secret we share can reach this adapter. Tell GatewayRunner that
+    # Ed25519 signature verification at intake acts as an allowlist: only peers
+    # whose public key we share can reach this adapter. Tell GatewayRunner that
     # this adapter enforces its own access policy so env allowlists do not
     # double-deny authenticated mesh senders.
     enforces_own_access_policy: bool = True
@@ -134,9 +132,9 @@ class MeshAdapter(BasePlatformAdapter):
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._route: str = config.extra.get("route", "receive")
-        # `secret` is an auth-enable sentinel, not the actual HMAC key. The
-        # actual per-sender HMAC secret is looked up from the fleet vault.
-        # Any non-empty value enables HMAC; "INSECURE_NO_AUTH" disables it.
+        # `secret` is an auth-enable sentinel, not the actual private key. The
+        # actual per-sender public key is looked up from the fleet vault.
+        # Any non-empty value enables Ed25519; "INSECURE_NO_AUTH" disables it.
         self._auth_sentinel: str = str(config.extra.get("secret", ""))
         self._target_session: Optional[str] = config.extra.get("target_session")
         if not self._target_session:
@@ -186,8 +184,8 @@ class MeshAdapter(BasePlatformAdapter):
 
         if not self._auth_sentinel:
             raise ValueError(
-                "[mesh] HMAC auth sentinel is required. Set platforms.mesh.extra.secret "
-                "to any non-empty value to enable HMAC, or 'INSECURE_NO_AUTH' "
+                "[mesh] auth sentinel is required. Set platforms.mesh.extra.secret "
+                "to any non-empty value to enable Ed25519, or 'INSECURE_NO_AUTH' "
                 "for local loopback-only testing."
             )
 
@@ -288,11 +286,10 @@ class MeshAdapter(BasePlatformAdapter):
 
         if self._auth_sentinel == "INSECURE_NO_AUTH":
             pass
-        elif request.headers.get("X-Hub-Signature-256"):
-            from_field, err = self._verify_hmac(request, body, from_field)
-            if err:
-                return err
         elif request.headers.get("X-Mesh-Signature"):
+            if not from_field:
+                logger.warning("[mesh] Missing 'from' field in payload")
+                return web.json_response({"status": "unauthorized"}, status=401)
             from_field, err = await self._verify_ed25519(request, body, from_field)
             if err:
                 return err
@@ -460,13 +457,10 @@ class MeshAdapter(BasePlatformAdapter):
             self._agent_name,
         )
 
-    def _verify_hmac(
+    async def _verify_ed25519(
         self, request: "web.Request", body: bytes, from_field: Any
     ) -> tuple[Optional[str], Optional["web.Response"]]:
-        """Verify the sender's HMAC signature against the sender's own secret."""
-        if self._auth_sentinel == "INSECURE_NO_AUTH":
-            return from_field, None
-
+        """Verify the sender's Ed25519 signature using the local cache."""
         if not from_field or not isinstance(from_field, str):
             logger.warning("[mesh] Missing sender 'from' field")
             return None, web.json_response({"status": "unauthorized"}, status=401)
@@ -476,74 +470,49 @@ class MeshAdapter(BasePlatformAdapter):
         except ValueError as exc:
             logger.warning("[mesh] Invalid sender name: %s", exc)
             return None, web.json_response({"status": "unauthorized"}, status=401)
+
+        from . import auth
 
         sender_info = get_raw_agent_identity(from_field)
         if not sender_info:
             logger.warning("[mesh] Unknown sender '%s'", from_field)
             return None, web.json_response({"status": "unauthorized"}, status=401)
 
-        sender_secret = _transport_auth_value(
-            _transport(sender_info, "hermes_webhook"), "secret"
+        public_key = _transport_auth_value(
+            _transport(sender_info, "hermes_webhook"), "public_key"
         )
-        if not sender_secret:
-            logger.warning("[mesh] Sender '%s' has no webhook secret", from_field)
+        if not public_key:
+            logger.warning("[mesh] Sender '%s' has no public_key in cache", from_field)
             return None, web.json_response({"status": "unauthorized"}, status=401)
 
-        provided = request.headers.get("X-Hub-Signature-256", "")
+        signature_b64 = request.headers.get("X-Mesh-Signature", "")
         timestamp = request.headers.get("X-Mesh-Timestamp", "")
-        with_ts = f"{timestamp}\n".encode() + body
+        signed_body = f"{timestamp}\n".encode() + body if timestamp else body
 
-        def _expected(data: bytes) -> str:
-            return "sha256=" + hmac.new(
-                sender_secret.encode(), data, hashlib.sha256
-            ).hexdigest()
-
-        if hmac.compare_digest(provided.encode(), _expected(with_ts).encode()):
-            return from_field, None
-        if hmac.compare_digest(provided.encode(), _expected(body).encode()):
-            return from_field, None
-
-        logger.warning("[mesh] HMAC verification failed for sender '%s'", from_field)
-        return None, web.json_response({"status": "unauthorized"}, status=401)
-
-    async def _verify_ed25519(
-        self, request: "web.Request", body: bytes, from_field: Any
-    ) -> tuple[Optional[str], Optional["web.Response"]]:
-        """Verify the sender's Ed25519 signature using the registry."""
-        if not from_field or not isinstance(from_field, str):
-            logger.warning("[mesh] Missing sender 'from' field")
-            return None, web.json_response({"status": "unauthorized"}, status=401)
+        def _verify(data: bytes) -> bool:
+            return auth.verify_ed25519(public_key, data, signature_b64)
 
         try:
-            from_field = _validate_agent_name(from_field)
-        except ValueError as exc:
-            logger.warning("[mesh] Invalid sender name: %s", exc)
-            return None, web.json_response({"status": "unauthorized"}, status=401)
-
-        from . import registry_bridge as _registry_bridge
-
-        if not _registry_bridge.MESH_PEER_REGISTRY_AVAILABLE:
-            logger.warning(
-                "[mesh] Ed25519 signature received but mesh-peer-registry is not installed"
-            )
-            return None, web.json_response({"status": "unauthorized"}, status=401)
-
-        try:
-            ok, err = await asyncio.to_thread(
-                _registry_bridge.verify_ed25519_signature,
-                dict(request.headers),
-                body,
-                from_field,
-                self.config.extra,
-            )
+            ok = await asyncio.to_thread(_verify, signed_body)
         except Exception as exc:
             logger.warning("[mesh] Ed25519 verification error: %s", exc)
             return None, web.json_response({"status": "unauthorized"}, status=401)
 
-        if not ok:
-            logger.warning("[mesh] Ed25519 verification failed: %s", err)
+        if ok:
+            return from_field, None
+
+        # Fallback: verify without timestamp for compatibility with senders that don't include it.
+        try:
+            ok = await asyncio.to_thread(_verify, body)
+        except Exception as exc:
+            logger.warning("[mesh] Ed25519 verification error: %s", exc)
             return None, web.json_response({"status": "unauthorized"}, status=401)
-        return from_field, None
+
+        if ok:
+            return from_field, None
+
+        logger.warning("[mesh] Ed25519 verification failed for sender '%s'", from_field)
+        return None, web.json_response({"status": "unauthorized"}, status=401)
 
     def _parse_envelope(self, text: str) -> tuple[Optional[dict], Optional["web.Response"]]:
         """Parse and validate the bracketed [mesh] envelope header."""
@@ -765,7 +734,7 @@ class MeshAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Mesh is intentionally one-way inbound.
 
-        The mesh adapter only receives HMAC-signed messages from peers and
+        The mesh adapter only receives Ed25519-signed messages from peers and
         routes them into the local agent's session. Replies are not sent back
         through the mesh automatically; the local agent must explicitly call
         ``mesh_send`` to respond. We log the response locally and report

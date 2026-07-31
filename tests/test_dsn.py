@@ -2,21 +2,22 @@
 import json
 import os
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from hermes_mesh import common, session_relay
+from hermes_mesh import auth as mesh_auth, common, session_relay
 
 
-def _identity(name, url="http://127.0.0.1:8645/mesh/receive", secret="test-secret"):
+def _identity(name, url="http://127.0.0.1:8645/mesh/receive", public_key="test-public-key-pem"):
     return {
         "id": name,
         "name": name,
         "transports": {
             "hermes_webhook": {
                 "url": url,
-                "auth": {"type": "hmac-sha256", "secret": secret},
+                "auth": {"public_key": public_key},
             },
         },
     }
@@ -62,13 +63,17 @@ class TestDSNDelivery:
                 },
             ),
             patch(
-                "hermes_mesh.session_relay.get_raw_agent_identity"
+                "hermes_mesh.identity.get_raw_agent_identity"
             ) as mock_raw,
+            patch(
+                "hermes_mesh.auth.resolve_sender"
+            ) as mock_resolve_sender,
             patch(
                 "hermes_mesh.session_relay._deliver_webhook"
             ) as mock_deliver,
         ):
             mock_deliver.return_value = ("dsn-delivery-id", None)
+            mock_resolve_sender.return_value = ("fake-private-key-pem", None)
 
             def _raw(name):
                 if name == "from_agent":
@@ -110,8 +115,11 @@ class TestDSNSendFailure:
                 },
             ),
             patch(
-                "hermes_mesh.session_relay.get_raw_agent_identity"
+                "hermes_mesh.identity.get_raw_agent_identity"
             ) as mock_raw,
+            patch(
+                "hermes_mesh.auth.resolve_sender"
+            ) as mock_resolve_sender,
             patch(
                 "hermes_mesh.session_relay._deliver_webhook"
             ) as mock_deliver,
@@ -124,7 +132,9 @@ class TestDSNSendFailure:
                 return _identity("target")
 
             mock_raw.side_effect = _raw
+            mock_resolve_sender.return_value = ("fake-private-key-pem", None)
             mock_deliver.return_value = (None, "unreachable")
+
 
             result = session_relay.handle_mesh_send(
                 {"message": "hi", "agent": "target"}
