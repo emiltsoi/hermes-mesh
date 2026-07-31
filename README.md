@@ -9,19 +9,21 @@ who asked, what they're responding to, and what action to take.
 
 ## Tools
 
-- `mesh_list` — list all agents in the fleet mesh vault or mesh-peer-registry.
-- `mesh_register` — register or update an agent identity in the fleet mesh vault or registry.
+- `mesh_list` — list all agents in the local fleet mesh vault.
+- `mesh_register` — register or update an agent identity in the local mesh vault.
 - `mesh_send` — send a session-preserving message to another fleet agent.
 - `mesh_deregister` — remove an agent identity.
+- `mesh_sync` — sync one or all peer identities from a mesh-peer-registry into the local vault.
+- `mesh_publish` — publish this agent's webhook URL and Ed25519 public key to a mesh-peer-registry.
 - `mesh_health` — return mesh health and metrics summary.
 - `mesh_refresh_identities` — clear the identity cache.
 
 ```
 Caller: mesh_send(agent="britney", message="Review this plan")
   │
-  ├─ 1. Resolves Britney's identity from the fleet vault or registry
+  ├─ 1. Resolves Britney's identity from the local fleet vault
   ├─ 2. Pads [mesh][from:linda][to:britney][id:uuid][action:do][reply:yes]
-  ├─ 3. HMAC-SHA256 or Ed25519 signs with the sender's own material
+  ├─ 3. Ed25519 signs with the sender's own private key
   └─ 4. POSTs to Britney's mesh adapter endpoint
 ```
 
@@ -76,15 +78,16 @@ platforms:
       port: 8744
       route: receive          # listens on /mesh/receive
       agent_name: agent0      # local agent name
-      # Authentication mode. "secret" is an on/off sentinel, not the HMAC key.
-      # Any non-empty value enables HMAC/Ed25519 verification; "INSECURE_NO_AUTH" disables it.
+      # Authentication sentinel. Any non-empty value enables Ed25519 verification;
+      # "INSECURE_NO_AUTH" disables it (loopback-only).
       secret: true
-      # Identity source: "file" (default, fleet/mesh/agents YAML vault) or "registry".
-      identity_source: file
-      # For registry mode: URL of the mesh-peer-registry.
-      # registry_url: http://127.0.0.1:8646
-      # For registry mode: path to the Ed25519 private key PEM (default: ~/.mesh/keys/<agent_name>.pem).
+      # Ed25519 private key PEM path (default: ~/.mesh/keys/<agent_name>.pem).
       # private_key_path: /path/to/key.pem
+      # Optional mesh-peer-registry for syncing/publishing peers.
+      # registry_url: https://registry.example.com
+      # allow_insecure_registry: false
+      # registry_pin: sha256-hex-of-server-certificate-spki
+      sign_timestamp: false   # Set to true to include X-Mesh-Timestamp in the signed payload
       # Optional session routing and float source.
       target_session: "telegram:dm:<chat_id>"
       telegram_bot_token: "..."
@@ -101,7 +104,7 @@ is `8645`.
 
 ### 2. Set up fleet identity
 
-For `identity_source: file` (the default), each agent needs an identity in `$HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml`:
+Each agent needs an identity in `$HERMES_HOME/fleet/mesh/agents/<name>/identity.yaml`:
 
 ```yaml
 id: britney
@@ -112,18 +115,21 @@ transports:
     protocol: hermes-webhook
     url: http://127.0.0.1:8745/mesh/receive
     auth:
-      type: hmac-sha256
-      secret: <britney-mesh-adapter-secret>
+      public_key: |
+        -----BEGIN PUBLIC KEY-----
+        <britney's-ed25519-public-key>
+        -----END PUBLIC KEY-----
 ```
 
 The `hermes_webhook.url` must point at the target agent's mesh adapter
-endpoint (`/mesh/<route>`). The `hermes_webhook.auth.secret` is the
-**target's** adapter secret; messages are signed with the **sender's**
-own secret for per-agent HMAC authentication.
+endpoint (`/mesh/<route>`). The `hermes_webhook.auth.public_key` is the
+**target's** Ed25519 public key; messages are signed with the **sender's**
+own private key for per-agent Ed25519 authentication.
 
-For `identity_source: registry`, identities live in the mesh-peer-registry
-instead of YAML files. The adapter verifies inbound `X-Mesh-Signature`
-headers with Ed25519 public keys fetched from the registry.
+The local vault is the runtime source of truth. To discover peers from a
+mesh-peer-registry, call `mesh_sync(name="...")` or `mesh_sync()` to pull
+all peers into the local vault. The adapter verifies inbound `X-Mesh-Signature`
+headers with the public key in the cached identity.
 
 Mesh delivery is one-way inbound into the target agent's session. If the
 agent generates a reply, the platform `send()` call is intentionally a
@@ -135,7 +141,7 @@ to send a response back through the mesh.
 You can also register identities at runtime:
 
 ```bash
-mesh_register(name="britney", url="http://127.0.0.1:8745/mesh/receive", secret="...", role="agent")
+mesh_register(name="britney", url="http://127.0.0.1:8745/mesh/receive", public_key="...", role="agent")
 ```
 
 ### 4. Environment
@@ -150,7 +156,9 @@ export MESH_REGISTER_ALLOW_LOOPBACK=0         # Set to 1 to let mesh_register st
 export MESH_IDENTITY_CACHE_TTL=1.0            # Identity YAML cache TTL in seconds (0 disables)
 export MESH_IDENTITY_CACHE_MAXSIZE=256        # Identity cache max entries
 export MESH_VAULT_PATH=~/.hermes/fleet        # Custom mesh vault root
-export MESH_SIGN_TIMESTAMP=0                  # Set to 1 to include X-Mesh-Timestamp in HMAC payload
+export MESH_SIGN_TIMESTAMP=0                  # Set to 1 to include X-Mesh-Timestamp in the signed payload
+export MESH_REGISTRY_PIN=sha256-hex-of-spki   # TLS pinning digest for mesh-peer-registry
+export MESH_REGISTRY_ALLOW_INSECURE=0         # Set to 1 to allow http:// registry URLs
 export MESH_OUTBOX_ENABLED=0                  # Set to 1 to queue failed sends for retry
 export MESH_OUTBOX_PATH=~/.hermes/fleet/mesh/outbox
 export MESH_OUTBOX_MAX_ATTEMPTS=5
@@ -159,7 +167,7 @@ export MESH_REPLAY_WINDOW_SIZE=10000
 export MESH_REPLAY_WINDOW_TTL=300
 export MESH_RATE_LIMIT_PER_MINUTE=0           # 0 disables
 export MESH_OUTBOX_INTERVAL=30                # Outbox retry sweep interval in seconds
-export TELEGRAM_BOT_TOKEN=...                 # For float delivery
+export TELEGRAM_BOT_TOKEN=[REDACTED:API key param]                 # For float delivery
 export TELEGRAM_HOME_CHANNEL=...              # Where floats go
 ```
 
@@ -179,11 +187,10 @@ The `[mesh]` prefix is the canonical format. All mesh peers, including OpenClaw,
 
 `hermes-mesh` verifies every inbound webhook before routing it into the agent session:
 
-- **HMAC mode (`identity_source: file`)**: verifies `X-Hub-Signature-256` against the sender's `hermes_webhook.auth.secret` from the local YAML vault.
-- **Registry mode (`identity_source: registry`)**: verifies `X-Mesh-Signature` (Ed25519) against the sender's public key in the mesh-peer-registry.
+- **Ed25519 signatures**: verifies `X-Mesh-Signature` (Ed25519) against the sender's `hermes_webhook.auth.public_key` from the local mesh vault. If a sender is not in the vault, call `mesh_sync(name="...")` to pull it from the mesh-peer-registry.
 - **Timestamp validation**: every inbound request must carry an `X-Mesh-Timestamp` header. The adapter rejects missing, non-numeric, or stale timestamps.
 - **Replay window**: a bounded TTL-based replay cache deduplicates message IDs and prevents replay attacks. Configured via `replay_window_size`, `replay_window_ttl`, `MESH_REPLAY_WINDOW_SIZE`, and `MESH_REPLAY_WINDOW_TTL`.
-- **Optional timestamp-included signing**: set `MESH_SIGN_TIMESTAMP=1` to include `X-Mesh-Timestamp` in the HMAC/Ed25519 signed payload. Receivers accept both legacy body-only and timestamp-prefixed signatures for backward compatibility.
+- **Optional timestamp-included signing**: set `MESH_SIGN_TIMESTAMP=1` or `sign_timestamp: true` to include `X-Mesh-Timestamp` in the signed payload. Receivers accept both legacy body-only and timestamp-prefixed signatures for backward compatibility.
 - **Durable outbox**: when `MESH_OUTBOX_ENABLED=1`, failed `mesh_send` deliveries are written to disk and retried by a background reaper. After `MESH_OUTBOX_MAX_ATTEMPTS` failures, items move to a `dead/` folder.
 - **Rate limiting**: optional per-sender rate limiting via `rate_limit_per_minute` / `MESH_RATE_LIMIT_PER_MINUTE`.
 
@@ -354,7 +361,7 @@ mesh_send(
 
 ### Session Float via Webhook Delivery
 
-The primary session relay mechanism is webhook delivery: `mesh_send` POSTs the `[mesh]` envelope to the target agent's `hermes_webhook` URL (e.g. `http://.../mesh/receive`), HMAC-SHA256 signed with the **sender's** own secret. The target gateway receives the webhook on its `mesh` platform adapter and routes it into the configured session. This works without any extra hook handler registered.
+The primary session relay mechanism is webhook delivery: `mesh_send` POSTs the `[mesh]` envelope to the target agent's `hermes_webhook` URL (e.g. `http://.../mesh/receive`), Ed25519 signed with the **sender's** own private key. The target gateway receives the webhook on its `mesh` platform adapter and routes it into the configured session. This works without any extra hook handler registered.
 
 `hermes-mesh` also sends a best-effort Telegram float to the sender's `TELEGRAM_HOME_CHANNEL` when `TELEGRAM_BOT_TOKEN` is set. The float is fire-and-forget; the tool result reflects the webhook delivery status, not the float.
 
@@ -365,7 +372,7 @@ Standard A2A (discover, call, serve, Agent Cards, JSON-RPC, security) is
 provided by the [hermes-agent-a2a plugin](https://github.com/emiltsoi/hermes-agent-a2a);
 the upstream `hermes-agent` core does not include A2A support.
 
-`hermes-mesh` carries the `[mesh][from:...][to:...]` envelope, per-agent HMAC
+`hermes-mesh` carries the `[mesh][from:...][to:...]` envelope, per-agent Ed25519
 authentication, and the `fleet/mesh/agents` vault. The two identity stores
 are now fully independent.
 
@@ -374,7 +381,7 @@ are now fully independent.
 Hermes agents are not the only mesh participants. The companion
 [openclaw-mesh](https://github.com/emiltsoi/openclaw-mesh) plugin turns an
 OpenClaw agent into a full mesh peer using the same vault format, envelope
-format, and HMAC scheme.
+format, and Ed25519 scheme.
 
 A Hermes agent can `mesh_send(agent="emts", message="...")` and an OpenClaw
 agent receives the full `[mesh]` envelope with sender identity, action, reply
