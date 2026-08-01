@@ -510,7 +510,6 @@ def _send_delivery_error(
     dsn_body = json.dumps({"from": dsn_from, "text": dsn_text}, sort_keys=True)
 
     from . import auth
-    from .common import mesh_extra
 
     extra = mesh_extra()
     target_url, error = auth.resolve_target(dsn_to)
@@ -652,7 +651,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     # Part 1: Webhook to target
     from . import auth
-    from .common import mesh_extra
 
     extra = mesh_extra()
     target_url, error = auth.resolve_target(agent)
@@ -877,7 +875,6 @@ def handle_mesh_sync(args: dict | None = None, **kwargs) -> dict:
         name: Agent name to sync. If omitted, syncs all peers from the registry.
         registry_url: Optional registry URL (defaults to config).
     """
-    from .common import mesh_extra
     from . import registry_bridge as _registry_bridge
 
     merged = dict(args) if args else {}
@@ -920,7 +917,6 @@ def handle_mesh_publish(args: dict | None = None, **kwargs) -> dict:
         ttl: Optional TTL in seconds.
         registry_url: Optional registry URL (defaults to config).
     """
-    from .common import mesh_extra
     from . import registry_bridge as _registry_bridge
 
     merged = dict(args) if args else {}
