@@ -6,6 +6,8 @@ when no registry operations are needed.
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
 from typing import Any
@@ -40,6 +42,27 @@ def _ensure_registry() -> None:
         raise RuntimeError("mesh-peer-registry is required for registry operations")
 
 
+@functools.lru_cache(maxsize=1)
+def _registry_client_kwargs_supported() -> frozenset[str]:
+    """Return which keyword arguments the installed RegistryClient accepts.
+
+    mesh-peer-registry 0.1.1 only accepts (url, private, public, timeout).
+    Newer versions accept `pin` and `allow_insecure`. We detect support from
+    the actual signature so hermes-mesh remains compatible with both.
+    """
+    if RegistryClient is None:
+        return frozenset()
+    try:
+        sig = inspect.signature(RegistryClient)
+    except (ValueError, TypeError):
+        # Mock or otherwise uninspectable; assume it accepts our known kwargs.
+        return frozenset(["pin", "allow_insecure"])
+    parameters = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return frozenset(["pin", "allow_insecure"])
+    return frozenset(name for name in ("pin", "allow_insecure") if name in parameters)
+
+
 def _registry_client(name: str, extra: dict | None = None) -> Any:
     """Return a RegistryClient for `name` against the configured registry."""
     _ensure_registry()
@@ -52,9 +75,13 @@ def _registry_client(name: str, extra: dict | None = None) -> Any:
         "MESH_REGISTRY_ALLOW_INSECURE", ""
     ).lower() in ("1", "true", "yes")
     private_pem, public_pem = auth.load_or_generate_keypair(name, extra)
-    return RegistryClient(
-        url, private_pem, public_pem, pin=pin, allow_insecure=allow_insecure
-    )
+    client_kwargs: dict[str, Any] = {}
+    supported = _registry_client_kwargs_supported()
+    if "pin" in supported:
+        client_kwargs["pin"] = pin
+    if "allow_insecure" in supported:
+        client_kwargs["allow_insecure"] = allow_insecure
+    return RegistryClient(url, private_pem, public_pem, **client_kwargs)
 
 
 def list_peers(extra: dict | None = None) -> list[Any]:
