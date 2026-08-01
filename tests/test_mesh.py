@@ -944,7 +944,7 @@ class TestRegistryClient:
             }
             result = registry_bridge.list_peers(extra)
             assert result == []
-            _, _, _, kwargs = MockClient.call_args
+            args, kwargs = MockClient.call_args
             assert kwargs["pin"] == "deadbeef"
             assert kwargs["allow_insecure"] is True
 
@@ -960,7 +960,7 @@ class TestRegistryClient:
             MockClient.return_value.list_peers.return_value = []
             extra = {"registry_url": "http://127.0.0.1:8646"}
             registry_bridge.list_peers(extra)
-            _, _, _, kwargs = MockClient.call_args
+            args, kwargs = MockClient.call_args
             assert kwargs["pin"] == "envpin"
             assert kwargs["allow_insecure"] is True
 
@@ -980,6 +980,6 @@ class TestRegistryClient:
                 "allow_insecure_registry": True,
             }
             registry_bridge.list_peers(extra)
-            _, _, _, kwargs = MockClient.call_args
+            args, kwargs = MockClient.call_args
             assert kwargs["pin"] == "overpin"
             assert kwargs["allow_insecure"] is True
