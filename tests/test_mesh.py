@@ -164,7 +164,7 @@ class TestSEC02_AgentNameValidation:
 
     def test_rejected_at_session_relay_level(self):
         result = handle_mesh_send(
-            {"message": "hello", "agent": "../../../etc"}
+            {"message": "hello", "agent": "../../../etc", "action": "info", "reply": "no"}
         )
         assert "error" in result
         assert "contains '..'" in result["error"]
@@ -212,20 +212,32 @@ class TestSSRF:
 
 class TestSessionRelay:
     def test_missing_message(self):
-        result = handle_mesh_send({"agent": "test"})
+        result = handle_mesh_send({"agent": "test", "action": "info", "reply": "no"})
         assert "error" in result
         assert "message" in result["error"].lower()
 
     def test_missing_agent(self):
-        result = handle_mesh_send({"message": "hello"})
+        result = handle_mesh_send({"message": "hello", "action": "info", "reply": "no"})
         assert "error" in result
         assert "agent" in result["error"].lower()
+
+    def test_missing_action(self):
+        result = handle_mesh_send({"message": "hello", "agent": "test", "reply": "no"})
+        assert "error" in result
+        assert "action" in result["error"].lower()
+        assert "hint" in result
+
+    def test_missing_reply(self):
+        result = handle_mesh_send({"message": "hello", "agent": "test", "action": "info"})
+        assert "error" in result
+        assert "reply" in result["error"].lower()
+        assert "hint" in result
 
     def test_agent_not_found(self):
         with patch("hermes_mesh.identity.get_raw_agent_identity") as mock_raw:
             mock_raw.return_value = None
             result = handle_mesh_send(
-                {"message": "hello", "agent": "nonexistent"}
+                {"message": "hello", "agent": "nonexistent", "action": "info", "reply": "no"}
             )
             assert "error" in result
             assert "not found" in result["error"].lower()
@@ -268,7 +280,7 @@ class TestSessionRelay:
                 mock_deliver.return_value = ("delivery-123", None)
 
                 result = handle_mesh_send(
-                    {"message": "hello test", "agent": "testagent"}
+                    {"message": "hello test", "agent": "testagent", "action": "info", "reply": "no"}
                 )
 
                 assert result.get("state") == "completed"
@@ -378,7 +390,7 @@ class TestEd25519Signing:
             mock_resolve_sender.return_value = (sender_private, None)
             mock_deliver.return_value = ("delivered", None)
 
-            result = handle_mesh_send({"message": "hi", "agent": "target"})
+            result = handle_mesh_send({"message": "hi", "agent": "target", "action": "info", "reply": "no"})
             assert result.get("status") == "delivered"
             mock_deliver.assert_called_once()
             signing_material = mock_deliver.call_args[0][2]
@@ -519,6 +531,45 @@ class TestAdapterHandleMesh:
         )
         resp = self._run(adapter._handle_mesh(req))
         assert resp.status == 400
+
+    def test_tolerant_receive_missing_action_and_reply(self):
+        """FR-2: envelope without action/reply parses with conservative defaults."""
+        adapter = self._make_adapter()
+        text = (
+            f"[mesh][from:ada][to:ADA][id:testid-123] hello"
+        )
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+
+    def test_tolerant_receive_missing_action_only(self):
+        adapter = self._make_adapter()
+        text = (
+            f"[mesh][from:ada][to:ADA][id:testid-123]"
+            f"[reply:no] hello"
+        )
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+
+    def test_tolerant_receive_missing_reply_only(self):
+        adapter = self._make_adapter()
+        text = (
+            f"[mesh][from:ada][to:ADA][id:testid-123]"
+            f"[action:info] hello"
+        )
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 202
 
     def test_rejects_invalid_sender(self):
         adapter = self._make_adapter()
@@ -800,7 +851,7 @@ class TestMeshSendValidation:
              patch("hermes_mesh.session_relay._float.send"):
             mock_resolve_sender.return_value = (sender_private, None)
             mock_deliver.return_value = ("delivered", None)
-            result = handle_mesh_send({"message": "hi", "agent": "target", "task_id": "custom-123"})
+            result = handle_mesh_send({"message": "hi", "agent": "target", "action": "info", "reply": "no", "task_id": "custom-123"})
             assert result.get("status") == "delivered"
             assert result.get("task_id") == "custom-123"
             body = mock_deliver.call_args[0][1]
@@ -909,7 +960,7 @@ class TestRegistrySend:
             mock_pinned.return_value = b'{"delivery_id":"d1"}'
             MockClient.return_value.get_peer.return_value = fake_peer
 
-            result = handle_mesh_send({"message": "hello registry", "agent": "target"})
+            result = handle_mesh_send({"message": "hello registry", "agent": "target", "action": "info", "reply": "no"})
 
         assert result.get("status") == "delivered"
         assert result.get("message_id") == "d1"

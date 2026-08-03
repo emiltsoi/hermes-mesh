@@ -137,7 +137,7 @@ class TestDSNSendFailure:
 
 
             result = session_relay.handle_mesh_send(
-                {"message": "hi", "agent": "target"}
+                {"message": "hi", "agent": "target", "action": "info", "reply": "no"}
             )
 
             assert result.get("error")

@@ -230,14 +230,20 @@ def register(ctx) -> None:
                     "action": {
                         "type": "string",
                         "enum": ["do", "info"],
-                        "description": "do (recipient should take action) | info (log/acknowledge)",
-                        "default": "do",
+                        "description": (
+                            "REQUIRED. Semantics: info = log/acknowledge, no work "
+                            "needed — use unless you need work done. do = recipient "
+                            "should take action. Prefer info; reserve do for real work."
+                        ),
                     },
                     "reply": {
                         "type": "string",
                         "enum": ["yes", "no"],
-                        "description": "yes (sender expects reply) | no (fire-and-forget)",
-                        "default": "yes",
+                        "description": (
+                            "REQUIRED. Semantics: no = fire-and-forget, no response "
+                            "needed — use unless you need a response. yes = sender "
+                            "expects a reply. Prefer no; reserve yes for genuine questions."
+                        ),
                     },
                     "ref": {
                         "type": "string",
@@ -248,7 +254,7 @@ def register(ctx) -> None:
                         "description": "Optional task ID override (auto-generated if omitted)",
                     },
                 },
-                "required": ["message", "agent"],
+                "required": ["message", "agent", "action", "reply"],
             },
         },
         handler=_json_dump_handler(handle_mesh_send),

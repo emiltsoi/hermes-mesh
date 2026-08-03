@@ -63,10 +63,15 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8645
 
 def _envelope_regex() -> re.Pattern:
-    """Return the mesh envelope regex, with optional version field."""
+    """Return the mesh envelope regex, with optional version field.
+
+    action/reply groups are OPTIONAL in the pattern (tolerant receive —
+    missing fields default to info/no in ``_parse_envelope``); the sender
+    side requires them explicitly (mesh-economy required-envelope rule).
+    """
     return re.compile(
         r'^\s*\[mesh\](?:\[v:([^\]]+)\])?\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
-        r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
+        r'(?:\[action:([^\]]+)\])?(?:\[reply:([^\]]+)\])?'
         r'(?:\[ref:([^\]]+)\])?\s*'
     )
 
@@ -532,6 +537,12 @@ class MeshAdapter(BasePlatformAdapter):
         except ValueError as exc:
             logger.warning("[mesh] Invalid envelope recipient: %s", exc)
             return None, web.json_response({"status": "bad request"}, status=400)
+        # Tolerant receive (mesh-economy): missing action/reply default to
+        # the conservative values (info = no work, no = no reply expected).
+        if action is None:
+            action = "info"
+        if reply is None:
+            reply = "no"
         if action not in {"do", "info"}:
             logger.warning("[mesh] Invalid envelope action: %s", action)
             return None, web.json_response({"status": "bad request"}, status=400)
