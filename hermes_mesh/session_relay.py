@@ -565,8 +565,10 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     Args:
         message: The message text (required).
         agent: Target agent name (required).
-        action: CTA action — "do" (default) or "info".
-        reply: Reply expected — "yes" (default) or "no".
+        action: CTA action — "do" or "info" (REQUIRED: info unless you need
+            work done; do only when the recipient should take action).
+        reply: Reply expected — "yes" or "no" (REQUIRED: no unless you need
+            a response; yes only for genuine questions).
         ref: Optional message ID being replied to (for threading).
         task_id: Optional task ID override (auto-generated if omitted).
 
@@ -600,8 +602,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     message = merged.get("message", "")
     agent = merged.get("agent", "")
-    action = merged.get("action", "do")
-    reply = merged.get("reply", "yes")
     ref = merged.get("ref")
     task_id = merged.get("task_id")
 
@@ -609,6 +609,18 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         return {"error": "'message' is required"}
     if not agent:
         return {"error": "'agent' is required"}
+    if "action" not in merged:
+        return {
+            "error": "'action' is required",
+            "hint": "reply=no unless you need a response; action=info unless you need work done",
+        }
+    if "reply" not in merged:
+        return {
+            "error": "'reply' is required",
+            "hint": "reply=no unless you need a response; action=info unless you need work done",
+        }
+    action = merged["action"]
+    reply = merged["reply"]
 
     # SEC-02: Validate agent name before path construction
     try:
