@@ -532,6 +532,18 @@ class TestAdapterHandleMesh:
         resp = self._run(adapter._handle_mesh(req))
         assert resp.status == 400
 
+    def test_rejects_invalid_reply(self):
+        """Gate 1b LOW: pin the invalid-reply guard (tolerance is for MISSING
+        values only, never invalid ones)."""
+        adapter = self._make_adapter()
+        text = self._envelope(reply="maybe")
+        req = self._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 400
+
     def test_tolerant_receive_missing_action_and_reply(self):
         """FR-2: envelope without action/reply parses with conservative defaults."""
         adapter = self._make_adapter()
