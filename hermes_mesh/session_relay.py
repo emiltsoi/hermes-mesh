@@ -37,6 +37,7 @@ from .common import (
 )
 from .identity import get_raw_agent_identity, list_agents, write_agent_identity
 from . import outbox
+from . import threads
 from .network import is_local_target_host
 
 logger = logging.getLogger(__name__)
@@ -567,8 +568,11 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         agent: Target agent name (required).
         action: CTA action — "do" or "info" (REQUIRED: info unless you need
             work done; do only when the recipient should take action).
-        reply: Reply expected — "yes" or "no" (REQUIRED: no unless you need
-            a response; yes only for genuine questions).
+        reply: REQUIRED. Semantics: no = fire-and-forget, no response needed —
+            use unless you need a response. yes = sender expects a reply.
+            end = terminal reply, closes the thread; replies referencing its
+            task_id are rejected THREAD_CLOSED. Prefer no; reserve yes for
+            genuine questions and end for closure.
         ref: Optional message ID being replied to (for threading).
         task_id: Optional task ID override (auto-generated if omitted).
 
@@ -631,8 +635,8 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     # Validate envelope fields before they are inserted into the bracket header.
     if action not in {"do", "info"}:
         return {"error": f"Invalid action '{action}'; must be 'do' or 'info'"}
-    if reply not in {"yes", "no"}:
-        return {"error": f"Invalid reply '{reply}'; must be 'yes' or 'no'"}
+    if reply not in {"yes", "no", "end"}:
+        return {"error": f"Invalid reply '{reply}'; must be 'yes', 'no', or 'end'"}
     if ref is not None and ref != "":
         try:
             ref = validate_envelope_token(ref)
@@ -641,6 +645,13 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             ref = None
     else:
         ref = None
+
+    # FR-3: reject replies referencing a closed (terminal) thread BEFORE delivery.
+    if ref is not None and threads.is_closed(ref):
+        return {
+            "error": f"THREAD_CLOSED: thread closed by terminal message {ref}",
+            "hint": f"open a new message (no ref) to reach {agent}",
+        }
 
     if task_id is not None and task_id != "":
         try:
@@ -656,6 +667,19 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         return {"error": f"Invalid sender name: {e}"}
 
     task_id = task_id or str(uuid.uuid4())
+
+    # FR-2 AC-2.1: sender gateway records the terminal anchor at send time.
+    # Persistence is best-effort bookkeeping (F3): a registry failure must
+    # never kill the terminal message delivery (AC-2.3).
+    if reply == "end":
+        try:
+            threads.record(task_id, closed_by=from_agent)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
+                task_id, from_agent, exc,
+            )
+
     header = f"[mesh][v:1][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
     if ref:
         header += f"[ref:{ref}]"
@@ -685,6 +709,14 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     )
 
     if delivery_id is None:
+        # F4: surface the send-time-close asymmetry on final end-message failure.
+        if reply == "end":
+            logger.warning(
+                "[mesh] terminal message %s to %s: sender-side thread closed "
+                "though delivery failed (%s) — recipient may not enforce "
+                "THREAD_CLOSED",
+                task_id, agent, error or "unknown",
+            )
         record_metric("send", "failed")
         if outbox.outbox_enabled():
             outbox.queue_message(from_agent, agent, padded_message, body, ref=ref)

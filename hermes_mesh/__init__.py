@@ -238,11 +238,13 @@ def register(ctx) -> None:
                     },
                     "reply": {
                         "type": "string",
-                        "enum": ["yes", "no"],
+                        "enum": ["yes", "no", "end"],
                         "description": (
                             "REQUIRED. Semantics: no = fire-and-forget, no response "
                             "needed — use unless you need a response. yes = sender "
-                            "expects a reply. Prefer no; reserve yes for genuine questions."
+                            "expects a reply. end = terminal reply, closes the thread; "
+                            "replies referencing its task_id are rejected THREAD_CLOSED. "
+                            "Prefer no; reserve yes for genuine questions and end for closure."
                         ),
                     },
                     "ref": {
