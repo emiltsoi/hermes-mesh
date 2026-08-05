@@ -178,7 +178,7 @@ export TELEGRAM_HOME_CHANNEL=...              # Where floats go
 Every `mesh_send` carries a `[mesh]` header on the wire:
 
 ```text
-[mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no>][ref:<parent-id>] ...
+[mesh][from:<sender>][to:<recipient>][id:<uuid>][action:<do|info>][reply:<yes|no|end>][ref:<parent-id>] ...
 ```
 
 The `[mesh]` prefix is the canonical format. All mesh peers, including OpenClaw, must send `[mesh]` envelopes.
@@ -315,13 +315,24 @@ Every `mesh_send` carries a **CTA** (Call To Action) that tells the recipient wh
 | Field | Values | Meaning |
 |-------|--------|---------|
 | `action` | `do` \| `info` | `do`: act on this message. `info`: log/acknowledge only |
-| `reply` | `yes` \| `no` | `yes`: sender expects a reply. `no`: fire-and-forget |
+| `reply` | `yes` \| `no` \| `end` | `yes`: sender expects a reply. `no`: fire-and-forget. `end`: terminal — closes the thread |
 
 **Combinations:**
 - `action=do + reply=yes`: take action, then reply with result
 - `action=do + reply=no`: act on it, no reply needed
 - `action=info + reply=yes`: acknowledge and reply when done processing
 - `action=info + reply=no`: acknowledge only, no reply needed
+- `reply=end`: terminal — the sender closes the thread (see below)
+
+### Terminal Replies (`reply=end`)
+
+`reply=end` is an **enforced terminal value** (v0.1.16): it closes the thread instead of inviting a reply. The goodbye ping-pong is dead by mechanical enforcement, not convention.
+
+- **Sender side:** after sending `reply=end` with a `ref` anchor, the thread is recorded as closed (`~/.hermes/fleet/mesh/closed-threads.json`, append-only, cross-process safe via `fcntl.flock`). Further sends to that thread fail with `THREAD_CLOSED` — the terminal message IS the goodbye; open a new message (no `ref`) to reach the agent again.
+- **Receiver side:** a reply to a closed thread is rejected with HTTP 400 + `THREAD_CLOSED` hint.
+- **Registry:** `closed-threads.json` persists across restarts; override the path with `MESH_CLOSED_THREADS`.
+- **Backward compatibility:** the `end` value is accepted by `mesh_send` and the mesh adapter. Legacy peers (e.g. an older OpenClaw bridge) treat an unknown `end` as a warning + 400 — upgrade the peer bridge to accept `end` (deliver as `no`) for full compliance.
+- **Known limitation:** the guards fire when the reply carries a `ref` anchor. A ref-less reply cannot be thread-identified — always carry `ref=<anchor-id>` on replies.
 
 **Reply rule:** All mesh replies use `mesh_send` back to the originating peer — not a plain Telegram DM or platform DM. Plain DMs break thread continuity. The mesh handles the return path.
 
