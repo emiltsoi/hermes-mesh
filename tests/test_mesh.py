@@ -548,7 +548,7 @@ class TestAdapterHandleMesh:
         """FR-2: envelope without action/reply parses with conservative defaults."""
         adapter = self._make_adapter()
         text = (
-            f"[mesh][from:ada][to:ADA][id:testid-123] hello"
+            "[mesh][from:ada][to:ADA][id:testid-123] hello"
         )
         req = self._make_request(
             {"from": "ada", "text": text},
@@ -560,8 +560,8 @@ class TestAdapterHandleMesh:
     def test_tolerant_receive_missing_action_only(self):
         adapter = self._make_adapter()
         text = (
-            f"[mesh][from:ada][to:ADA][id:testid-123]"
-            f"[reply:no] hello"
+            "[mesh][from:ada][to:ADA][id:testid-123]"
+            "[reply:no] hello"
         )
         req = self._make_request(
             {"from": "ada", "text": text},
@@ -573,8 +573,8 @@ class TestAdapterHandleMesh:
     def test_tolerant_receive_missing_reply_only(self):
         adapter = self._make_adapter()
         text = (
-            f"[mesh][from:ada][to:ADA][id:testid-123]"
-            f"[action:info] hello"
+            "[mesh][from:ada][to:ADA][id:testid-123]"
+            "[action:info] hello"
         )
         req = self._make_request(
             {"from": "ada", "text": text},
