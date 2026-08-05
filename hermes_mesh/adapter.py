@@ -33,6 +33,7 @@ except ImportError:
 
 from . import float as _float
 from . import outbox as _outbox
+from . import threads as _threads
 from .identity import get_raw_agent_identity
 from .common import MESH_DSN_HEADER, MESH_DSN_VALUE
 from .session_relay import _dsn_enabled, _send_delivery_error, _validate_agent_name
@@ -347,6 +348,32 @@ class MeshAdapter(BasePlatformAdapter):
             self._send_receive_dsn(request, text, sender, msg_id, "not-found")
             return web.json_response({"status": "not found"}, status=404)
 
+        # FR-4: reject inbound replies referencing a closed thread (backstop for
+        # non-hermes-mesh peers that lack the outbound guard).
+        if ref is not None and _threads.is_closed(ref):
+            logger.warning(
+                "[mesh] Rejected reply to closed thread %s from %s", ref, sender
+            )
+            return web.json_response(
+                {
+                    "error": f"THREAD_CLOSED: thread closed by terminal message {ref}",
+                    "hint": f"open a new message (no ref) to reach {recipient}",
+                },
+                status=400,
+            )
+
+        # FR-2 AC-2.2: recipient gateway records the terminal anchor on receive.
+        # Registry write is best-effort bookkeeping (F9): a failure here must
+        # never 500 an inbound webhook — log and continue delivering normally.
+        if reply == "end":
+            try:
+                _threads.record(msg_id, closed_by=sender)
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
+                    msg_id, sender, exc,
+                )
+
         event, err = self._build_event(
             payload, sender, recipient, msg_id, action, reply, ref, body_text
         )
@@ -546,7 +573,7 @@ class MeshAdapter(BasePlatformAdapter):
         if action not in {"do", "info"}:
             logger.warning("[mesh] Invalid envelope action: %s", action)
             return None, web.json_response({"status": "bad request"}, status=400)
-        if reply not in {"yes", "no"}:
+        if reply not in {"yes", "no", "end"}:
             logger.warning("[mesh] Invalid envelope reply: %s", reply)
             return None, web.json_response({"status": "bad request"}, status=400)
 
