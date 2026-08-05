@@ -330,6 +330,7 @@ Every `mesh_send` carries a **CTA** (Call To Action) that tells the recipient wh
 
 - **Sender side:** after sending `reply=end` with a `ref` anchor, the thread is recorded as closed (`~/.hermes/fleet/mesh/closed-threads.json`, append-only, cross-process safe via `fcntl.flock`). Further sends to that thread fail with `THREAD_CLOSED` — the terminal message IS the goodbye; open a new message (no `ref`) to reach the agent again.
 - **Receiver side:** a reply to a closed thread is rejected with HTTP 400 + `THREAD_CLOSED` hint.
+- **Receiver CTA (v0.1.18):** an inbound `reply=end` renders the no-obligation CTA — `(thread closed by sender — no reply owed; new message = new thread)` — instead of echoing `reply: end`. Terminal messages never manufacture a reply obligation; `reply=yes`/`reply=no` render the normal `[Reply via mesh …]` CTA unchanged.
 - **Registry:** `closed-threads.json` persists across restarts; override the path with `MESH_CLOSED_THREADS`.
 - **Backward compatibility:** the `end` value is accepted by `mesh_send` and the mesh adapter. Legacy peers (e.g. an older OpenClaw bridge) treat an unknown `end` as a warning + 400 — upgrade the peer bridge to accept `end` (deliver as `no`) for full compliance.
 - **Known limitation:** the guards fire when the reply carries a `ref` anchor. A ref-less reply cannot be thread-identified — always carry `ref=<anchor-id>` on replies.

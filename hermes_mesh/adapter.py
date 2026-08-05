@@ -617,7 +617,10 @@ class MeshAdapter(BasePlatformAdapter):
         """Build a MessageEvent with the correct platform source and metadata."""
         cta = ""
         if action and reply:
-            cta = f" [Reply via mesh to {sender} — action: {action}, reply: {reply}]"
+            if reply == "end":
+                cta = " (thread closed by sender — no reply owed; new message = new thread)"
+            else:
+                cta = f" [Reply via mesh to {sender} — action: {action}, reply: {reply}]"
         display_text = f"⬡ [Mesh from:{sender}] {body_text}{cta}"
 
         if self._target_session:
