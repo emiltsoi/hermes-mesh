@@ -671,6 +671,55 @@ class TestAdapterHandleMesh:
         assert not is_loopback_bind_host("::")
         assert is_loopback_bind_host("::1")
 
+    # --- FR-1 (adapter-cta-reply-end): incoming reply=end renders a no-obligation CTA ---
+
+    def _drain_event(self, adapter, req):
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+        event = adapter._mesh_inbox.get_nowait()
+        assert event is not None
+        return event
+
+    def test_inbound_end_renders_no_obligation_cta(self):
+        adapter = self._make_adapter()
+        req = self._make_request(
+            {"from": "ada", "text": self._envelope(reply="end")},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        event = self._drain_event(adapter, req)
+        assert "thread closed by sender — no reply owed; new message = new thread" in event.text
+        assert "Reply via mesh" not in event.text
+        assert "reply: end" not in event.text
+
+    def test_inbound_yes_cta_unchanged(self):
+        adapter = self._make_adapter()
+        req = self._make_request(
+            {"from": "ada", "text": self._envelope(action="do", reply="yes")},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        event = self._drain_event(adapter, req)
+        assert "[Reply via mesh to ada — action: do, reply: yes]" in event.text
+
+    def test_inbound_no_cta_unchanged(self):
+        adapter = self._make_adapter()
+        req = self._make_request(
+            {"from": "ada", "text": self._envelope(action="info", reply="no")},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        event = self._drain_event(adapter, req)
+        assert "[Reply via mesh to ada — action: info, reply: no]" in event.text
+
+    def test_inbound_missing_reply_defaults_to_no_cta(self):
+        # Tolerant receive (mesh-economy): missing reply -> "no" -> CTA renders reply: no
+        adapter = self._make_adapter()
+        header = "[mesh][from:ada][to:ADA][id:testid-123][action:info] no-reply-field"
+        req = self._make_request(
+            {"from": "ada", "text": header},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        event = self._drain_event(adapter, req)
+        assert "[Reply via mesh to ada — action: info, reply: no]" in event.text
+
 
 class TestPinnedRequest:
     """_pinned_request should try every resolved IP, not just the first."""
