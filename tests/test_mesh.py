@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hermes_mesh import auth as mesh_auth
+from hermes_mesh import outbox
 from hermes_mesh import threads
 from hermes_mesh.adapter import MeshAdapter
 from hermes_mesh.network import is_loopback_bind_host
@@ -1154,27 +1155,42 @@ class TestF1_GuardWinsOverDedup:
 
 
 class TestF2_DSNExemptFromGuard:
-    """F2 (HIGH): ref-carrying DSNs skip THREAD_CLOSED (notifications, not
-    replies). Both wire shapes pass the exemption: the X-Mesh-DSN header and
-    the [mesh-dsn] body fallback (AC-2.1). Non-DSN replies still 400 (AC-2.2)."""
+    """F2/B2 (HIGH): ref-carrying DSNs skip THREAD_CLOSED (notifications, not
+    replies) ONLY via the canonical X-Mesh-DSN header (B2). The former
+    [mesh-dsn] body-substring fallback was dropped — a body that merely
+    mentions the marker is client-controlled and no longer bypasses the guard.
+    AC-2.1: body-mentioning reply to a closed anchor -> 400 THREAD_CLOSED.
+    AC-2.2: header-carrying DSN to a closed anchor -> delivered."""
 
-    @pytest.mark.parametrize("shape", ["header", "body"])
-    def test_dsn_shaped_ref_to_closed_anchor_delivers(self, shape, _isolate_registry):
+    def test_header_dsn_ref_to_closed_anchor_delivers(self, _isolate_registry):
+        """AC-2.2: the X-Mesh-DSN header is the canonical DSN signal."""
         threads.record("term-1", closed_by="ada")
         adapter = TestAdapterHandleMesh._make_adapter()
         text = TestAdapterHandleMesh._envelope(
             reply="no", ref="term-1", msg_id="dsn-1", body="delivery failed"
         )
-        if shape == "body":
-            text += " [mesh-dsn][status:failed][reason:unreachable]"
-        headers = {"X-Mesh-Timestamp": str(time.time())}
-        if shape == "header":
-            headers["X-Mesh-DSN"] = "1"
+        headers = {"X-Mesh-Timestamp": str(time.time()), "X-Mesh-DSN": "1"}
         req = TestAdapterHandleMesh._make_request({"from": "ada", "text": text}, headers)
         resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
         assert resp.status == 202
         event = adapter._mesh_inbox.get_nowait()
         assert event is not None
+
+    def test_body_mention_ref_to_closed_anchor_400(self, _isolate_registry):
+        """AC-2.1: the [mesh-dsn] body marker alone must NOT bypass the guard."""
+        threads.record("term-1", closed_by="ada")
+        adapter = TestAdapterHandleMesh._make_adapter()
+        text = TestAdapterHandleMesh._envelope(
+            reply="no", ref="term-1", msg_id="dsn-2", body="delivery failed"
+        )
+        text += " [mesh-dsn][status:failed][reason:unreachable]"
+        headers = {"X-Mesh-Timestamp": str(time.time())}
+        req = TestAdapterHandleMesh._make_request({"from": "ada", "text": text}, headers)
+        resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+        assert resp.status == 400
+        payload = json.loads(resp.body)
+        assert payload["error"] == "THREAD_CLOSED: thread closed by terminal message term-1"
+        assert adapter._mesh_inbox.empty()
 
     def test_non_dsn_reply_to_closed_anchor_still_400(self, _isolate_registry):
         threads.record("term-1", closed_by="ada")
@@ -1297,3 +1313,134 @@ class TestF8_ErrorCorrelation:
             })
             assert "error" in result
             assert result["task_id"] == "corr-1"
+
+
+class TestB3_DedupAfterEnqueue:
+    """B3 (HIGH): the dedup seen-record is written AFTER a successful enqueue.
+    A busy (QueueFull) message is NOT marked seen, so the sender's retry is a
+    fresh attempt that can succeed once the queue drains (AC-3.1). Delivered
+    messages still dedup (AC-3.2, covered by test_duplicate_non_ref_msg_id_dedups_to_200)."""
+
+    def test_busy_not_seen_retry_delivers(self, _isolate_registry):
+        """AC-3.1: inbox full -> first attempt 503, id NOT in seen; retry after
+        drain -> delivered (202), not a 200 duplicate."""
+        adapter = TestAdapterHandleMesh._make_adapter()
+        adapter._mesh_inbox = asyncio.Queue(maxsize=1)
+        adapter._mesh_inbox.put_nowait(object())
+        text = TestAdapterHandleMesh._envelope(reply="no", msg_id="busy-1", body="hello")
+        with patch("hermes_mesh.adapter._send_delivery_error") as mock_dsn:
+            req = TestAdapterHandleMesh._make_request(
+                {"from": "ada", "text": text},
+                {"X-Mesh-Timestamp": str(time.time())},
+            )
+            resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+        assert resp.status == 503
+        assert "busy-1" not in adapter._seen_message_ids
+        mock_dsn.assert_called_once()
+
+        # Drain the inbox; the retry is a fresh attempt -> delivered.
+        adapter._mesh_inbox.get_nowait()
+        req = TestAdapterHandleMesh._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+        assert "busy-1" in adapter._seen_message_ids
+        assert not adapter._mesh_inbox.empty()
+
+
+class TestB4_RecordBeforeDelivery:
+    """B4 (MED): the sender records the terminal anchor after auth resolve
+    succeeds, BEFORE the delivery attempt (AC-4.2). Resolve-fail paths leave no
+    anchor (AC-4.1 — held from wave-1 F5, covered by test_resolve_fail_no_anchor_and_dsn)."""
+
+    def test_during_delivery_is_closed_true(self, _isolate_registry, tmp_path):
+        """AC-4.2: while _deliver_webhook is running, is_closed(task_id) is True."""
+        sender_private, _ = mesh_auth.load_or_generate_keypair(
+            "sender", extra={"private_key_path": str(tmp_path / "sender.pem")}
+        )
+        seen = {}
+
+        def _deliver(url, body, signing_material, **kwargs):
+            seen["closed"] = threads.is_closed("b4-task")
+            return ("d-1", None)
+
+        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}), \
+             patch("hermes_mesh.auth.resolve_target", return_value=("http://t", None)), \
+             patch("hermes_mesh.auth.resolve_sender", return_value=(sender_private, None)), \
+             patch("hermes_mesh.session_relay._deliver_webhook", side_effect=_deliver), \
+             patch("hermes_mesh.session_relay._float.send"):
+            result = handle_mesh_send({
+                "message": "bye", "agent": "target", "action": "info",
+                "reply": "end", "task_id": "b4-task",
+            })
+        assert result.get("status") == "delivered"
+        assert seen.get("closed") is True
+        assert threads.is_closed("b4-task") is True
+
+
+class TestB5_OutboxRecheck:
+    """B5 (MED): outbox _attempt_item re-checks _threads.is_closed(ref) before
+    POST; closed -> drop + log (AC-5.1); open thread -> retries unchanged
+    (AC-5.2). DSN items are exempt — their ref is correlation, not reply intent."""
+
+    def test_queued_reply_to_closed_thread_dropped(self, _isolate_registry):
+        """AC-5.1: queued reply to a thread closed while queued -> attempt
+        skipped, no recipient POST."""
+        threads.record("term-1", closed_by="ada")
+        item = {
+            "id": "out-1",
+            "from": "sender",
+            "to": "target",
+            "padded_message": "[mesh][from:sender][to:target][id:m1] hi",
+            "body": '{"from":"sender","text":"hi"}',
+            "ref": "term-1",
+            "is_dsn": False,
+        }
+        with patch("hermes_mesh.outbox._resolve_material_and_url") as mock_resolve, \
+             patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver:
+            ok = outbox._attempt_item(item)
+        assert ok is True
+        mock_resolve.assert_not_called()
+        mock_deliver.assert_not_called()
+
+    def test_open_thread_retries_unchanged(self, _isolate_registry):
+        """AC-5.2: open thread -> POST still happens (regression)."""
+        item = {
+            "id": "out-2",
+            "from": "sender",
+            "to": "target",
+            "padded_message": "[mesh][from:sender][to:target][id:m2] hi",
+            "body": '{"from":"sender","text":"hi"}',
+            "ref": "open-ref",
+            "is_dsn": False,
+        }
+        with patch("hermes_mesh.outbox._resolve_material_and_url",
+                   return_value=("pem", "http://127.0.0.1:8645/mesh/receive", "")), \
+             patch("hermes_mesh.session_relay._deliver_webhook",
+                   return_value=("d-1", None)) as mock_deliver:
+            ok = outbox._attempt_item(item)
+        assert ok is True
+        mock_deliver.assert_called_once()
+
+    def test_dsn_item_ref_closed_not_dropped(self, _isolate_registry):
+        """A queued DSN whose correlation ref is closed is still delivered
+        (delivery-failure notifications must survive thread closure)."""
+        threads.record("term-1", closed_by="ada")
+        item = {
+            "id": "out-3",
+            "from": "sender",
+            "to": "target",
+            "padded_message": "[mesh][from:sender][to:target][id:m3] [mesh-dsn]...",
+            "body": '{"from":"sender","text":"dsn"}',
+            "ref": "term-1",
+            "is_dsn": True,
+        }
+        with patch("hermes_mesh.outbox._resolve_material_and_url",
+                   return_value=("pem", "http://127.0.0.1:8645/mesh/receive", "")), \
+             patch("hermes_mesh.session_relay._deliver_webhook",
+                   return_value=("d-1", None)) as mock_deliver:
+            ok = outbox._attempt_item(item)
+        assert ok is True
+        mock_deliver.assert_called_once()

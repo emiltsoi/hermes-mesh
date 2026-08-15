@@ -362,13 +362,14 @@ class MeshAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        # Replay protection: drop exact duplicate message ids (AC-1.2).
+        # Replay protection: drop exact duplicate message ids (AC-1.2). The
+        # seen-record is written AFTER the enqueue succeeds (B3): a busy
+        # (QueueFull) message must not be marked seen, or the sender's retry
+        # would dedup to 200 and a terminal message would never deliver.
         if msg_id in self._seen_message_ids:
             logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
             record_metric("receive", "duplicate")
             return web.json_response({"status": "duplicate"}, status=200)
-        self._seen_message_ids[msg_id] = time.time()
-        self._expire_seen_messages()
 
         # FR-2 AC-2.2: recipient gateway records the terminal anchor on receive.
         # Registry write is best-effort bookkeeping (F9): a failure here must
@@ -408,6 +409,11 @@ class MeshAdapter(BasePlatformAdapter):
                 status=503,
             )
 
+        # B3: mark seen only after the message was actually enqueued (success
+        # path above). The check->enqueue->record sequence is synchronous, so
+        # no interleaving risk.
+        self._seen_message_ids[msg_id] = time.time()
+        self._expire_seen_messages()
         record_metric("receive", "total")
         return web.json_response(
             {"status": "accepted", "delivery_id": msg_id},
@@ -464,14 +470,16 @@ class MeshAdapter(BasePlatformAdapter):
         return None
 
     def _is_dsn_request(self, request: "web.Request", text: str) -> bool:
-        """Return True if the request is itself a DSN; DSNs don't cause DSNs."""
-        if request.headers.get(MESH_DSN_HEADER) == MESH_DSN_VALUE:
-            return True
-        # Body-level fallback in case a DSN was relayed through a peer that
-        # strips custom headers.
-        if text.startswith("[mesh]") and text.find("[mesh-dsn]") != -1:
-            return True
-        return False
+        """Return True if the request is itself a DSN; DSNs don't cause DSNs.
+
+        The X-Mesh-DSN header is the CANONICAL signal (B2): we own both ends of
+        the transport and always set it on DSNs. The former body-substring
+        fallback ([mesh-dsn]) was dropped — it was client-controlled and let a
+        reply that merely MENTIONS the marker skip the THREAD_CLOSED guard.
+        Known limitation: a DSN relayed through a peer that strips custom
+        headers is no longer recognized as a DSN (openclaw-mesh keeps headers).
+        """
+        return request.headers.get(MESH_DSN_HEADER) == MESH_DSN_VALUE
 
     def _send_receive_dsn(
         self,

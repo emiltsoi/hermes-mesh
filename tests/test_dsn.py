@@ -177,7 +177,9 @@ class TestF2_NoDSNForDSN:
         )
         req = MagicMock()
         req.read = AsyncMock(return_value=json.dumps({"from": "ada", "text": text}).encode())
-        req.headers = {"X-Mesh-Timestamp": str(time.time())}
+        # B2: the X-Mesh-DSN header is the canonical DSN signal; a body
+        # mention alone is no longer sufficient.
+        req.headers = {"X-Mesh-Timestamp": str(time.time()), "X-Mesh-DSN": "1"}
         with patch("hermes_mesh.adapter._send_delivery_error") as mock_send, \
              patch.dict(os.environ, {"MESH_DSN_ENABLED": "1"}):
             resp = asyncio.run(adapter._handle_mesh(req))
