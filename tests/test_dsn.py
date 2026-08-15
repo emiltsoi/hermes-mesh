@@ -1,9 +1,11 @@
 """Delivery-Status Notification (DSN) tests for hermes-mesh."""
+import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -147,3 +149,47 @@ class TestDSNSendFailure:
             dsn_call = mock_deliver.call_args_list[1]
             extra = dsn_call.kwargs.get("extra_headers") or dsn_call[1].get("extra_headers")
             assert extra == {"X-Mesh-DSN": "1"}
+
+
+class TestF2_NoDSNForDSN:
+    """F2 AC-2.3: DSN responses never spawn DSNs — on the receive side
+    (`_send_receive_dsn` bails on DSN-shaped requests) and on the send side
+    (`_send_delivery_error` bails on `is_dsn=True`)."""
+
+    def test_dsn_shaped_receive_failure_does_not_spawn_dsn(self):
+        """A DSN-shaped inbound that fails receive-side (recipient mismatch)
+        sends no DSN back."""
+        from hermes_mesh.adapter import MeshAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = MeshAdapter(
+            PlatformConfig(
+                extra={
+                    "secret": "INSECURE_NO_AUTH",
+                    "agent_name": "ada",
+                    "target_session": "telegram:dm:123",
+                }
+            )
+        )
+        text = (
+            "[mesh][from:ada][to:OTHER][id:m1][action:info][reply:no][ref:orig-1] "
+            "[mesh-dsn][status:failed][reason:unreachable]"
+        )
+        req = MagicMock()
+        req.read = AsyncMock(return_value=json.dumps({"from": "ada", "text": text}).encode())
+        req.headers = {"X-Mesh-Timestamp": str(time.time())}
+        with patch("hermes_mesh.adapter._send_delivery_error") as mock_send, \
+             patch.dict(os.environ, {"MESH_DSN_ENABLED": "1"}):
+            resp = asyncio.run(adapter._handle_mesh(req))
+        assert resp.status == 404
+        mock_send.assert_not_called()
+
+    def test_send_delivery_error_skips_dsn_for_dsn(self):
+        """_send_delivery_error(is_dsn=True) never delivers a DSN."""
+        with patch.dict(os.environ, {"MESH_DSN_ENABLED": "1", "MESH_DSN_RATE_LIMIT": "10"}), \
+             patch("hermes_mesh.session_relay._deliver_webhook") as mock_deliver:
+            session_relay._send_delivery_error(
+                "from_agent", "to_agent", "orig-123", "unreachable",
+                "from_agent", "to_agent", is_dsn=True,
+            )
+            mock_deliver.assert_not_called()

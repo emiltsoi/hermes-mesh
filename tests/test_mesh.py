@@ -6,12 +6,14 @@ import stat
 import tempfile
 import time
 import urllib.error
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from hermes_mesh import auth as mesh_auth
+from hermes_mesh import threads
 from hermes_mesh.adapter import MeshAdapter
 from hermes_mesh.network import is_loopback_bind_host
 from hermes_mesh.common import validate_envelope_token
@@ -34,6 +36,22 @@ from hermes_mesh.session_relay import (
 )
 from gateway.config import PlatformConfig
 from hermes_mesh import float as float_module
+
+@pytest.fixture()
+def _isolate_registry(tmp_path, monkeypatch):
+    """Pin the closed-threads registry to a per-test temp file and clear the
+    in-memory snapshot so the F1/F2 adapter tests start from a known state."""
+    monkeypatch.setenv(
+        "MESH_CLOSED_THREADS",
+        str(tmp_path / "mesh" / "closed-threads.json"),
+    )
+    threads._LOCKED.clear()
+    threads._LOADED = False
+    yield
+    threads._LOCKED.clear()
+    threads._LOADED = False
+
+
 
 
 class TestIdentity:
@@ -1095,3 +1113,187 @@ class TestRegistryClient:
             args, kwargs = MockClient.call_args
             assert kwargs["pin"] == "overpin"
             assert kwargs["allow_insecure"] is True
+
+
+class TestF1_GuardWinsOverDedup:
+    """F1 (HIGH): the THREAD_CLOSED guard runs before the dedup record, so a
+    retried msg_id that references a closed anchor is rejected twice (AC-1.1)
+    while duplicate non-ref messages still dedup to 200 (AC-1.2)."""
+
+    def test_retried_msg_id_to_closed_anchor_400_twice(self, _isolate_registry):
+        threads.record("term-1", closed_by="ada")
+        adapter = TestAdapterHandleMesh._make_adapter()
+        text = TestAdapterHandleMesh._envelope(
+            reply="no", ref="term-1", msg_id="retry-me", body="late reply"
+        )
+        for _ in range(2):
+            req = TestAdapterHandleMesh._make_request(
+                {"from": "ada", "text": text},
+                {"X-Mesh-Timestamp": str(time.time())},
+            )
+            resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+            assert resp.status == 400
+            payload = json.loads(resp.body)
+            assert payload["error"] == "THREAD_CLOSED: thread closed by terminal message term-1"
+        assert adapter._mesh_inbox.empty()
+
+    def test_duplicate_non_ref_msg_id_dedups_to_200(self):
+        adapter = TestAdapterHandleMesh._make_adapter()
+        text = TestAdapterHandleMesh._envelope(reply="no", msg_id="dup-me", body="hello")
+        for i in range(2):
+            req = TestAdapterHandleMesh._make_request(
+                {"from": "ada", "text": text},
+                {"X-Mesh-Timestamp": str(time.time())},
+            )
+            resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+            if i == 0:
+                assert resp.status == 202
+            else:
+                assert resp.status == 200
+                assert json.loads(resp.body) == {"status": "duplicate"}
+
+
+class TestF2_DSNExemptFromGuard:
+    """F2 (HIGH): ref-carrying DSNs skip THREAD_CLOSED (notifications, not
+    replies). Both wire shapes pass the exemption: the X-Mesh-DSN header and
+    the [mesh-dsn] body fallback (AC-2.1). Non-DSN replies still 400 (AC-2.2)."""
+
+    @pytest.mark.parametrize("shape", ["header", "body"])
+    def test_dsn_shaped_ref_to_closed_anchor_delivers(self, shape, _isolate_registry):
+        threads.record("term-1", closed_by="ada")
+        adapter = TestAdapterHandleMesh._make_adapter()
+        text = TestAdapterHandleMesh._envelope(
+            reply="no", ref="term-1", msg_id="dsn-1", body="delivery failed"
+        )
+        if shape == "body":
+            text += " [mesh-dsn][status:failed][reason:unreachable]"
+        headers = {"X-Mesh-Timestamp": str(time.time())}
+        if shape == "header":
+            headers["X-Mesh-DSN"] = "1"
+        req = TestAdapterHandleMesh._make_request({"from": "ada", "text": text}, headers)
+        resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+        assert resp.status == 202
+        event = adapter._mesh_inbox.get_nowait()
+        assert event is not None
+
+    def test_non_dsn_reply_to_closed_anchor_still_400(self, _isolate_registry):
+        threads.record("term-1", closed_by="ada")
+        adapter = TestAdapterHandleMesh._make_adapter()
+        text = TestAdapterHandleMesh._envelope(
+            reply="no", ref="term-1", msg_id="non-dsn-1", body="late reply"
+        )
+        req = TestAdapterHandleMesh._make_request(
+            {"from": "ada", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = TestAdapterHandleMesh._run(adapter._handle_mesh(req))
+        assert resp.status == 400
+        payload = json.loads(resp.body)
+        assert payload["error"] == "THREAD_CLOSED: thread closed by terminal message term-1"
+        assert adapter._mesh_inbox.empty()
+
+
+class TestF5_ResolveBeforeRecord:
+    """F5 (MED): the terminal anchor is recorded only after resolution; a
+    resolve-fail run records no anchor and still surfaces a delivery-error DSN
+    (AC-5.1); a successful terminal send still records the anchor (AC-5.2)."""
+
+    @pytest.mark.parametrize("which", ["target", "sender"])
+    def test_resolve_fail_no_anchor_and_dsn(self, which, tmp_path):
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}))
+            mock_record = stack.enter_context(
+                patch("hermes_mesh.session_relay.threads.record")
+            )
+            mock_dsn = stack.enter_context(
+                patch("hermes_mesh.session_relay._send_delivery_error")
+            )
+            if which == "target":
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_target", return_value=(None, "not found"))
+                )
+            else:
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_target", return_value=("http://t", None))
+                )
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_sender", return_value=(None, "no key"))
+                )
+            result = handle_mesh_send({
+                "message": "bye", "agent": "target", "action": "info",
+                "reply": "end", "task_id": "f5-1",
+            })
+            assert "error" in result
+            assert result.get("task_id") == "f5-1"
+            mock_record.assert_not_called()
+            mock_dsn.assert_called_once()
+
+    def test_success_records_anchor_after_resolve(self, tmp_path):
+        sender_private, _ = mesh_auth.load_or_generate_keypair(
+            "sender", extra={"private_key_path": str(tmp_path / "sender.pem")}
+        )
+        order = []
+
+        def _resolve_sender(name, extra=None):
+            order.append("resolve")
+            return (sender_private, None)
+
+        def _record(anchor, closed_by):
+            order.append("record")
+
+        with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}), \
+             patch("hermes_mesh.auth.resolve_target", return_value=("http://t", None)), \
+             patch("hermes_mesh.auth.resolve_sender", side_effect=_resolve_sender), \
+             patch("hermes_mesh.session_relay.threads.record", side_effect=_record) as mock_record, \
+             patch("hermes_mesh.session_relay._deliver_webhook", return_value=("d-1", None)), \
+             patch("hermes_mesh.session_relay._float.send"):
+            result = handle_mesh_send({
+                "message": "bye", "agent": "target", "action": "info",
+                "reply": "end", "task_id": "f5-ok",
+            })
+        assert result.get("status") == "delivered"
+        mock_record.assert_called_once_with("f5-ok", closed_by="sender")
+        assert order.index("resolve") < order.index("record")
+
+
+class TestF8_ErrorCorrelation:
+    """F8 (LOW): every immediate-failure return carries task_id (AC-8.1):
+    resolve_target failure, resolve_sender failure, and post-retries webhook."""
+
+    @pytest.mark.parametrize("site", ["resolve_target", "resolve_sender", "webhook"])
+    def test_immediate_failure_returns_carry_task_id(self, site):
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "MESH_AGENT_NAME": "sender", "MESH_OUTBOX_ENABLED": "0",
+            }))
+            stack.enter_context(patch("hermes_mesh.session_relay._send_delivery_error"))
+            if site == "resolve_target":
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_target", return_value=(None, "boom"))
+                )
+            elif site == "resolve_sender":
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_target", return_value=("http://t", None))
+                )
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_sender", return_value=(None, "boom"))
+                )
+            else:
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_target", return_value=("http://t", None))
+                )
+                stack.enter_context(
+                    patch("hermes_mesh.auth.resolve_sender", return_value=("pem", None))
+                )
+                stack.enter_context(
+                    patch("hermes_mesh.session_relay._deliver_webhook",
+                          return_value=(None, "unreachable"))
+                )
+                stack.enter_context(patch("hermes_mesh.session_relay._float.send"))
+            reply = "end" if site != "webhook" else "no"
+            result = handle_mesh_send({
+                "message": "hi", "agent": "target", "action": "info",
+                "reply": reply, "task_id": "corr-1",
+            })
+            assert "error" in result
+            assert result["task_id"] == "corr-1"
