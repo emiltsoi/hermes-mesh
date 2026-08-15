@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -127,6 +128,27 @@ def _hydrate(entries: list[dict], path: Path) -> None:
     _MTIME = _registry_mtime(path)
 
 
+def _read_entries_strict(path: Path) -> tuple[list[dict], bool]:
+    """Read registry entries, reporting read failure separately.
+
+    Returns ``(entries, failed)``. ``failed`` is True when the file exists but
+    could not be read as a valid JSON list (corrupt/malformed) — ``record``
+    uses this to back up the corrupt bytes before writing fresh (B6). Fail-open
+    callers that only need ``[]`` on failure use ``_read_entries``.
+    """
+    if not path.exists():
+        return [], False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("%s: %s (%s)", _REGISTRY_UNAVAILABLE, path, exc)
+        return [], True
+    if not isinstance(data, list):
+        logger.warning("%s: %s (malformed)", _REGISTRY_UNAVAILABLE, path)
+        return [], True
+    return [entry for entry in data if isinstance(entry, dict)], False
+
+
 def _read_entries(path: Path | None = None) -> list[dict]:
     """Read registry entries from disk; tolerate a missing or corrupt file.
 
@@ -136,17 +158,8 @@ def _read_entries(path: Path | None = None) -> list[dict]:
     """
     if path is None:
         path = _registry_path()
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        logger.warning("%s: %s (%s)", _REGISTRY_UNAVAILABLE, path, exc)
-        return []
-    if not isinstance(data, list):
-        logger.warning("%s: %s (malformed)", _REGISTRY_UNAVAILABLE, path)
-        return []
-    return [entry for entry in data if isinstance(entry, dict)]
+    entries, _ = _read_entries_strict(path)
+    return entries
 
 
 def _write_entries(entries: list[dict], path: Path | None = None) -> None:
@@ -181,6 +194,31 @@ def _write_entries(entries: list[dict], path: Path | None = None) -> None:
         raise
 
 
+def _backup_corrupt(path: Path) -> None:
+    """Back up a corrupt registry file to ``<path>.corrupt-<ts>``.
+
+    Called inside the flock critical section (``record``) so the backup name is
+    unique and the original corrupt bytes are preserved before the fresh write
+    clobbers the path (B6). Best-effort: on failure log loudly and continue —
+    the subsequent fresh write is still attempted.
+    """
+    if not path.exists():
+        return
+    backup = Path(f"{path}.corrupt-{time.time()}")
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        logger.warning(
+            "[mesh] failed to back up corrupt closed-threads registry %s: %s",
+            path, exc,
+        )
+        return
+    logger.warning(
+        "[mesh] corrupt closed-threads registry %s backed up to %s",
+        path, backup,
+    )
+
+
 def load() -> list[dict]:
     """Load registry entries from disk into the locked set (restart rehydrate).
 
@@ -208,7 +246,12 @@ def record(anchor_task_id: str, closed_by: str) -> None:
         # Fresh read under the cross-process lock: never trust the in-memory
         # snapshot for idempotency — another gateway process may have written
         # since we last hydrated.
-        entries = _read_entries(path)
+        entries, failed = _read_entries_strict(path)
+        if failed:
+            # B6: never clobber unreadable state. Back up the corrupt file
+            # inside the flock critical section so the original bytes survive
+            # the fresh write below, then start from [].
+            _backup_corrupt(path)
         for entry in entries:
             if entry.get("anchor_task_id") == anchor:
                 _hydrate(entries, path)
@@ -239,10 +282,18 @@ def is_closed(anchor_task_id: str | None) -> bool:
     # Locked read (F7): _hydrate clears+re-adds the in-memory set non-atomically,
     # so concurrent record()/hydrate could otherwise expose a transient empty
     # snapshot. Same GIL+flock discipline as writes.
-    with _registry_lock(path):
-        if not _LOADED:
-            _hydrate(_read_entries(path), path)
+    try:
+        with _registry_lock(path):
+            if not _LOADED:
+                _hydrate(_read_entries(path), path)
+                return anchor_task_id in _LOCKED
+            if _registry_mtime(path) != _MTIME:
+                _hydrate(_read_entries(path), path)
             return anchor_task_id in _LOCKED
-        if _registry_mtime(path) != _MTIME:
-            _hydrate(_read_entries(path), path)
-        return anchor_task_id in _LOCKED
+    except (PermissionError, OSError) as exc:
+        # B1 fail-open: the read path must never raise on lock acquisition — an
+        # unwritable registry dir (lock sidecar O_CREAT denied) would otherwise
+        # PermissionError every ref-bearing message and brick messaging. The
+        # WRITE path (record) stays loud. Uncertainty -> False.
+        logger.warning("%s: %s (%s)", _REGISTRY_UNAVAILABLE, path, exc)
+        return False

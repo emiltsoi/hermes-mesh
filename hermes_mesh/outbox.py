@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from . import threads as _threads
 from .common import parse_mesh_header, record_metric, validate_envelope_token
 from .network import is_local_target_host
 
@@ -148,6 +149,19 @@ def _webhook_allow_loopback() -> bool:
 def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     """Try to deliver one outbox item.  Return True on success."""
     from .session_relay import _deliver_webhook, _sign_timestamp_enabled
+
+    # B5: re-check the thread is still open before POST. A reply queued while
+    # its thread was open may be retried after the thread closed — sending it
+    # would just bounce THREAD_CLOSED and burn retries. Drop + log instead.
+    # DSN items are exempt: their ref is correlation (delivery notification),
+    # not reply intent — mirrors the inbound DSN exemption (B2).
+    ref = item.get("ref")
+    if ref is not None and not item.get("is_dsn") and _threads.is_closed(ref):
+        logger.warning(
+            "Mesh outbox: message %s references closed thread %s; dropping",
+            item.get("id"), ref,
+        )
+        return True
 
     from_agent = item["from"]
     to_agent = item["to"]

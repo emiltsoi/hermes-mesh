@@ -703,6 +703,24 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         )
         return {"error": error, "task_id": task_id}
 
+    # FR-2 AC-2.1 / F5 / B4: the sender gateway records the terminal anchor
+    # after auth resolve succeeds (resolve_target/resolve_sender above) and
+    # BEFORE the delivery attempt. This closes the in-flight window: once
+    # delivery begins, is_closed(task_id) is already True (AC-4.2), so a
+    # concurrent reply cannot slip past the outbound guard. A resolve failure
+    # returns above, leaving no closed thread (AC-4.1 — wave-1 F5 held). The
+    # residual acceptance->record gap is the auth resolve itself (documented,
+    # accepted). Persistence is best-effort bookkeeping (F3): a registry
+    # failure must never kill the terminal message delivery (AC-2.3).
+    if reply == "end":
+        try:
+            threads.record(task_id, closed_by=from_agent)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
+                task_id, from_agent, exc,
+            )
+
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
     allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
     sign_timestamp = _sign_timestamp_enabled()
@@ -713,20 +731,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         allow_loopback=allow_loopback,
         sign_timestamp=sign_timestamp,
     )
-
-    # FR-2 AC-2.1 / F5: the sender gateway records the terminal anchor only
-    # after the resolution + delivery attempt completes (AC-5.2). A resolve
-    # failure returns above, leaving no closed thread (AC-5.1). Persistence is
-    # best-effort bookkeeping (F3): a registry failure must never kill the
-    # terminal message delivery (AC-2.3).
-    if reply == "end":
-        try:
-            threads.record(task_id, closed_by=from_agent)
-        except (OSError, ValueError) as exc:
-            logger.warning(
-                "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
-                task_id, from_agent, exc,
-            )
 
     if delivery_id is None:
         # F4: surface the send-time-close asymmetry on final end-message failure.

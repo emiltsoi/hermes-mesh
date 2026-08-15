@@ -543,3 +543,89 @@ class TestReviewFixes_F3_F4_F6_F7:
         assert done.wait(timeout=2)
         t.join(timeout=2)
         assert result.get("val") is False
+
+
+class TestB1_FailOpenLockAcquisition:
+    """B1 (HIGH): the read path (is_closed) must never raise on lock
+    acquisition — an unwritable registry dir (lock sidecar O_CREAT denied)
+    fails open to False (AC-1.1) and ref-bearing messages still deliver,
+    while the WRITE path (record) stays loud (AC-1.3)."""
+
+    @staticmethod
+    def _skip_if_root():
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("running as root; permission bits are bypassed")
+
+    def test_unwritable_dir_is_closed_fails_open(self, caplog):
+        """AC-1.1: chmod 0555 registry dir -> is_closed returns False, no raise."""
+        self._skip_if_root()
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        assert not threads._registry_lock_path(path).exists()
+        path.parent.chmod(0o555)
+        try:
+            with caplog.at_level("WARNING", logger="hermes_mesh.threads"):
+                assert threads.is_closed("any-ref") is False
+                assert threads.is_closed("any-ref") is False
+            assert "UNAVAILABLE" in caplog.text
+        finally:
+            path.parent.chmod(0o755)
+
+    def test_ref_message_delivered_with_unwritable_dir(self):
+        """AC-1.1 end-to-end: a ref-bearing message DELIVERS through _handle_mesh."""
+        self._skip_if_root()
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        assert not threads._registry_lock_path(path).exists()
+        path.parent.chmod(0o555)
+        try:
+            adapter = _make_adapter()
+            text = _envelope(reply="no", ref="some-ref", msg_id="b1-m1", body="hello")
+            req = _make_request({"from": "ada", "text": text})
+            resp = _run(adapter._handle_mesh(req))
+            assert resp.status == 202
+            assert not adapter._mesh_inbox.empty()
+        finally:
+            path.parent.chmod(0o755)
+
+    def test_record_on_unwritable_dir_still_raises(self):
+        """AC-1.3: write path (record) is NOT fail-open — it still raises."""
+        self._skip_if_root()
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o555)
+        try:
+            with pytest.raises(PermissionError):
+                threads.record("anchor-w", closed_by="ada")
+        finally:
+            path.parent.chmod(0o755)
+
+
+class TestB6_NoClobberUnreadableState:
+    """B6 (MED): a corrupt registry is backed up before record writes fresh —
+    never clobbering the unreadable bytes (AC-6.1); healthy registries create
+    no backup (AC-6.2)."""
+
+    def test_corrupt_registry_backed_up_and_fresh(self, caplog):
+        """AC-6.1: corrupt -> record c -> disk has [c] AND a .corrupt-<ts>
+        backup preserves the original corrupt bytes."""
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        corrupt = b'{"a": corrupted!!!}'
+        path.write_bytes(corrupt)
+        with caplog.at_level("WARNING", logger="hermes_mesh.threads"):
+            threads.record("c", closed_by="ada")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert [entry["anchor_task_id"] for entry in data] == ["c"]
+        backups = sorted(path.parent.glob("closed-threads.json.corrupt-*"))
+        assert backups, "expected a .corrupt-<ts> backup"
+        assert backups[-1].read_bytes() == corrupt
+        assert "backed up" in caplog.text
+
+    def test_healthy_registry_no_backup(self):
+        """AC-6.2: healthy registry -> no backup created."""
+        threads.record("a", closed_by="ada")
+        threads.record("b", closed_by="bob")
+        path = threads._registry_path()
+        backups = list(path.parent.glob("closed-threads.json.corrupt-*"))
+        assert backups == []
