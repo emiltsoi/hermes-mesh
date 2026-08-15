@@ -110,7 +110,9 @@ def _registry_lock(path: Path):
         finally:
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_UN)
-    os.close(fd)
+            # Close inside the finally so an exception in the yield body never
+            # leaks the lock-file fd (F4).
+            os.close(fd)
 
 
 def _hydrate(entries: list[dict], path: Path) -> None:
@@ -138,7 +140,7 @@ def _read_entries(path: Path | None = None) -> list[dict]:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+    except (OSError, ValueError) as exc:
         logger.warning("%s: %s (%s)", _REGISTRY_UNAVAILABLE, path, exc)
         return []
     if not isinstance(data, list):
@@ -161,6 +163,16 @@ def _write_entries(entries: list[dict], path: Path | None = None) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        # Durability (F6): fsync the parent directory so the rename itself is
+        # persisted across power loss, not just the file contents.
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:  # pragma: no cover - dir fsync unsupported on this FS
+            pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -224,9 +236,13 @@ def is_closed(anchor_task_id: str | None) -> bool:
     if anchor_task_id is None:
         return False
     path = _registry_path()
-    if not _LOADED:
-        _hydrate(_read_entries(path), path)
+    # Locked read (F7): _hydrate clears+re-adds the in-memory set non-atomically,
+    # so concurrent record()/hydrate could otherwise expose a transient empty
+    # snapshot. Same GIL+flock discipline as writes.
+    with _registry_lock(path):
+        if not _LOADED:
+            _hydrate(_read_entries(path), path)
+            return anchor_task_id in _LOCKED
+        if _registry_mtime(path) != _MTIME:
+            _hydrate(_read_entries(path), path)
         return anchor_task_id in _LOCKED
-    if _registry_mtime(path) != _MTIME:
-        _hydrate(_read_entries(path), path)
-    return anchor_task_id in _LOCKED

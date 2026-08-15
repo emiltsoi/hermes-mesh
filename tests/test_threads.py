@@ -10,11 +10,13 @@ Maps to the sealed spec (mesh-terminal-reply-2026-08-05):
 - FR-6 back-compat / receive tolerance (AC-6.1)
 """
 import asyncio
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -451,3 +453,93 @@ class TestCrossProcessAndDegrade:
         path.write_text(json.dumps(data), encoding="utf-8")
         assert threads.is_closed("ext-1") is True
         assert threads.is_closed("local-1") is True
+
+
+class TestReviewFixes_F3_F4_F6_F7:
+    """v0.1.19 review-fix wave: F3 (fail-open), F4 (fd leak), F6 (dir fsync),
+    F7 (locked reads)."""
+
+    def test_f3_corrupt_utf8_registry_fails_open(self, caplog):
+        """AC-3.1: corrupt-UTF-8 registry -> _read_entries [] + is_closed False
+        + UNAVAILABLE marker logged; messaging never blocks."""
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xff\xfe\x00\x41\xff")
+        with caplog.at_level("WARNING", logger="hermes_mesh.threads"):
+            entries = threads._read_entries()
+        assert entries == []
+        assert threads.is_closed("any-anchor") is False
+        assert "UNAVAILABLE" in caplog.text
+
+    def test_f4_no_fd_leak_on_raising_iterations(self):
+        """AC-4.1: 50 raising iterations -> /proc/self/fd delta == 0."""
+        if not os.path.isdir("/proc/self/fd"):
+            pytest.skip("requires /proc/self/fd")
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _fd_count():
+            return len(os.listdir("/proc/self/fd"))
+
+        before = _fd_count()
+        for _ in range(50):
+            try:
+                with threads._registry_lock(path):
+                    raise ValueError("boom")
+            except ValueError:
+                pass
+        after = _fd_count()
+        assert after == before
+
+    def test_f6_write_fsyncs_parent_dir(self):
+        """AC-6.1: os.replace is followed by a parent-directory fsync."""
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        real_fsync = os.fsync
+        real_open = os.open
+        fsynced = []
+        readonly_fds = []
+
+        def _open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            if len(args) > 1 and args[1] == os.O_RDONLY:
+                readonly_fds.append(fd)
+            return fd
+
+        def _fsync(fd):
+            fsynced.append(fd)
+            return real_fsync(fd)
+
+        with patch("hermes_mesh.threads.os.fsync", side_effect=_fsync), \
+             patch("hermes_mesh.threads.os.open", side_effect=_open):
+            threads.record("anchor-f6", closed_by="ada")
+        assert readonly_fds, "expected an O_RDONLY directory open"
+        assert any(fd in fsynced for fd in readonly_fds), "parent dir fd not fsynced"
+
+    def test_f7_is_closed_takes_registry_flock(self):
+        """AC-7.1: is_closed blocks on the registry flock (locked read path);
+        fail-open direction preserved (any uncertainty -> False)."""
+        path = threads._registry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = threads._registry_lock_path(path)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        result = {}
+        started = threading.Event()
+        done = threading.Event()
+
+        def _check():
+            started.set()
+            result["val"] = threads.is_closed("any-anchor")
+            done.set()
+
+        t = threading.Thread(target=_check)
+        t.start()
+        assert started.wait(timeout=2), "is_closed thread never started"
+        blocked = not done.wait(timeout=0.3)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        assert blocked, "is_closed must block while the registry flock is held"
+        assert done.wait(timeout=2)
+        t.join(timeout=2)
+        assert result.get("val") is False

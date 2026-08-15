@@ -668,18 +668,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     task_id = task_id or str(uuid.uuid4())
 
-    # FR-2 AC-2.1: sender gateway records the terminal anchor at send time.
-    # Persistence is best-effort bookkeeping (F3): a registry failure must
-    # never kill the terminal message delivery (AC-2.3).
-    if reply == "end":
-        try:
-            threads.record(task_id, closed_by=from_agent)
-        except (OSError, ValueError) as exc:
-            logger.warning(
-                "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
-                task_id, from_agent, exc,
-            )
-
     header = f"[mesh][v:1][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
     if ref:
         header += f"[ref:{ref}]"
@@ -691,11 +679,29 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     extra = mesh_extra()
     target_url, error = auth.resolve_target(agent)
     if error:
-        return {"error": error}
+        # F5 AC-5.1: a resolve failure records no anchor and still surfaces a
+        # delivery-error DSN (best-effort). F8: the error carries task_id.
+        _send_delivery_error(
+            from_agent,
+            agent if ref else from_agent,
+            task_id,
+            error or "unreachable",
+            from_agent,
+            agent,
+        )
+        return {"error": error, "task_id": task_id}
 
     signing_material, error = auth.resolve_sender(from_agent, extra)
     if error:
-        return {"error": error}
+        _send_delivery_error(
+            from_agent,
+            agent if ref else from_agent,
+            task_id,
+            error or "unreachable",
+            from_agent,
+            agent,
+        )
+        return {"error": error, "task_id": task_id}
 
     body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
     allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
@@ -707,6 +713,20 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         allow_loopback=allow_loopback,
         sign_timestamp=sign_timestamp,
     )
+
+    # FR-2 AC-2.1 / F5: the sender gateway records the terminal anchor only
+    # after the resolution + delivery attempt completes (AC-5.2). A resolve
+    # failure returns above, leaving no closed thread (AC-5.1). Persistence is
+    # best-effort bookkeeping (F3): a registry failure must never kill the
+    # terminal message delivery (AC-2.3).
+    if reply == "end":
+        try:
+            threads.record(task_id, closed_by=from_agent)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
+                task_id, from_agent, exc,
+            )
 
     if delivery_id is None:
         # F4: surface the send-time-close asymmetry on final end-message failure.
@@ -740,7 +760,10 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             from_agent,
             agent,
         )
-        return {"error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts"}
+        return {
+            "error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts",
+            "task_id": task_id,
+        }
 
     # Part 2: Telegram float (best-effort, non-blocking)
     _float.send(text=padded_message, sender_name=from_agent)

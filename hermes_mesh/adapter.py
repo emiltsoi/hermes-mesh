@@ -321,13 +321,6 @@ class MeshAdapter(BasePlatformAdapter):
             self._send_receive_dsn(request, text, sender, msg_id, "rate-limited")
             return rate_err
 
-        if msg_id in self._seen_message_ids:
-            logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
-            record_metric("receive", "duplicate")
-            return web.json_response({"status": "duplicate"}, status=200)
-        self._seen_message_ids[msg_id] = time.time()
-        self._expire_seen_messages()
-
         if from_field and sender != from_field:
             logger.warning(
                 "[mesh] Envelope sender '%s' does not match body 'from' field '%s'",
@@ -348,9 +341,16 @@ class MeshAdapter(BasePlatformAdapter):
             self._send_receive_dsn(request, text, sender, msg_id, "not-found")
             return web.json_response({"status": "not found"}, status=404)
 
+        # F1/F2: DSN-check -> THREAD_CLOSED guard -> dedup record. A DSN is a
+        # notification, not a reply; its ref is correlation, not reply intent --
+        # so DSN-shaped messages skip the THREAD_CLOSED guard. Guard wins over
+        # dedup: a retried msg_id that references a closed thread is rejected
+        # before any dedup record can turn the retry into a 200 duplicate.
+        is_dsn = self._is_dsn_request(request, text)
+
         # FR-4: reject inbound replies referencing a closed thread (backstop for
         # non-hermes-mesh peers that lack the outbound guard).
-        if ref is not None and _threads.is_closed(ref):
+        if ref is not None and not is_dsn and _threads.is_closed(ref):
             logger.warning(
                 "[mesh] Rejected reply to closed thread %s from %s", ref, sender
             )
@@ -361,6 +361,14 @@ class MeshAdapter(BasePlatformAdapter):
                 },
                 status=400,
             )
+
+        # Replay protection: drop exact duplicate message ids (AC-1.2).
+        if msg_id in self._seen_message_ids:
+            logger.info("[mesh] Duplicate message_id %s dropped", msg_id)
+            record_metric("receive", "duplicate")
+            return web.json_response({"status": "duplicate"}, status=200)
+        self._seen_message_ids[msg_id] = time.time()
+        self._expire_seen_messages()
 
         # FR-2 AC-2.2: recipient gateway records the terminal anchor on receive.
         # Registry write is best-effort bookkeeping (F9): a failure here must
