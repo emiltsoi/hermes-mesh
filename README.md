@@ -74,7 +74,7 @@ platforms:
   mesh:
     enabled: true
     extra:
-      host: 0.0.0.0
+      host: 127.0.0.1        # ⚠️ Loopback for single-host fleets. 0.0.0.0 exposes mesh on all interfaces — only if agents are on separate hosts AND you have firewall protection.
       port: 8744
       route: receive          # listens on /mesh/receive
       agent_name: agent0      # local agent name
@@ -126,10 +126,28 @@ endpoint (`/mesh/<route>`). The `hermes_webhook.auth.public_key` is the
 **target's** Ed25519 public key; messages are signed with the **sender's**
 own private key for per-agent Ed25519 authentication.
 
+> **⚠️ CRITICAL — registration is REQUIRED, not optional.** If an agent is
+> NOT registered in the mesh-peer-registry, peers will **401 on signature
+> verification** — the receiver cannot look up the sender's public key and
+> rejects the delivery. This is the #1 cause of "mesh_send delivered but
+> target 401s". After creating the identity.yaml, **register the agent in
+> the registry** (see step 3) AND `mesh_sync()` on every peer so they pull
+> the new identity. Verify with: `curl -s http://<registry>/peers/<name>` —
+> it must return the entry.
+
 The local vault is the runtime source of truth. To discover peers from a
 mesh-peer-registry, call `mesh_sync(name="...")` or `mesh_sync()` to pull
 all peers into the local vault. The adapter verifies inbound `X-Mesh-Signature`
 headers with the public key in the cached identity.
+
+> **Mesh-to-DM routing (recommended for conversational fleets).** Set
+> `target_session: "telegram:dm:<chat_id>"` in `platforms.mesh.extra` (or the
+> global `~/.hermes/config.yaml`) so inbound mesh messages route into the
+> agent's **main DM session** — preserving full conversation context. Without
+> it, mesh messages go to a separate mesh session and the agent loses context
+> (replies won't know the thread). The global config is the single source of
+> truth: all agents inherit `telegram:dm:<chat_id>` without per-profile
+> duplication.
 
 Mesh delivery is one-way inbound into the target agent's session. If the
 agent generates a reply, the platform `send()` call is intentionally a
@@ -436,6 +454,19 @@ PYTHONPATH=/home/emil/CascadeProjects/hermes-mesh:\
 
 This coupling is expected while the project remains a plugin rather than a
 standalone library.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| **401 Unauthorized** on inbound mesh POST | Sender not in receiver's registry/vault — receiver can't verify their Ed25519 key | Register sender in the registry (`mesh_register` / `mesh_publish`), then `mesh_sync()` on the receiver. Verify: `curl -s http://<registry>/peers/<sender>` returns the entry |
+| **401** after restart | Identity cache stale or registry lost the peer (TTL expiry) | Re-register the peer + `mesh_sync()` on peers |
+| **404 Not Found** on delivery | `hermes_webhook.url` points at `/webhook` instead of the mesh adapter `/mesh/<route>` | Fix identity.yaml: url must be `http://<host>:<mesh_port>/mesh/receive` (NOT the webhook port/path) |
+| **404** on `POST /webhook` | The Hermes gateway serves `/webhooks/{route_name}`, not `/webhook` — the mesh relay never posts there | This is expected; the mesh uses `/mesh/<route>` only. If identity.yaml says `/webhook`, correct it |
+| **Could not bind: address already in use** | Mesh port conflicts with another service (e.g. A2A using the same port) | Give each subsystem its own port — mesh, A2A, webhook must all differ |
+| **Loopback blocked** on registration/delivery | `MESH_REGISTER_ALLOW_LOOPBACK` / `MESH_WEBHOOK_ALLOW_LOOPBACK` not set for loopback-only fleets | `export MESH_WEBHOOK_ALLOW_LOOPBACK=1 MESH_REGISTER_ALLOW_LOOPBACK=1` (loopback-only fleets) |
+| **Insecure registry refused** | Registry is http:// but `MESH_REGISTRY_ALLOW_INSECURE` unset | `export MESH_REGISTRY_ALLOW_INSECURE=1` for local-only registries |
+| **Reply not reaching caller** | `target_session` not set — reply went to a separate mesh session | Set `target_session: "telegram:dm:<chat_id>"` (global or per-profile) so replies route into the DM session |
 
 ## License
 
