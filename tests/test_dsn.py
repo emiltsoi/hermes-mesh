@@ -97,10 +97,11 @@ class TestDSNDelivery:
             call = mock_deliver.call_args
             extra_headers = call.kwargs.get("extra_headers") or call[1].get("extra_headers")
             assert extra_headers == {"X-Mesh-DSN": "1"}
+            # The delivery path now receives the raw envelope string and a
+            # `sender` kwarg; the JSON wire-wrap happens inside _deliver_webhook.
             body = call[0][1]
-            payload = json.loads(body)
-            assert payload["from"] == "from_agent"
-            assert "[mesh-dsn]" in payload["text"]
+            assert "[mesh-dsn]" in body
+            assert call.kwargs.get("sender") == "from_agent"
 
 
 class TestDSNSendFailure:
