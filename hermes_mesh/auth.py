@@ -1,24 +1,16 @@
 """Mesh authentication — Ed25519 signing, key management, and peer resolution.
 
-This module is the only runtime dependency for mesh auth. It does NOT
-import `mesh_peer_registry`; that package is only needed by the optional
-`mesh_sync` / `mesh_publish` tools.
+This module delegates Ed25519 primitives to ``mesh_core.crypto`` while keeping
+the Hermes-specific public API unchanged.
 """
 from __future__ import annotations
 
-import base64
-import binascii
 import logging
 import os
 from pathlib import Path
 from typing import Optional, Tuple
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from mesh_core import crypto as _crypto
 
 from . import identity
 from .common import transport as _transport
@@ -39,17 +31,6 @@ def _private_key_path(name: str, extra: dict | None = None) -> Path:
     return DEFAULT_KEY_DIR / f"{name}.pem"
 
 
-def _public_from_private(private_pem: str) -> str:
-    """Derive the public key PEM from an Ed25519 private key PEM."""
-    private = serialization.load_pem_private_key(
-        private_pem.encode("utf-8"), password=None
-    )
-    return private.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("utf-8")
-
-
 def load_or_generate_keypair(
     name: str, extra: dict | None = None
 ) -> Tuple[str, str]:
@@ -59,94 +40,25 @@ def load_or_generate_keypair(
     `~/.mesh/keys/<name>.pem` (or `extra["private_key_path"]`) with 0600
     permissions.
     """
-    path = _private_key_path(name, extra)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        path.parent.chmod(0o700)
-    except OSError:
-        logger.warning("mesh keys: could not chmod directory %s", path.parent)
-
-    if path.exists():
-        private_pem = path.read_text(encoding="utf-8")
-        return private_pem, _public_from_private(private_pem)
-
-    private = Ed25519PrivateKey.generate()
-    public = private.public_key()
-    private_pem = private.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
-    public_pem = public.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("utf-8")
-
-    path.write_text(private_pem, encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        logger.warning("mesh keys: could not chmod %s", path)
-
-    return private_pem, public_pem
+    private_key_path = _private_key_path(name, extra) if extra and extra.get("private_key_path") else None
+    return _crypto.load_or_generate_keypair(
+        name,
+        private_key_path_override=private_key_path,
+    )
 
 
 def sign_ed25519(private_pem: str, message: bytes) -> str:
     """Sign `message` with the private key and return a base64 signature."""
-    private = serialization.load_pem_private_key(
-        private_pem.encode("utf-8"), password=None
-    )
-    return base64.b64encode(private.sign(message)).decode("utf-8")
+    return _crypto.sign_message(private_pem, message)
 
 
 def verify_ed25519(public_pem: str, message: bytes, signature_b64: str) -> bool:
     """Verify an Ed25519 signature.
 
-    Tolerates two key framings (migration bridge, wave
-    2026-08-16-key-framing-interop F2):
-
-    - PEM SPKI (input containing "BEGIN PUBLIC KEY"): STRICT PEM only via
-      `load_pem_public_key`. Corrupt PEM returns False (401) — it is NEVER
-      reinterpreted through the raw base64 path.
-    - RAW base64 SPKI (no PEM marker): the input is stripped (YAML block
-      scalars carry trailing newlines — whitespace is load-bearing), strict
-      base64-decoded, must be exactly 44 bytes (Ed25519 SPKI DER), and must
-      parse to an `Ed25519PublicKey`. X25519 SPKI is also 44 bytes (same DER
-      shape, OID 2B 65 6E vs Ed25519 2B 65 70) — the isinstance check rejects
-      it; without it, `verify()` would raise.
-
-    Every failure path returns False — no exception escapes. This function is
-    the adapter's auth choke point; callers map False to 401.
+    Delegates to ``mesh_core.crypto.verify_message``, which tolerates PEM SPKI
+    and raw base64 SPKI inputs and never raises.
     """
-    try:
-        if "BEGIN PUBLIC KEY" in public_pem:
-            public = serialization.load_pem_public_key(public_pem.encode("utf-8"))
-        else:
-            stripped = public_pem.strip()
-            try:
-                der = base64.b64decode(stripped.encode("utf-8"), validate=True)
-            except (binascii.Error, ValueError):
-                return False
-            if len(der) != 44:
-                return False
-            try:
-                public = serialization.load_der_public_key(der)
-            except ValueError:
-                return False
-            if not isinstance(public, Ed25519PublicKey):
-                return False
-
-        try:
-            signature = base64.b64decode(signature_b64.encode("utf-8"))
-        except Exception:
-            return False
-        try:
-            public.verify(signature, message)
-            return True
-        except InvalidSignature:
-            return False
-    except Exception:
-        return False
+    return _crypto.verify_message(public_pem, message, signature_b64)
 
 
 def resolve_target(name: str) -> Tuple[Optional[str], Optional[str]]:

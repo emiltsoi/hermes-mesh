@@ -10,34 +10,29 @@ from pathlib import Path
 
 import yaml
 
-_ENVELOPE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+from mesh_core.envelope import parse_envelope as _parse_envelope
+from mesh_core.envelope import validate_envelope_token as _validate_envelope_token
+from mesh_core.exceptions import EnvelopeError
 
 # DSN (Delivery-Status Notification) constants
 MESH_DSN_HEADER = "X-Mesh-DSN"
 MESH_DSN_VALUE = "1"
 
-_MESH_HEADER_RE = re.compile(
-    r'^\s*\[mesh\](?:\[v:[^\]]+\])?\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
-    r'\[action:([^\]]+)\]\[reply:([^\]]+)\]'
-    r'(?:\[ref:([^\]]+)\])?\s*'
-)
-
 
 def parse_mesh_header(text: str) -> dict | None:
     """Parse the bracketed [mesh] envelope header into a dict, or None."""
-    m = _MESH_HEADER_RE.match(text)
-    if not m:
+    try:
+        envelope = _parse_envelope(text)
+    except EnvelopeError:
         return None
-    sender, recipient, msg_id, action, reply, ref = m.groups()
-    body_text = text[m.end():].lstrip()
     return {
-        "sender": sender,
-        "recipient": recipient,
-        "msg_id": msg_id,
-        "action": action,
-        "reply": reply,
-        "ref": ref,
-        "body_text": body_text,
+        "sender": envelope.sender,
+        "recipient": envelope.recipient,
+        "msg_id": envelope.msg_id,
+        "action": envelope.action,
+        "reply": envelope.reply,
+        "ref": envelope.ref,
+        "body_text": envelope.body,
     }
 
 
@@ -48,17 +43,10 @@ def validate_envelope_token(token: object) -> str:
     they must be short and free of injection/whitespace characters. Returns
     the token as a string. Raises ValueError if it is empty or invalid.
     """
-    if not isinstance(token, str):
-        raise ValueError(f"Envelope token must be a string: {token!r}")
-    value = token.strip()
-    if not value:
-        raise ValueError("Envelope token must not be empty")
-    if not _ENVELOPE_TOKEN_RE.match(value):
-        raise ValueError(
-            f"Invalid envelope token: {value!r}. "
-            "Allowed: 1-128 characters from A-Z, a-z, 0-9, _, ., -, :"
-        )
-    return value
+    try:
+        return _validate_envelope_token(token)
+    except EnvelopeError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def transport(agent_info: dict, name: str) -> dict:

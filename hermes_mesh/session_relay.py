@@ -23,8 +23,17 @@ import ssl
 import time
 import urllib.error
 import uuid
+from dataclasses import replace
 from typing import Optional
 from urllib.parse import urlparse
+
+from mesh_core.delivery import _exception_to_reason
+from mesh_core.dsn import (
+    _check_dsn_rate_limit,
+    _dsn_enabled,
+    _dsn_rate_limit,
+    make_dsn_envelope,
+)
 
 from . import float as _float
 from .common import (
@@ -312,32 +321,6 @@ def _extract_envelope_sender(body: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _exception_to_reason(exc: Exception) -> str:
-    """Map a delivery exception to a short, stable reason code."""
-    from urllib.error import HTTPError
-
-    if isinstance(exc, HTTPError):
-        code = exc.code
-        if code in (401, 403):
-            return "unauthorized"
-        if code == 404:
-            return "not-found"
-        if code == 400:
-            return "bad-request"
-        if code == 429:
-            return "rate-limited"
-        if code == 503:
-            return "busy"
-        if code >= 500:
-            return "internal-error"
-    msg = str(exc).lower()
-    if "blocked" in msg or "private" in msg or "loopback" in msg:
-        return "loopback-blocked"
-    if "timeout" in msg:
-        return "unreachable"
-    return "unreachable"
-
-
 def _deliver_webhook(
     url: str,
     body: str,
@@ -460,46 +443,6 @@ def _deliver_webhook(
 # Delivery-Status Notifications (DSN)
 # ---------------------------------------------------------------------------
 
-_DSN_ENABLED: bool | None = None
-
-
-def _dsn_enabled() -> bool:
-    """Return True when DSN generation is enabled."""
-    global _DSN_ENABLED
-    if _DSN_ENABLED is None:
-        _DSN_ENABLED = os.getenv("MESH_DSN_ENABLED", "1").lower() in ("1", "true", "yes")
-    return _DSN_ENABLED
-
-
-def _dsn_rate_limit(auth_failure: bool = False) -> int:
-    """Return the per-minute DSN rate limit for a recipient."""
-    env = "MESH_DSN_AUTH_FAILURE_RATE_LIMIT" if auth_failure else "MESH_DSN_RATE_LIMIT"
-    default = "0" if auth_failure else "10"
-    raw = os.getenv(env, default)
-    try:
-        return int(raw)
-    except ValueError:
-        return int(default)
-
-
-def _check_dsn_rate_limit(to_agent: str, auth_failure: bool = False) -> bool:
-    """Return True if a DSN to this recipient is still allowed this minute."""
-    limit = _dsn_rate_limit(auth_failure=auth_failure)
-    if auth_failure and limit <= 0:
-        return False
-    if limit <= 0:
-        return True
-    now = time.time()
-    bucket = _DSN_RATE_BUCKETS.get(to_agent)
-    if bucket is None or now - bucket[1] > 60:
-        _DSN_RATE_BUCKETS[to_agent] = (1, now)
-        return True
-    count, window_start = bucket
-    count += 1
-    _DSN_RATE_BUCKETS[to_agent] = (count, window_start)
-    return count <= limit
-
-
 def _make_dsn_text(
     dsn_from: str,
     dsn_to: str,
@@ -509,18 +452,11 @@ def _make_dsn_text(
     original_to: str,
 ) -> str:
     """Build a DSN bracketed message body."""
-    dsn_id = str(uuid.uuid4())
-    safe_reason = re.sub(r"[^A-Za-z0-9_.:-]", "_", reason)[:32]
-    body = (
-        f"[mesh-dsn][status:failed][reason:{safe_reason}] "
-        f"Delivery of message {original_id} from {original_from} to {original_to} "
-        f"failed: {safe_reason}."
+    envelope = make_dsn_envelope(
+        dsn_from, dsn_to, original_id, reason, original_from, original_to
     )
-    header = (
-        f"[mesh][v:1][from:{dsn_from}][to:{dsn_to}][id:{dsn_id}]"
-        f"[action:info][reply:no][ref:{original_id}]"
-    )
-    return f"{header} {body}"
+    # Preserve Hermes's historical [v:1] marker.
+    return replace(envelope, version="1").build()
 
 
 def _send_delivery_error(
