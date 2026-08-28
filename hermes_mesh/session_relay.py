@@ -291,6 +291,17 @@ _DELIVERY_TIMEOUT = int(os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT", "10"))
 
 _DSN_RATE_BUCKETS: dict[str, tuple[int, float]] = {}
 
+# Matches the [from:<name>] token inside a mesh envelope header. Used to derive
+# the JSON wire-wrap "from" field when the caller does not pass an explicit
+# sender to _deliver_webhook.
+_FROM_TOKEN_RE = re.compile(r"\[from:([^\]]+)\]")
+
+
+def _extract_envelope_sender(body: str) -> str | None:
+    """Return the sender named in the envelope's [from:...] token, or None."""
+    match = _FROM_TOKEN_RE.search(body or "")
+    return match.group(1) if match else None
+
 
 def _exception_to_reason(exc: Exception) -> str:
     """Map a delivery exception to a short, stable reason code."""
@@ -326,6 +337,8 @@ def _deliver_webhook(
     allow_loopback: bool = False,
     sign_timestamp: bool = False,
     extra_headers: dict | None = None,
+    wire_format: str = "json",
+    sender: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Deliver an Ed25519-signed webhook POST with retry.
 
@@ -334,11 +347,34 @@ def _deliver_webhook(
     returns a loopback/private address after validation passed. If the first
     resolved IP is unreachable, the remaining getaddrinfo results are tried.
 
+    Wire format (``wire_format``):
+      * ``"json"`` (canonical, default) — wraps ``body`` (the envelope string)
+        in ``{"text": <envelope>, "from": <sender>}`` and signs over the
+        wrapped JSON. This is the shape diploid-mesh and other Phase-5 peers
+        expect on /mesh/receive. The ``from`` field is taken from ``sender``
+        when provided, else derived from the envelope's ``[from:...]`` token,
+        else defaults to ``"hermes"``.
+      * ``"raw"`` (legacy) — sends ``body`` verbatim and signs over it, for
+        back-compat with hermes-mesh peers that still speak the raw envelope
+        wire shape.
+
+    Signing is otherwise unchanged: Ed25519 over ``timestamp\n<wire-body>`` when
+    ``sign_timestamp`` is set, else over ``<wire-body>``.
+
     Returns (delivery_id, None) on success, or (None, reason_code) if all
     retries fail. The reason_code is a short token such as 'unreachable',
     'unauthorized', or 'loopback-blocked'.
     """
     from . import auth
+
+    if wire_format == "json":
+        if not sender:
+            sender = _extract_envelope_sender(body) or "hermes"
+        wire_body = json.dumps({"from": sender, "text": body}, sort_keys=True)
+    elif wire_format == "raw":
+        wire_body = body
+    else:
+        raise ValueError(f"Unsupported wire_format: {wire_format!r}")
 
     try:
         _, resolved_ip_objs = _resolve_target_url(url, allow_loopback=allow_loopback)
@@ -353,7 +389,7 @@ def _deliver_webhook(
     }
     if extra_headers:
         headers.update(extra_headers)
-    signed_body = f"{timestamp}\n{body}".encode() if sign_timestamp else body.encode()
+    signed_body = f"{timestamp}\n{wire_body}".encode() if sign_timestamp else wire_body.encode()
     sig = auth.sign_ed25519(signing_material, signed_body)
     headers["X-Mesh-Signature"] = sig
 
@@ -373,7 +409,7 @@ def _deliver_webhook(
             attempt_timeout = max(1.0, remaining / (_DELIVERY_RETRIES - attempt))
             data = _pinned_request(
                 url,
-                body.encode(),
+                wire_body.encode(),
                 headers,
                 attempt_timeout,
                 allow_loopback=allow_loopback,
@@ -508,7 +544,6 @@ def _send_delivery_error(
         return
 
     dsn_text = _make_dsn_text(dsn_from, dsn_to, original_id, reason, original_from, original_to)
-    dsn_body = json.dumps({"from": dsn_from, "text": dsn_text}, sort_keys=True)
 
     from . import auth
 
@@ -531,11 +566,12 @@ def _send_delivery_error(
     sign_timestamp = _sign_timestamp_enabled()
     delivery_id, dsn_error = _deliver_webhook(
         target_url,
-        dsn_body,
+        dsn_text,
         signing_material,
         allow_loopback=allow_loopback,
         sign_timestamp=sign_timestamp,
         extra_headers=extra_headers,
+        sender=dsn_from,
     )
     if delivery_id is None:
         logger.warning("[mesh] DSN delivery to %s failed: %s", dsn_to, dsn_error)
@@ -544,7 +580,7 @@ def _send_delivery_error(
                 dsn_from,
                 dsn_to,
                 dsn_text,
-                dsn_body,
+                dsn_text,
                 is_dsn=True,
                 ref=original_id,
             )
@@ -721,15 +757,15 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 task_id, from_agent, exc,
             )
 
-    body = json.dumps({"from": from_agent, "text": padded_message}, sort_keys=True)
     allow_loopback = _webhook_allow_loopback() or _is_local_url(target_url)
     sign_timestamp = _sign_timestamp_enabled()
     delivery_id, error = _deliver_webhook(
         target_url,
-        body,
+        padded_message,
         signing_material,
         allow_loopback=allow_loopback,
         sign_timestamp=sign_timestamp,
+        sender=from_agent,
     )
 
     if delivery_id is None:
@@ -743,7 +779,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             )
         record_metric("send", "failed")
         if outbox.outbox_enabled():
-            outbox.queue_message(from_agent, agent, padded_message, body, ref=ref)
+            outbox.queue_message(from_agent, agent, padded_message, padded_message, ref=ref)
             return {
                 "task_id": task_id,
                 "state": "queued",

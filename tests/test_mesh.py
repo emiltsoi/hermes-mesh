@@ -428,15 +428,18 @@ class TestEd25519Signing:
             "sender",
             extra={"private_key_path": str(tmp_path / "sender.pem")},
         )
-        body = json.dumps({"from": "sender", "text": "[mesh] hello"})
+        # New contract: callers pass the raw envelope string; _deliver_webhook
+        # performs the JSON wire-wrap (default wire_format="json").
+        envelope = "[mesh][from:sender][to:target][id:m1][action:info][reply:no] hello"
 
         with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned:
             mock_pinned.return_value = b'{"delivery_id":"d1"}'
             delivery_id, error = _deliver_webhook(
                 "http://127.0.0.1:8645/mesh/receive",
-                body,
+                envelope,
                 private_pem,
                 allow_loopback=True,
+                sender="sender",
             )
 
         assert delivery_id == "d1"
@@ -449,6 +452,111 @@ class TestEd25519Signing:
 
         sig = headers["X-Mesh-Signature"]
         assert mesh_auth.verify_ed25519(public_pem, sent_body, sig)
+
+    def test_deliver_webhook_json_wire_wrap(self, tmp_path, monkeypatch):
+        """wire_format='json' wraps the envelope in {"text":..,"from":..} and
+        signs over the wrapped body (diploid-mesh / Phase-5 interop shape)."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("MESH_WEBHOOK_ALLOW_LOOPBACK", "1")
+
+        private_pem, public_pem = mesh_auth.load_or_generate_keypair(
+            "sender",
+            extra={"private_key_path": str(tmp_path / "sender.pem")},
+        )
+        envelope = (
+            "[mesh][v:1][from:hermes-0][to:diploid-0][id:interop-001]"
+            "[action:do][reply:yes] hello from hermes"
+        )
+
+        with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned:
+            mock_pinned.return_value = b'{"delivery_id":"d1"}'
+            delivery_id, error = _deliver_webhook(
+                "http://127.0.0.1:8645/mesh/receive",
+                envelope,
+                private_pem,
+                allow_loopback=True,
+                sign_timestamp=True,
+                wire_format="json",
+                sender="hermes-0",
+            )
+
+        assert delivery_id == "d1"
+        assert error is None
+        url, sent_body, headers, *_ = mock_pinned.call_args[0]
+
+        # Wire body is the JSON wrap diploid expects.
+        assert headers.get("Content-Type") == "application/json"
+        payload = json.loads(sent_body.decode("utf-8"))
+        assert payload["text"] == envelope
+        assert payload["from"] == "hermes-0"
+
+        # Signature is over timestamp\n<wrapped-body>, matching diploid ingress.
+        timestamp = headers["X-Mesh-Timestamp"]
+        signed = f"{timestamp}\n{sent_body.decode('utf-8')}".encode()
+        sig = headers["X-Mesh-Signature"]
+        assert mesh_auth.verify_ed25519(public_pem, signed, sig)
+
+    def test_deliver_webhook_raw_wire_format(self, tmp_path, monkeypatch):
+        """wire_format='raw' sends the envelope verbatim and signs over it
+        (legacy hermes<->hermes back-compat path)."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("MESH_WEBHOOK_ALLOW_LOOPBACK", "1")
+
+        private_pem, public_pem = mesh_auth.load_or_generate_keypair(
+            "sender",
+            extra={"private_key_path": str(tmp_path / "sender.pem")},
+        )
+        envelope = "[mesh][from:sender][to:target][id:m1][action:info][reply:no] hello"
+
+        with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned:
+            mock_pinned.return_value = b'{"delivery_id":"d1"}'
+            delivery_id, error = _deliver_webhook(
+                "http://127.0.0.1:8645/mesh/receive",
+                envelope,
+                private_pem,
+                allow_loopback=True,
+                wire_format="raw",
+            )
+
+        assert delivery_id == "d1"
+        assert error is None
+        url, sent_body, headers, *_ = mock_pinned.call_args[0]
+
+        # Raw path: body is the envelope verbatim, no JSON wrap.
+        assert sent_body == envelope.encode("utf-8")
+        sig = headers["X-Mesh-Signature"]
+        assert mesh_auth.verify_ed25519(public_pem, sent_body, sig)
+
+    def test_deliver_webhook_default_wire_format_is_json(self, tmp_path, monkeypatch):
+        """The default wire_format is 'json' (canonical) — omitting the kwarg
+        produces the JSON wrap, and the sender is derived from [from:...] when
+        no explicit sender is passed."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("MESH_WEBHOOK_ALLOW_LOOPBACK", "1")
+
+        private_pem, public_pem = mesh_auth.load_or_generate_keypair(
+            "sender",
+            extra={"private_key_path": str(tmp_path / "sender.pem")},
+        )
+        envelope = "[mesh][from:hermes-0][to:target][id:m1][action:info][reply:no] hi"
+
+        with patch("hermes_mesh.session_relay._pinned_request") as mock_pinned:
+            mock_pinned.return_value = b'{"delivery_id":"d1"}'
+            _deliver_webhook(
+                "http://127.0.0.1:8645/mesh/receive",
+                envelope,
+                private_pem,
+                allow_loopback=True,
+            )
+
+        url, sent_body, headers, *_ = mock_pinned.call_args[0]
+        payload = json.loads(sent_body.decode("utf-8"))
+        assert payload["text"] == envelope
+        # sender derived from the envelope's [from:hermes-0] token
+        assert payload["from"] == "hermes-0"
 
 class TestAdapterHandleMesh:
     """Adapter intake: replay window, envelope validation, per-agent Ed25519."""

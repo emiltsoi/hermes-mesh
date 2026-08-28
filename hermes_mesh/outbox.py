@@ -165,7 +165,10 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
 
     from_agent = item["from"]
     to_agent = item["to"]
-    body = item["body"]
+    # Deliver the raw envelope (padded_message); _deliver_webhook performs the
+    # JSON wire-wrap. The stored "body" field is retained for back-compat with
+    # items queued before the wrap moved into the delivery path.
+    envelope = item.get("padded_message") or item["body"]
     signing_material, target_url, error = _resolve_material_and_url(
         from_agent, to_agent, extra
     )
@@ -175,10 +178,11 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     sign_timestamp = bool(extra and extra.get("sign_timestamp")) or _sign_timestamp_enabled()
     delivery_id, _ = _deliver_webhook(
         target_url,
-        body,
+        envelope,
         signing_material,
         allow_loopback=_webhook_allow_loopback() or _is_local_url(target_url),
         sign_timestamp=sign_timestamp,
+        sender=from_agent,
     )
     if delivery_id is not None:
         record_metric("send", "outbox_delivered")
