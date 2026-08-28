@@ -174,7 +174,7 @@ export MESH_REGISTER_ALLOW_LOOPBACK=0         # Set to 1 to let mesh_register st
 export MESH_IDENTITY_CACHE_TTL=1.0            # Identity YAML cache TTL in seconds (0 disables)
 export MESH_IDENTITY_CACHE_MAXSIZE=256        # Identity cache max entries
 export MESH_VAULT_PATH=~/.hermes/fleet        # Custom mesh vault root
-export MESH_SIGN_TIMESTAMP=0                  # Set to 1 to include X-Mesh-Timestamp in the signed payload
+export MESH_SIGN_TIMESTAMP=0                  # Set to 0 to OPT OUT of X-Mesh-Timestamp signing (default is ON — the canonical json wire requires it)
 export MESH_REGISTRY_PIN=sha256-hex-of-spki   # TLS pinning digest for mesh-peer-registry
 export MESH_REGISTRY_ALLOW_INSECURE=0         # Set to 1 to allow http:// registry URLs
 export MESH_OUTBOX_ENABLED=0                  # Set to 1 to queue failed sends for retry
@@ -208,7 +208,13 @@ The `[mesh]` prefix is the canonical format. All mesh peers, including OpenClaw,
 - **Ed25519 signatures**: verifies `X-Mesh-Signature` (Ed25519) against the sender's `hermes_webhook.auth.public_key` from the local mesh vault. If a sender is not in the vault, call `mesh_sync(name="...")` to pull it from the mesh-peer-registry.
 - **Timestamp validation**: every inbound request must carry an `X-Mesh-Timestamp` header. The adapter rejects missing, non-numeric, or stale timestamps.
 - **Replay window**: a bounded TTL-based replay cache deduplicates message IDs and prevents replay attacks. Configured via `replay_window_size`, `replay_window_ttl`, `MESH_REPLAY_WINDOW_SIZE`, and `MESH_REPLAY_WINDOW_TTL`.
-- **Optional timestamp-included signing**: set `MESH_SIGN_TIMESTAMP=1` or `sign_timestamp: true` to include `X-Mesh-Timestamp` in the signed payload. Receivers accept both legacy body-only and timestamp-prefixed signatures for backward compatibility.
+- **Timestamp-included signing (DEFAULT ON)**: `X-Mesh-Timestamp` is included in the signed payload by default (the canonical JSON wire requires it — the replay-defense the contract demands). Set `MESH_SIGN_TIMESTAMP=0` to opt out (raw back-compat). Receivers accept both legacy body-only and timestamp-prefixed signatures for backward compatibility.
+
+## Phase 5: mesh_core + diploid interop (0.1.23)
+
+- **`mesh-peer-registry` (mesh_core) is now a dependency** — the shared protocol home (envelope/crypto/delivery/identity).
+- **JSON canonical wire**: `_deliver_webhook` wraps the envelope in `{"text": <envelope>, "from": <sender>}` + signs over `timestamp\n<body>` (Content-Type: application/json). The raw bracketed body remains available via `wire_format="raw"` (back-compat for hermes↔hermes peers).
+- **Diploid interop**: hermes-mesh ↔ diploid-agent/diploid-mesh (Phase 5) — verified by the hermetic dual-boot test (`test_hermes_interop.py`).
 - **Durable outbox**: when `MESH_OUTBOX_ENABLED=1`, failed `mesh_send` deliveries are written to disk and retried by a background reaper. After `MESH_OUTBOX_MAX_ATTEMPTS` failures, items move to a `dead/` folder.
 - **Rate limiting**: optional per-sender rate limiting via `rate_limit_per_minute` / `MESH_RATE_LIMIT_PER_MINUTE`.
 
