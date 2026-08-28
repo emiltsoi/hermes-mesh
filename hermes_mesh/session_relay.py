@@ -306,9 +306,6 @@ _DELIVERY_RETRIES = int(os.getenv("MESH_WEBHOOK_DELIVERY_RETRIES", "3"))
 _DELIVERY_BACKOFF = float(os.getenv("MESH_WEBHOOK_DELIVERY_BACKOFF", "1.0"))
 _DELIVERY_TIMEOUT = int(os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT", "10"))
 
-
-_DSN_RATE_BUCKETS: dict[str, tuple[int, float]] = {}
-
 # Matches the [from:<name>] token inside a mesh envelope header. Used to derive
 # the JSON wire-wrap "from" field when the caller does not pass an explicit
 # sender to _deliver_webhook.
