@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Optional
 
 from . import threads as _threads
-from .common import parse_mesh_header, record_metric, validate_envelope_token
+from mesh_core.envelope import parse_envelope as _parse_envelope
+from mesh_core.exceptions import EnvelopeError
+
+from .common import record_metric
 from .network import is_local_target_host
 
 logger = logging.getLogger(__name__)
@@ -249,21 +252,22 @@ def retry_outbox(
             if not item.get("is_dsn"):
                 try:
                     from .session_relay import _send_delivery_error
-                    header = parse_mesh_header(item.get("padded_message", ""))
-                    if header:
-                        original_from = header["sender"]
-                        original_to = header["recipient"]
-                        original_id = validate_envelope_token(header["msg_id"])
-                        ref = item.get("ref") or header.get("ref")
-                        dsn_to = original_to if ref else original_from
-                        _send_delivery_error(
-                            original_from,
-                            dsn_to,
-                            original_id,
-                            "dead-letter",
-                            original_from,
-                            original_to,
-                        )
+                    env = _parse_envelope(item.get("padded_message", ""))
+                    original_from = env.sender
+                    original_to = env.recipient
+                    original_id = env.msg_id
+                    ref = item.get("ref") or env.ref
+                    dsn_to = original_to if ref else original_from
+                    _send_delivery_error(
+                        original_from,
+                        dsn_to,
+                        original_id,
+                        "dead-letter",
+                        original_from,
+                        original_to,
+                    )
+                except EnvelopeError:
+                    pass
                 except Exception as e:
                     logger.warning("Mesh outbox: failed to send DSN for dead letter %s: %s", item.get("id"), e)
         else:

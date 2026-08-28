@@ -25,40 +25,43 @@ the marker "[mesh] closed-threads registry UNAVAILABLE — enforcement disabled"
 is logged and enforcement is disabled.
 
 Plain module-level functions: ``load`` / ``record`` / ``is_closed`` plus the
-in-memory locked-flag store (``_LOCKED``). Reuses ``common.py`` validators.
+in-memory locked-flag store (``_LOCKED``).
+
+This module converges on ``mesh_core.threads`` primitives for the heavy
+lifting — file locking/hydration, atomic writes, corrupt-file backups, and
+entry reading — while preserving the Hermes-specific default vault path,
+fail-open logging, and module-level state that the existing tests patch.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
-import shutil
-import tempfile
-import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - POSIX-only feature
-    fcntl = None  # type: ignore[assignment]
+import mesh_core.threads as _core
+from mesh_core.envelope import validate_envelope_token as _validate_token
+from mesh_core.exceptions import EnvelopeError
 
 from .common import validate_envelope_token
+from .identity import _fleet_root
 
 logger = logging.getLogger(__name__)
 
 # In-memory locked-flag store: an anchor present here is a closed thread whose
 # replies are rejected with THREAD_CLOSED.
-_LOCKED: set[str] = set()
 _LOADED: bool = False
+_LOCKED: set[str] = set()
 # mtime of the registry file whose content is currently reflected in _LOCKED.
 _MTIME: int | float | None = None
-# Intra-process guard; the cross-process guard is fcntl.flock on the lock file.
-_WRITE_LOCK = threading.Lock()
+
+# Re-export the mesh_core write lock so callers/tests can see the same object.
+_WRITE_LOCK = _core._WRITE_LOCK
 
 # Distinct, greppable marker for the intentional fail-open state (F6).
-_REGISTRY_UNAVAILABLE = "[mesh] closed-threads registry UNAVAILABLE — enforcement disabled"
+_REGISTRY_UNAVAILABLE = (
+    "[mesh] closed-threads registry UNAVAILABLE — enforcement disabled"
+)
 
 
 def _registry_path() -> Path:
@@ -66,54 +69,22 @@ def _registry_path() -> Path:
     env = os.environ.get("MESH_CLOSED_THREADS")
     if env:
         return Path(env)
-    from .identity import _fleet_root
-
     return _fleet_root() / "mesh" / "closed-threads.json"
 
 
 def _registry_lock_path(path: Path) -> Path:
     """Return the sidecar lock file used for cross-process serialization."""
-    return Path(f"{path}.lock")
+    return _core._registry_lock_path(path)
 
 
 def _registry_mtime(path: Path) -> int | float | None:
-    """Return the registry file's mtime, or None if it does not exist.
-
-    Uses ``st_mtime_ns`` (full precision) when available so two writes in
-    the same second are still distinguishable; the F2 mtime check only
-    re-reads the file when this value changes.
-    """
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    ns = getattr(st, "st_mtime_ns", None)
-    return ns if ns is not None else st.st_mtime
+    """Return the registry file's mtime, or None if it does not exist."""
+    return _core._registry_mtime(path)
 
 
-@contextmanager
 def _registry_lock(path: Path):
-    """Hold the registry lock across a read-merge-write critical section.
-
-    Acquires the intra-process ``_WRITE_LOCK`` and, when fcntl is available,
-    an exclusive ``flock`` on the sidecar lock file. The flock is what
-    serializes the multiple fleet gateway processes that share one registry;
-    it is held across the whole read-append-write so no anchor is lost.
-    """
-    lock_path = _registry_lock_path(path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-    with _WRITE_LOCK:
-        try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            # Close inside the finally so an exception in the yield body never
-            # leaks the lock-file fd (F4).
-            os.close(fd)
+    """Hold the registry lock across a read-merge-write critical section."""
+    return _core._registry_lock(path)
 
 
 def _hydrate(entries: list[dict], path: Path) -> None:
@@ -121,44 +92,34 @@ def _hydrate(entries: list[dict], path: Path) -> None:
     global _LOCKED, _LOADED, _MTIME
     _LOCKED.clear()
     for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         anchor = entry.get("anchor_task_id")
-        if isinstance(anchor, str) and anchor:
-            _LOCKED.add(anchor)
+        if not isinstance(anchor, str) or not anchor:
+            continue
+        try:
+            _LOCKED.add(_validate_token(anchor, "anchor"))
+        except EnvelopeError:
+            pass
     _LOADED = True
     _MTIME = _registry_mtime(path)
-
-
-def _read_entries_strict(path: Path) -> tuple[list[dict], bool]:
-    """Read registry entries, reporting read failure separately.
-
-    Returns ``(entries, failed)``. ``failed`` is True when the file exists but
-    could not be read as a valid JSON list (corrupt/malformed) — ``record``
-    uses this to back up the corrupt bytes before writing fresh (B6). Fail-open
-    callers that only need ``[]`` on failure use ``_read_entries``.
-    """
-    if not path.exists():
-        return [], False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        logger.warning("%s: %s (%s)", _REGISTRY_UNAVAILABLE, path, exc)
-        return [], True
-    if not isinstance(data, list):
-        logger.warning("%s: %s (malformed)", _REGISTRY_UNAVAILABLE, path)
-        return [], True
-    return [entry for entry in data if isinstance(entry, dict)], False
 
 
 def _read_entries(path: Path | None = None) -> list[dict]:
     """Read registry entries from disk; tolerate a missing or corrupt file.
 
     Fail-open: on corrupt/unreadable state log the distinct UNAVAILABLE marker
-    and return [] so messaging is never blocked (F6). Callers that then write
-    re-hydrate from whatever they write.
+    and return [] so messaging is never blocked (F6).
     """
     if path is None:
         path = _registry_path()
-    entries, _ = _read_entries_strict(path)
+    entries, failed = _core._read_entries_strict(path)
+    if failed:
+        logger.warning(
+            "%s: %s (corrupt or unreadable)",
+            _REGISTRY_UNAVAILABLE,
+            path,
+        )
     return entries
 
 
@@ -166,32 +127,7 @@ def _write_entries(entries: list[dict], path: Path | None = None) -> None:
     """Atomically write registry entries (tmp file + os.replace)."""
     if path is None:
         path = _registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        dir=str(path.parent), prefix="closed-threads-", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(entries, f, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        # Durability (F6): fsync the parent directory so the rename itself is
-        # persisted across power loss, not just the file contents.
-        try:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:  # pragma: no cover - dir fsync unsupported on this FS
-            pass
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _core._write_entries(entries, path)
 
 
 def _backup_corrupt(path: Path) -> None:
@@ -202,21 +138,17 @@ def _backup_corrupt(path: Path) -> None:
     clobbers the path (B6). Best-effort: on failure log loudly and continue —
     the subsequent fresh write is still attempted.
     """
-    if not path.exists():
-        return
-    backup = Path(f"{path}.corrupt-{time.time()}")
-    try:
-        shutil.copy2(path, backup)
-    except OSError as exc:
+    backup = _core._backup_corrupt(path)
+    if backup:
         logger.warning(
-            "[mesh] failed to back up corrupt closed-threads registry %s: %s",
-            path, exc,
+            "[mesh] corrupt closed-threads registry %s backed up to %s",
+            path,
+            backup,
         )
-        return
-    logger.warning(
-        "[mesh] corrupt closed-threads registry %s backed up to %s",
-        path, backup,
-    )
+    else:
+        logger.warning(
+            "[mesh] failed to back up corrupt closed-threads registry %s", path
+        )
 
 
 def load() -> list[dict]:
@@ -246,7 +178,7 @@ def record(anchor_task_id: str, closed_by: str) -> None:
         # Fresh read under the cross-process lock: never trust the in-memory
         # snapshot for idempotency — another gateway process may have written
         # since we last hydrated.
-        entries, failed = _read_entries_strict(path)
+        entries, failed = _core._read_entries_strict(path)
         if failed:
             # B6: never clobber unreadable state. Back up the corrupt file
             # inside the flock critical section so the original bytes survive
@@ -297,3 +229,25 @@ def is_closed(anchor_task_id: str | None) -> bool:
         # WRITE path (record) stays loud. Uncertainty -> False.
         logger.warning("%s: %s (%s)", _REGISTRY_UNAVAILABLE, path, exc)
         return False
+
+
+def list_closed() -> list[str]:
+    """Return all closed anchors."""
+    path = _registry_path()
+    if not _LOADED or _registry_mtime(path) != _MTIME:
+        _hydrate(_read_entries(path), path)
+    return sorted(_LOCKED)
+
+
+def clear() -> None:
+    """Clear the on-disk registry and the in-memory locked set."""
+    path = _registry_path()
+    with _registry_lock(path):
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    _LOCKED.clear()
+    _LOADED = False
+    _MTIME = None
