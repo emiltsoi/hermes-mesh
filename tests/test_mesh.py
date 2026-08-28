@@ -1162,7 +1162,10 @@ class TestRegistrySend:
         assert "X-Hub-Signature-256" not in headers
 
         sig = headers["X-Mesh-Signature"]
-        assert verify_message(sender_public, body, sig)
+        ts = headers["X-Mesh-Timestamp"]
+        # Canonical contract (2026-08-29): signature is over timestamp\n<body>
+        # when X-Mesh-Timestamp is present (default ON for json wire format).
+        assert verify_message(sender_public, f"{ts}\n{body.decode()}".encode(), sig)
 
 
 class TestRegistryClient:
