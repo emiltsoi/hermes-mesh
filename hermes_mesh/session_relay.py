@@ -78,9 +78,18 @@ def _webhook_allow_loopback() -> bool:
 
 
 def _sign_timestamp_enabled() -> bool:
-    """Return True when mesh_send should include X-Mesh-Timestamp in the signed payload."""
+    """Return True when mesh_send should include X-Mesh-Timestamp in the signed payload.
+
+    Default ON (2026-08-29, Phase 5 interop): the timestamp is the replay-defense
+    the contract demands — diploid-mesh's ingress ALWAYS verifies over
+    timestamp\\n<body>. Default-off was the legacy that created the hermes↔diploid
+    400 gap. Env MESH_SIGN_TIMESTAMP=0/false/no explicitly disables (raw
+    back-compat path).
+    """
     env = os.getenv("MESH_SIGN_TIMESTAMP", "")
-    return env.lower() in ("1", "true", "yes")
+    if env:
+        return env.lower() in ("1", "true", "yes")
+    return True
 
 
 def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> bool:
