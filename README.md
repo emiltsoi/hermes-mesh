@@ -412,20 +412,26 @@ the upstream `hermes-agent` core does not include A2A support.
 authentication, and the `fleet/mesh/agents` vault. The two identity stores
 are now fully independent.
 
-## OpenClaw interoperability
+## Cross-harness interoperability
 
-Hermes agents are not the only mesh participants. The companion
-[openclaw-mesh](https://github.com/emiltsoi/openclaw-mesh) plugin turns an
-OpenClaw agent into a full mesh peer using the same vault format, envelope
-format, and Ed25519 scheme.
+Hermes agents are not the only mesh participants. The mesh protocol is shared across three harnesses:
+
+| Harness | Mesh bridge |
+|---|---|
+| **Hermes** | `hermes-mesh` (this repo) |
+| **OpenClaw** | [openclaw-mesh](https://github.com/emiltsoi/openclaw-mesh) |
+| **diploid-agent** | [diploid-mesh](https://github.com/emiltsoi/diploid-mesh) |
+
+All three use the same local vault (`mesh/agents/<name>/identity.yaml`), the same `[mesh][from:...][to:...]` envelope, the same Ed25519 wire signatures, and the same optional [mesh-peer-registry](https://github.com/emiltsoi/mesh-peer-registry) server. A Hermes agent can `mesh_send(agent="diploid-0", message="...")` and the diploid agent receives the full envelope and can reply back the same way.
+
+### OpenClaw bridge
 
 A Hermes agent can `mesh_send(agent="emts", message="...")` and an OpenClaw
 agent receives the full `[mesh]` envelope with sender identity, action, reply
 intent, and thread id. Replies flow back the same way. Both agents keep the
-session context — who asked, what they asked for, and whether a reply is
-expected — across the Hermes/OpenClaw boundary.
+session context across the Hermes/OpenClaw boundary.
 
-### Known OpenClaw wake caveat
+#### Known OpenClaw wake caveat
 
 OpenClaw agents receive the inbound webhook through the `openclaw-mesh`
 plugin, which calls `api.runtime.agent.runEmbeddedAgent(...)` to inject the
@@ -438,6 +444,10 @@ waking an idle session from a plugin. The workarounds are:
 
 1. Keep the OpenClaw session warm before sending, or
 2. Send an explicit user turn to wake it, then send the mesh message.
+
+### diploid-agent bridge
+
+A Hermes agent can send to a diploid-agent peer the same way it sends to another Hermes peer: resolve the peer from the local vault or the shared registry, then `mesh_send(...)`. The diploid-agent harness receives the webhook through `diploid_mesh.ingress`, parses the `[mesh]` envelope, wakes the agent with mesh context, and lets it reply with the `mesh_send` MCP tool. The same Ed25519 verification, replay window, and thread-closure semantics apply on both sides.
 
 ## Testing
 
