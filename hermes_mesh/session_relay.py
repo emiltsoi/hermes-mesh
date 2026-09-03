@@ -586,6 +586,8 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     agent = merged.get("agent", "")
     ref = merged.get("ref")
     task_id = merged.get("task_id")
+    session = merged.get("session")
+    from_session = merged.get("from_session")
 
     if not message:
         return {"error": "'message' is required"}
@@ -646,7 +648,28 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     task_id = task_id or str(uuid.uuid4())
 
-    header = f"[mesh][v:1][from:{from_agent}][to:{agent}][id:{task_id}][action:{action}][reply:{reply}]"
+    # Session-selector tokens (0.1.8): validate against the envelope alphabet.
+    if session is not None and session != "":
+        try:
+            session = validate_envelope_token(session)
+        except ValueError as e:
+            return {"error": f"Invalid session: {e}"}
+    else:
+        session = None
+    if from_session is not None and from_session != "":
+        try:
+            from_session = validate_envelope_token(from_session)
+        except ValueError as e:
+            return {"error": f"Invalid from_session: {e}"}
+    else:
+        from_session = None
+
+    header = f"[mesh][v:1][from:{from_agent}][to:{agent}][id:{task_id}]"
+    if session:
+        header += f"[session:{session}]"
+    if from_session:
+        header += f"[from_session:{from_session}]"
+    header += f"[action:{action}][reply:{reply}]"
     if ref:
         header += f"[ref:{ref}]"
     padded_message = f"{header} {message}"

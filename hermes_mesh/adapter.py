@@ -69,9 +69,13 @@ def _envelope_regex() -> re.Pattern:
     action/reply groups are OPTIONAL in the pattern (tolerant receive —
     missing fields default to info/no in ``_parse_envelope``); the sender
     side requires them explicitly (mesh-economy required-envelope rule).
+    0.1.8 session-selector: [session] + [from_session] are optional tokens
+    after [id] (canonical order per the session-selector spec).
     """
     return re.compile(
         r'^\s*\[mesh\](?:\[v:([^\]]+)\])?\[from:([^\]]+)\]\[to:([^\]]+)\]\[id:([^\]]+)\]'
+        r'(?:\[session:([^\]]+)\])?'
+        r'(?:\[from_session:([^\]]+)\])?'
         r'(?:\[action:([^\]]+)\])?(?:\[reply:([^\]]+)\])?'
         r'(?:\[ref:([^\]]+)\])?\s*'
     )
@@ -145,6 +149,12 @@ class MeshAdapter(BasePlatformAdapter):
         self._target_session: Optional[str] = config.extra.get("target_session")
         if not self._target_session:
             self._target_session = _global_mesh_target_session()
+        # Session map (0.1.8 session-selector): session name -> platform
+        # session key (e.g. "review" -> "telegram:dm:7945905361"). Absent
+        # session in an envelope falls back to target_session (unchanged).
+        self._session_map: dict[str, str] = dict(
+            config.extra.get("session_map") or {}
+        )
         self._agent_name: str = str(
             config.extra.get("agent_name")
             or os.getenv("MESH_AGENT_NAME", "hermes-agent")
@@ -384,7 +394,9 @@ class MeshAdapter(BasePlatformAdapter):
                 )
 
         event, err = self._build_event(
-            payload, sender, recipient, msg_id, action, reply, ref, body_text
+            payload, sender, recipient, msg_id, action, reply, ref, body_text,
+            session=parsed.get("session"),
+            from_session=parsed.get("from_session"),
         )
         if err:
             self._send_receive_dsn(request, text, sender, msg_id, "internal-error")
@@ -568,7 +580,7 @@ class MeshAdapter(BasePlatformAdapter):
         if not m:
             return None, web.json_response({"status": "bad request"}, status=400)
 
-        _version, sender, recipient, msg_id, action, reply, ref = m.groups()
+        _version, sender, recipient, msg_id, session, from_session, action, reply, ref = m.groups()
 
         try:
             sender = _validate_agent_name(sender)
@@ -579,6 +591,16 @@ class MeshAdapter(BasePlatformAdapter):
             recipient = _validate_agent_name(recipient)
         except ValueError as exc:
             logger.warning("[mesh] Invalid envelope recipient: %s", exc)
+            return None, web.json_response({"status": "bad request"}, status=400)
+        # Session tokens (0.1.8 session-selector): validate against the same
+        # envelope-token alphabet; absent = None (default session routing).
+        try:
+            if session:
+                session = validate_envelope_token(session)
+            if from_session:
+                from_session = validate_envelope_token(from_session)
+        except ValueError as exc:
+            logger.warning("[mesh] Invalid envelope session token: %s", exc)
             return None, web.json_response({"status": "bad request"}, status=400)
         # Tolerant receive (mesh-economy): missing action/reply default to
         # the conservative values (info = no work, no = no reply expected).
@@ -616,6 +638,8 @@ class MeshAdapter(BasePlatformAdapter):
             "action": action,
             "reply": reply,
             "ref": ref,
+            "session": session,
+            "from_session": from_session,
             "body_text": body_text,
         }, None
 
@@ -629,6 +653,8 @@ class MeshAdapter(BasePlatformAdapter):
         reply: str,
         ref: Optional[str],
         body_text: str,
+        session: Optional[str] = None,
+        from_session: Optional[str] = None,
     ) -> tuple[Optional["MessageEvent"], Optional["web.Response"]]:
         """Build a MessageEvent with the correct platform source and metadata."""
         cta = ""
@@ -639,8 +665,27 @@ class MeshAdapter(BasePlatformAdapter):
                 cta = f" [Reply via mesh to {sender} — action: {action}, reply: {reply}]"
         display_text = f"⬡ [Mesh from:{sender}] {body_text}{cta}"
 
-        if self._target_session:
-            parts = self._target_session.split(":", 2)
+        # Session-selector routing (0.1.8): a [session:<name>] token overrides
+        # the target_session when the name maps in the local session_map.
+        # Absent session / unmapped name -> target_session (the default,
+        # backward-compatible).
+        effective_target: Optional[str] = self._target_session
+        if session:
+            mapped = self._session_map.get(session)
+            if mapped:
+                effective_target = mapped
+                logger.info(
+                    "[mesh] session_map: [session:%s] -> %s (from %s)",
+                    session, mapped, sender,
+                )
+            else:
+                logger.info(
+                    "[mesh] session_map: [session:%s] not mapped — falling back to target_session",
+                    session,
+                )
+
+        if effective_target:
+            parts = effective_target.split(":", 2)
             target_platform_str = parts[0]
             if len(parts) == 3:
                 target_chat_type = parts[1]
@@ -691,6 +736,8 @@ class MeshAdapter(BasePlatformAdapter):
             "reply": reply,
             "ref": ref,
             "message_id": msg_id,
+            "session": session,
+            "from_session": from_session,
         }
         return event, None
 

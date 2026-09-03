@@ -255,6 +255,14 @@ def register(ctx) -> None:
                         "type": "string",
                         "description": "Optional task ID override (auto-generated if omitted)",
                     },
+                    "session": {
+                        "type": "string",
+                        "description": "Optional target session name (session-selector 0.1.8). Routes to the receiver's mapped platform session; absent = the receiver's default (target_session).",
+                    },
+                    "from_session": {
+                        "type": "string",
+                        "description": "Optional originating session name (session-selector 0.1.8). The reply copies this as its session — use when replying to a message that carried [from_session:...].",
+                    },
                 },
                 "required": ["message", "agent", "action", "reply"],
             },
