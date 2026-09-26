@@ -16,9 +16,15 @@ dependencies = [
 Homepage = "https://github.com/emiltsoi/hermes-mesh"
 Repository = "https://github.com/emiltsoi/hermes-mesh.git"
 
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+# No [build-system] on purpose. Hermes PM treats a plugin as a "virtual" workspace
+# member when no build backend is declared, and renames it to a unique key
+# (hermes-plugin-hermes-mesh-<hash>). A buildable member instead keeps its declared
+# name, so the same plugin enabled in two profiles declares one name twice and hard-
+# fails `uv lock` -- which is exactly what blocked mesh on the second of thirteen
+# wives (2026-09-26). The fleet runs one shared PM environment across 13 profiles, so
+# mesh MUST be virtual to be installable by more than one of them.
+# Dependencies below are still read and installed by PM. Packaging is unaffected:
+# PEP 517 falls back to the default setuptools backend when this table is absent.
 
 [tool.setuptools]
 packages = ["hermes_mesh"]
