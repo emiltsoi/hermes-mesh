@@ -446,3 +446,74 @@ class TestSendWallBudget:
         assert "part 1/2" in caplog.text
         assert "budget exhausted" in caplog.text
         assert "remaining parts not attempted" in caplog.text
+
+
+# INVARIANT: no chunker may silently drop or duplicate a byte — the parts
+# rebuild the input exactly, or as an explicit prefix when truncation was
+# declared. Named as a first-class claim so a search for the round-trip
+# property (reconstruct / unescape / prefix) finds it instead of having to
+# infer it from assertions scattered across the tests above.
+class TestPartsReconstructOriginal:
+    """The round-trip property, asserted once across every case class."""
+
+    @staticmethod
+    def _send(text: str) -> list[dict]:
+        payloads: list[dict] = []
+        with patch("hermes_mesh.float.urllib.request.urlopen", _capture(payloads)):
+            float_module.send(text, config=CFG)
+        return payloads
+
+    def test_parts_reconstruct_the_original_input_exactly(self):
+        # 1. Short / single part: the lone payload is the escaped text and the
+        #    parts rejoin to the input.
+        text = "hello world"
+        payloads = self._send(text)
+        assert len(payloads) == 1
+        assert payloads[0]["text"] == float_module.html.escape(text, quote=False)
+        assert "".join(_content(p["text"]) for p in payloads) == text
+
+        # 2. Exact multiple of the multipart budget (4000 minus the widest
+        #    "[8/8] " marker = 3994) and one char over it.
+        for text in ("a" * (3994 * 2), "a" * (3994 * 2 + 1)):
+            payloads = self._send(text)
+            # No truncation here, so there is no suffix to strip.
+            assert not _SUFFIX_RE.search(payloads[-1]["text"])
+            assert "".join(_content(p["text"]) for p in payloads) == text
+
+        # 3. Escape expansion: raw != escaped. The rejoin is the escaped input,
+        #    and unescaping it recovers the raw input byte-for-byte.
+        for text in ("&" * 801, "&" * 4200):
+            escaped = float_module.html.escape(text, quote=False)
+            payloads = self._send(text)
+            assert not _SUFFIX_RE.search(payloads[-1]["text"])
+            joined = "".join(_content(p["text"]) for p in payloads)
+            assert joined == escaped
+            assert float_module.html.unescape(joined) == text
+
+        # 4. A cut that would land mid-entity: position 3994 falls inside the
+        #    '&amp;' starting at 3992. No part may end on a dangling '&', and
+        #    unescaping the rejoin is byte-identical to the input.
+        text = "a" * 3992 + "&" + "b" * 200
+        payloads = self._send(text)
+        assert not _SUFFIX_RE.search(payloads[-1]["text"])
+        joined = "".join(_content(p["text"]) for p in payloads)
+        assert joined == float_module.html.escape(text, quote=False)
+        assert float_module.html.unescape(joined) == text
+        for p in payloads:
+            assert _entities_closed(p["text"]), p["text"]
+            assert not _content(p["text"]).endswith("&")
+
+        # 5. Over the 8-part ceiling: truncation is declared, so the marker is
+        #    appended *inside* the final part. Strip it only because truncation
+        #    actually happened (and assert the marker is present): stripping it
+        #    unconditionally would also strip content that legitimately ends
+        #    like the marker, making the prefix check vacuous.
+        text = "a" * 80000
+        payloads = self._send(text)
+        assert len(payloads) == float_module._MAX_PARTS
+        marker = re.search(r"\+([\d,]+) chars not floated$", payloads[-1]["text"])
+        assert marker is not None, payloads[-1]["text"]
+        reported = int(marker.group(1).replace(",", ""))
+        prefix = "".join(_content(p["text"], truncated=True) for p in payloads)
+        assert text.startswith(prefix)
+        assert reported == len(text) - len(prefix)
