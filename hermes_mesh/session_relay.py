@@ -826,10 +826,27 @@ def _register_one(
         return {"registered": False, "error": f"Invalid URL: {exc}"}
 
     if not public_key:
-        # Generate a keypair for this agent. The private key is stored locally.
-        public_key, error = auth.get_public_key(name)
-        if error:
-            return {"registered": False, "error": error}
+        # Load the EXISTING local keypair when one exists. Generate only for a
+        # brand-new agent — and NEVER over an existing identity: generating here
+        # would silently rotate the agent's key and break every peer holding the
+        # old one (key-trap guard, kore's catch 2026-10-09).
+        existing = auth.existing_public_key(name)
+        if existing:
+            public_key = existing
+        elif get_raw_agent_identity(name):
+            return {
+                "registered": False,
+                "error": (
+                    f"Agent '{name}' has an existing mesh identity but no local "
+                    "keypair — refusing to generate one (that would silently "
+                    "rotate the agent's key). Carry the keypair first, or pass "
+                    "public_key explicitly."
+                ),
+            }
+        else:
+            public_key, error = auth.get_public_key(name)
+            if error:
+                return {"registered": False, "error": error}
 
     if dry_run:
         return {
@@ -868,7 +885,9 @@ def handle_mesh_register(args: dict | None = None, **kwargs) -> dict:
     Args:
         name: Agent name (defaults to MESH_AGENT_NAME env var).
         url: Hermes webhook URL for this agent.
-        public_key: Optional Ed25519 public key PEM. If omitted, one is generated.
+        public_key: Optional Ed25519 public key PEM. If omitted, the EXISTING
+            local keypair is loaded; a fresh one is generated only for a
+            brand-new agent — never over an existing identity.
         role: Optional role description (default "agent").
         description: Optional human-readable description.
         overwrite: Whether to overwrite an existing identity (default False).

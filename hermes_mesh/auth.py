@@ -89,7 +89,7 @@ def resolve_sender(name: str, extra: dict | None = None) -> Tuple[Optional[str],
 
 
 def get_public_key(name: str, extra: dict | None = None) -> Tuple[Optional[str], Optional[str]]:
-    """Return the public key PEM for `name`.
+    """Return the public key PEM for an agent, if known.
 
     Generates the keypair if missing. This is useful when registering or
     publishing an agent.
@@ -99,3 +99,33 @@ def get_public_key(name: str, extra: dict | None = None) -> Tuple[Optional[str],
         return public_pem, None
     except Exception as exc:
         return None, f"could not load or generate Ed25519 key for '{name}': {exc}"
+
+
+def existing_public_key(name: str, extra: dict | None = None) -> Optional[str]:
+    """Return the public key PEM for an EXISTING local keypair, or None.
+
+    Load-only: NEVER generates. Used by mesh_register so it cannot silently
+    mint a fresh keypair over an existing identity (key-trap guard, kore's
+    catch 2026-10-09) — registering with overwrite plus a missing key file
+    would otherwise rotate the agent's key and break every peer that holds
+    the old one.
+    """
+    try:
+        path = _private_key_path(name, extra)
+        if not path.exists():
+            return None
+        from cryptography.hazmat.primitives import serialization
+
+        private_pem = path.read_text(encoding="utf-8")
+        public_pem = (
+            serialization.load_pem_private_key(private_pem.encode(), password=None)
+            .public_key()
+            .public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            .decode()
+        )
+        return public_pem
+    except Exception:
+        return None
