@@ -648,19 +648,27 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     task_id = task_id or str(uuid.uuid4())
 
-    # ── H3 · busy gate (SPEC §H1–H3) ────────────────────────────────────────────
-    # One open thread per wife. A message from the SAME peer is never refused — it
-    # merges into the open thread with attribution. Notices (reply=no) are exempt
-    # (H9): the board must never go silent because a wife is mid-conversation.
-    # Refused is neither delivered nor lost: nothing has been sent at this point.
+    # ── H3 · busy gate: CLAIM the door before the message leaves the box ────────
+    # One open thread per recipient. Same peer is never refused — it merges into the
+    # open thread with attribution. Notices (reply=no) and terminators (reply=end) are
+    # exempt: a notice must never go silent because a wife is talking, and a terminator
+    # that can be refused means a thread can never stop existing.
+    # Claiming inside one flock closes the check-then-act race: the lock decides who
+    # wins, not the clock. A failed send rolls the claim back.
+    claim_held = False
     if reply not in ("no", "end"):
         try:
             from . import open_threads as _open_threads
 
-            blocker = _open_threads.conflict(agent, from_agent)
-        except Exception:  # noqa: BLE001 — the gate must never break sending
-            blocker = None
-        if blocker:
+            claimed = _open_threads.claim(task_id, from_agent, agent)
+        except Exception as exc:  # noqa: BLE001 — never break sending
+            claimed = {"ok": True, "lease": None}
+            try:
+                _open_threads.gate_error(exc, "relay-gate")
+            except Exception:  # noqa: BLE001
+                pass
+        if not claimed.get("ok"):
+            blocker = claimed.get("blocker") or {}
             holder = (
                 blocker.get("opened_by")
                 if blocker.get("opened_by") != agent
@@ -679,6 +687,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 "reroute": blocker.get("reroute"),
                 "note": "refused is neither delivered nor lost — nothing was sent",
             }
+        claim_held = claimed.get("lease") is not None
     # ────────────────────────────────────────────────────────────────────────────
 
     # Session-selector tokens (0.1.8): validate against the envelope alphabet.
@@ -798,6 +807,13 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             from_agent,
             agent,
         )
+        if claim_held:
+            try:
+                from . import open_threads as _open_threads
+
+                _open_threads.release(task_id)
+            except Exception:  # noqa: BLE001
+                pass
         return {
             "error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts",
             "task_id": task_id,
@@ -821,8 +837,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         elif reply == "yes":
             if ref:
                 _open_threads.touch(ref, resize_to=resize)
-            else:
-                _open_threads.open_thread(delivery_id or task_id, from_agent, agent)
     except Exception:  # noqa: BLE001 — bookkeeping must never break a delivery
         pass
     # ────────────────────────────────────────────────────────────────────────────

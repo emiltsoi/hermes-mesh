@@ -64,6 +64,11 @@ def failopen_count() -> int:
     return _FAILOPEN_COUNT
 
 
+def gate_error(exc: BaseException, where: str = "gate") -> None:
+    """Count a gate-side failure. A gate that fails open silently is a slogan."""
+    _degrade(f"{where} error {exc!r}", _registry_path())
+
+
 def _degrade(reason: str, path: Path) -> None:
     global _FAILOPEN_COUNT
     _FAILOPEN_COUNT += 1
@@ -260,3 +265,49 @@ def release_if_party(thread_id: str, who: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         _degrade(f"release_if_party error {exc!r}", path)
         return False
+
+
+def claim(
+    thread_id: str,
+    opened_by: str,
+    peer: str,
+    lease_minutes: int = DEFAULT_LEASE_MINUTES,
+) -> dict:
+    """Claim the door for ``peer``, or report who holds it — atomically.
+
+    The gate used to be a check followed by a later open: two senders could both pass
+    the check, hold no lock, and both append a lease, leaving one recipient with two
+    live threads. The lock decides who wins here, not the clock. Returns:
+      {"ok": True,  "lease": <record|None>}   claimed (None when the registry degraded)
+      {"ok": False, "blocker": <record>}      refused; render E-BUSY from the blocker
+    """
+    tid = validate_envelope_token(thread_id)
+    by = validate_envelope_token(opened_by)
+    to = validate_envelope_token(peer)
+    minutes = max(1, min(int(lease_minutes), MAX_LEASE_MINUTES))
+    path = _registry_path()
+    now = _now()
+    try:
+        with _core._registry_lock(path):
+            entries = [r for r in _read(path) if _live(r, now)]
+            for rec in entries:
+                parties = {rec.get("opened_by"), rec.get("peer")}
+                if to in parties and by not in parties:
+                    return {"ok": False, "blocker": rec}
+            rec = {
+                "thread_id": tid,
+                "opened_by": by,
+                "peer": to,
+                "opened_at": now,
+                "lease_until": now + minutes * 60,
+                "lease_minutes": minutes,
+                "replies": 0,
+                "resized": False,
+            }
+            entries.append(rec)
+            if not _write(entries, path):
+                return {"ok": True, "lease": None}
+            return {"ok": True, "lease": rec}
+    except Exception as exc:  # noqa: BLE001 — never break sending
+        gate_error(exc, "claim")
+        return {"ok": True, "lease": None}
