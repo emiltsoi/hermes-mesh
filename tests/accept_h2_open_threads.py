@@ -4,7 +4,12 @@ Runs entirely in a temp registry (MESH_OPEN_THREADS), never the live file.
 Time is frozen, never waited: Linda's negative control says prove expiry by
 moving the clock, not by sleeping.
 """
-import os, sys, json, pathlib, tempfile, importlib
+import os
+import sys
+import json
+import pathlib
+import tempfile
+import importlib
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))

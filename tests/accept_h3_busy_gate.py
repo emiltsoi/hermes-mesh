@@ -7,7 +7,10 @@ produced by the SENDER's gateway, before anything leaves the box. Nothing is que
 Not a static grep and not a copy of the logic: the real tool handler, with only the
 webhook transport stubbed.
 """
-import os, sys, tempfile, pathlib
+import os
+import sys
+import tempfile
+import pathlib
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))

@@ -20,7 +20,10 @@ different MOMENTS in a message's life.**
 Same shape, different moment, opposite answers. An exemption is co-extensive with the refusal of
 *that* message at *that* point — not with every refusal that shares a name.
 """
-import sys, os, tempfile, pathlib
+import sys
+import os
+import tempfile
+import pathlib
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))

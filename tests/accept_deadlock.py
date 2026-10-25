@@ -8,7 +8,12 @@ party it has made unreachable is not a gate.
 Rule under test: **an outbound thread never makes its opener busy for inbound.** Only a
 recipient who is the PEER of somebody else's live lease is busy.
 """
-import sys, os, json, time, tempfile, pathlib
+import sys
+import os
+import json
+import time
+import tempfile
+import pathlib
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))
@@ -32,7 +37,8 @@ sr._float.send = lambda **kw: None
 failures = []
 def check(name, cond, detail=""):
     print(f"  {'PASS' if cond else 'FAIL'}  {name}" + ("" if cond else f"  ← {detail}"))
-    if not cond: failures.append(name)
+    if not cond:
+        failures.append(name)
 
 def as_(who):
     """Pretend the sending gateway belongs to `who`."""

@@ -13,7 +13,11 @@ Three things are asserted here, and the third is the one that matters:
   2. a failed delivery retracts the pending close, so the same ref can be retried
   3. a confirmed delivery promotes it to a real close
 """
-import sys, os, tempfile, pathlib, json
+import sys
+import os
+import tempfile
+import pathlib
+import json
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))

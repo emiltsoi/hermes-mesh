@@ -4,7 +4,11 @@ Deliberately holds the claim for a moment (sleep inside the stubbed transport) s
 window between claim and delivery is wide enough for a second process to hit it —
 which is exactly the window a sequential test can never open.
 """
-import os, sys, json, time, pathlib
+import os
+import sys
+import json
+import time
+import pathlib
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))

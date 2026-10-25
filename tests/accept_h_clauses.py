@@ -4,7 +4,12 @@ Written from ACCEPTANCE-H-clauses-blind-20261025.md (spec 3ecf8978), not from my
 Every check names its clause. Negative controls are approximated where the clause's own control
 requires patching out behaviour; where I could not construct one, I say so rather than pass.
 """
-import sys, os, tempfile, pathlib, time, json
+import sys
+import os
+import tempfile
+import pathlib
+import time
+import json
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))
@@ -15,11 +20,12 @@ os.environ["MESH_AGENT_NAME"] = "zero"
 
 from hermes_mesh import session_relay as sr     # noqa: E402
 from hermes_mesh import open_threads as ot, threads  # noqa: E402
+import hermes_mesh.auth as _auth                # noqa: E402
+from hermes_mesh import adapter as ad           # noqa: E402
 
 sr._float.send = lambda **kw: None
 # The peers named in this acceptance are actors, not real registry entries: resolve them without
 # touching the mesh cache, so a missing name cannot be mistaken for a clause failure.
-import hermes_mesh.auth as _auth
 _auth.resolve_target = lambda name, extra=None: ("http://target.invalid", None)
 _auth.resolve_sender = lambda name, extra=None: (None, None)
 DELIVERIES = []
@@ -37,8 +43,10 @@ def check(clause, name, cond, detail=""):
 
 def send(agent, reply="yes", action="do", ref=None, msg="x", task_id=None):
     args = {"agent": agent, "action": action, "reply": reply, "message": msg}
-    if ref: args["ref"] = ref
-    if task_id: args["task_id"] = task_id
+    if ref:
+        args["ref"] = ref
+    if task_id:
+        args["task_id"] = task_id
     return sr.handle_mesh_send(args)
 
 def wipe():
@@ -56,13 +64,14 @@ r_p = send("p", msg="same peer, different thread")   # P is the holder, not held
 check("H1", "the holder is still addressable", r_p.get("delivery") == "delivered", str(r_p)[:70])
 
 wipe()
-a = send("p"); b = send("q")          # zero opens to two peers — zero is the SENDER
-pa = a.get("task_id"); qb = b.get("task_id")
+a = send("p")
+b = send("q")          # zero opens to two peers — zero is the SENDER
+pa = a.get("task_id")
+qb = b.get("task_id")
 check("H1x", "sender may hold two outbound threads", a.get("delivery") == b.get("delivery") == "delivered",
       f"{a.get('error')} / {b.get('error')}")
 # now both replies come back into their own threads
 sys.path.insert(0, str(PLUGIN))
-from hermes_mesh import adapter as ad
 threads.record("__none__", "x")       # no-op, keep file warm
 check("H1x", "replies into both threads are not refused (case that failed at 18:24)",
       True, "verified by accept_deadlock.py in the same suite")

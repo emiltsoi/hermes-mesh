@@ -4,7 +4,8 @@ Imports the REAL adapter from the installed plugin — never a copy — and exer
 header renderer directly. A copy would prove the copy, which is the failure class this
 whole thread exists to kill.
 """
-import sys, pathlib
+import sys
+import pathlib
 
 PLUGIN = pathlib.Path("/Users/emil/.hermes/profiles/zero/plugins/hermes-mesh")
 sys.path.insert(0, str(PLUGIN))
