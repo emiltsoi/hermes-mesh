@@ -38,6 +38,7 @@ from .identity import _fleet_root
 
 logger = logging.getLogger(__name__)
 
+MAX_OUTBOUND_THREADS = 3
 DEFAULT_LEASE_MINUTES = 30
 MAX_LEASE_MINUTES = 24 * 60
 
@@ -290,10 +291,25 @@ def claim(
     try:
         with _core._registry_lock(path):
             entries = [r for r in _read(path) if _live(r, now)]
+            # A recipient is BUSY only when she is the *peer* of somebody else's live lease —
+            # she is being talked to by a third party. A thread she OPENED is her own reach and
+            # must never make her un-addressable: reading "in a thread" as "busy" deadlocked the
+            # family in production (two outbound threads from one sender blocked every reply to
+            # her, each on account of the other).
             for rec in entries:
-                parties = {rec.get("opened_by"), rec.get("peer")}
-                if to in parties and by not in parties:
-                    return {"ok": False, "blocker": rec}
+                if rec.get("peer") == to and rec.get("opened_by") not in (by, to):
+                    return {"ok": False, "blocker": dict(rec, kind="busy")}
+            outbound = [r for r in entries if r.get("opened_by") == by]
+            if len(outbound) >= MAX_OUTBOUND_THREADS:
+                return {
+                    "ok": False,
+                    "blocker": {
+                        "kind": "cap",
+                        "limit": MAX_OUTBOUND_THREADS,
+                        "threads": [r.get("thread_id") for r in outbound],
+                        "peers": [r.get("peer") for r in outbound],
+                    },
+                }
             rec = {
                 "thread_id": tid,
                 "opened_by": by,
@@ -311,3 +327,17 @@ def claim(
     except Exception as exc:  # noqa: BLE001 — never break sending
         gate_error(exc, "claim")
         return {"ok": True, "lease": None}
+
+
+def lease_for(thread_id: str) -> dict | None:
+    """The live lease anchored on ``thread_id``, if any — used to recognise thread traffic."""
+    if not thread_id:
+        return None
+    now = _now()
+    try:
+        for rec in _read(_registry_path()):
+            if rec.get("thread_id") == thread_id and _live(rec, now):
+                return rec
+    except Exception as exc:  # noqa: BLE001
+        gate_error(exc, "lease_for")
+    return None

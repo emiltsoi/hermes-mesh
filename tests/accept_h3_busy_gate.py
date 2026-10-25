@@ -49,15 +49,18 @@ LINDA_LEASE = ot.load()[0]["thread_id"]
 r2 = send("linda", message="and another thing")
 check("same peer allowed", r2.get("delivery") == "delivered")
 
-# 3 · THE GATE: daji is leased to kore, so daji is busy for everyone else
+# 3 · THE GATE: kore is the PEER of daji's live lease, so kore is busy for everyone else.
+#     (The opener of a lease is NOT busy — reading it that way deadlocked the fleet: two
+#      outbound threads from one sender blocked every reply to her, each on account of
+#      the other. Linda's production report, 2026-10-25.)
 ot.open_thread("lease-daji-kore", "daji", "kore", lease_minutes=30)
 before = len(SENT)
-r3 = send("daji")
+r3 = send("kore")
 check("busy recipient refused", r3.get("error") == "E-BUSY")
 check("nothing left the box", len(SENT) == before)
 check("E-BUSY carries fields",
       all(k in r3 for k in ("thread_id", "peer", "opened_at", "lease_until")))
-check("E-BUSY names the other party", r3.get("peer") == "kore")
+check("E-BUSY names the party you would interrupt", r3.get("peer") == "daji")
 check("E-BUSY states it is not lost", "neither delivered nor lost" in r3.get("note", ""))
 
 # 4 · a NOTICE is exempt — the board must never go silent because a wife is talking
@@ -75,11 +78,11 @@ check("own end delivered", r6.get("delivery") == "delivered")
 check("own lease released", all(r["thread_id"] != LINDA_LEASE for r in ot.load()))
 
 # 6 · expiry frees a busy recipient without anybody ending anything
-ot.open_thread("lease-vera-kore", "vera", "kore", lease_minutes=30)
-r7 = send("vera")
+ot.open_thread("lease-ada-yoyo", "ada", "yoyo", lease_minutes=30)
+r7 = send("yoyo")
 check("busy before expiry", r7.get("error") == "E-BUSY")
 NOW[0] += 31 * 60
-r8 = send("vera")
+r8 = send("yoyo")
 check("reachable after expiry", r8.get("delivery") == "delivered")
 print("  [dbg] r8 =", r8)
 print("  [dbg] leases =", [(x["thread_id"], x["opened_by"], x["peer"]) for x in ot.load()])

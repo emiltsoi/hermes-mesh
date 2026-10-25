@@ -682,7 +682,15 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         try:
             from . import open_threads as _open_threads
 
-            claimed = _open_threads.claim(task_id, from_agent, agent)
+            _lease = _open_threads.lease_for(ref) if ref else None
+            _thread_traffic = bool(
+                _lease and {_lease.get("opened_by"), _lease.get("peer")} == {from_agent, agent}
+            )
+            claimed = (
+                {"ok": True, "lease": _lease}
+                if _thread_traffic
+                else _open_threads.claim(task_id, from_agent, agent)
+            )
         except Exception as exc:  # noqa: BLE001 — never break sending
             claimed = {"ok": True, "lease": None}
             try:
@@ -692,22 +700,35 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         if not claimed.get("ok"):
             blocker = claimed.get("blocker") or {}
             _meter(action, reply, agent, blocker.get("thread_id"), "refused")
-            holder = (
-                blocker.get("opened_by")
-                if blocker.get("opened_by") != agent
-                else blocker.get("peer")
-            )
+            kind = blocker.get("kind")
+            if kind == "cap":
+                return {
+                    "error": "E-BUSY",
+                    "reason": "too-many-open",
+                    "message": (
+                        f"you already hold {blocker.get('limit')} open outbound threads "
+                        f"({', '.join(str(p) for p in blocker.get('peers') or [])}); "
+                        f"close one with reply:end"
+                    ),
+                    "threads": blocker.get("threads"),
+                    "peers": blocker.get("peers"),
+                    "reroute": "reply:no notice — notices are exempt",
+                    "note": "refused is neither delivered nor lost — nothing was sent",
+                }
+            holder = blocker.get("opened_by")
             return {
                 "error": "E-BUSY",
+                "reason": "recipient-busy",
                 "message": (
-                    f"'{agent}' has an open thread with '{holder}'; it ends on reply:end "
-                    f"or when its lease expires"
+                    f"'{agent}' is in an open thread with '{holder}' (not you); it ends on "
+                    f"reply:end or when its lease expires"
                 ),
                 "thread_id": blocker.get("thread_id"),
                 "peer": holder,
                 "opened_at": blocker.get("opened_at"),
                 "lease_until": blocker.get("lease_until"),
-                "reroute": blocker.get("reroute"),
+                # never a dead end: the notice path is exempt and always arrives
+                "reroute": "reply:no notice — notices are exempt",
                 "note": "refused is neither delivered nor lost — nothing was sent",
             }
         claim_held = claimed.get("lease") is not None
