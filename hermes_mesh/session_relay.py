@@ -546,6 +546,16 @@ def _send_delivery_error(
 _METER = "[mesh] send"
 
 
+def _reroute_time(lease_until) -> str:
+    """Human-readable lease expiry for a refusal address; never raises."""
+    try:
+        import datetime as _dt
+
+        return _dt.datetime.fromtimestamp(float(lease_until)).strftime("%H:%M:%S")
+    except Exception:  # noqa: BLE001 — an address is a courtesy, not a dependency
+        return "lease expiry"
+
+
 def _meter(action: str, reply: str, peer: str, thread_id: str | None, outcome: str) -> None:
     try:
         logger.info(
@@ -712,7 +722,11 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                     ),
                     "threads": blocker.get("threads"),
                     "peers": blocker.get("peers"),
-                    "reroute": "reply:no notice — notices are exempt",
+                    # too-many-open is your own doing: close one of YOUR threads and resend.
+                    "reroute": (
+                        "close one with reply:end, or send as a reply:no notice "
+                        "(notices are exempt)"
+                    ),
                     "note": "refused is neither delivered nor lost — nothing was sent",
                 }
             holder = blocker.get("opened_by")
@@ -727,8 +741,12 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 "peer": holder,
                 "opened_at": blocker.get("opened_at"),
                 "lease_until": blocker.get("lease_until"),
-                # never a dead end: the notice path is exempt and always arrives
-                "reroute": "reply:no notice — notices are exempt",
+                # never a dead end, and specific to THIS cause: the holder's lease expires,
+                # so the address is a time, not a gesture.
+                "reroute": (
+                    f"send as a reply:no notice (exempt), or retry after the lease ends at "
+                    f"{_reroute_time(blocker.get('lease_until'))}"
+                ),
                 "note": "refused is neither delivered nor lost — nothing was sent",
             }
         claim_held = claimed.get("lease") is not None
