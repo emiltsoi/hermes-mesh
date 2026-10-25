@@ -77,7 +77,7 @@ platforms:
       host: 127.0.0.1        # ⚠️ Loopback for single-host fleets. 0.0.0.0 exposes mesh on all interfaces — only if agents are on separate hosts AND you have firewall protection.
       port: 8744
       route: receive          # listens on /mesh/receive
-      agent_name: agent0      # local agent name
+      agent_name: zero      # local agent name
       # Authentication sentinel. Any non-empty value enables Ed25519 verification;
       # "INSECURE_NO_AUTH" disables it (loopback-only).
       secret: true
@@ -462,9 +462,9 @@ PYTHONPATH=/path/to/hermes-mesh:/path/to/hermes-agent pytest tests/test_mesh.py 
 For example, with a default install:
 
 ```bash
-PYTHONPATH=/home/emil/CascadeProjects/hermes-mesh:\
-/home/emil/.hermes/hermes-agent:\
-/home/emil/CascadeProjects/mesh-peer-registry \
+PYTHONPATH=/Users/emil/CascadeProjects/hermes-mesh:\
+/Users/emil/.hermes/hermes-agent:\
+/Users/emil/CascadeProjects/mesh-peer-registry \
   pytest tests/test_mesh.py -q
 ```
 

@@ -643,6 +643,35 @@ class MeshAdapter(BasePlatformAdapter):
             "body_text": body_text,
         }, None
 
+    @staticmethod
+    def _format_display_text(
+        sender: str,
+        body_text: str,
+        action: str,
+        reply: str,
+        msg_ids: list,
+        ref: Optional[str] = None,
+    ) -> str:
+        """Render the inbound header the wife actually sees.
+
+        The thread id is surfaced here on purpose: a wife can only name the thread she is
+        answering if she was shown its id. With merged deliveries this carries N ids, one per
+        message, and the wife names which thread she answers — the transport never guesses.
+        """
+        cta = ""
+        if action and reply:
+            if reply == "end":
+                cta = " (thread closed by sender — no reply owed; new message = new thread)"
+            else:
+                ref_hint = msg_ids[0] if len(msg_ids) == 1 else "<one of the ids above>"
+                cta = (
+                    f" [Reply via mesh to {sender} — action: {action}, reply: {reply},"
+                    f" ref: {ref_hint}]"
+                )
+        thread_tags = "".join(f" [thread:{i}]" for i in msg_ids if i)
+        reply_to_tag = f" [re:{ref}]" if ref else ""
+        return f"⬡ [Mesh from:{sender}]{thread_tags}{reply_to_tag} {body_text}{cta}"
+
     def _build_event(
         self,
         payload: dict,
@@ -657,13 +686,9 @@ class MeshAdapter(BasePlatformAdapter):
         from_session: Optional[str] = None,
     ) -> tuple[Optional["MessageEvent"], Optional["web.Response"]]:
         """Build a MessageEvent with the correct platform source and metadata."""
-        cta = ""
-        if action and reply:
-            if reply == "end":
-                cta = " (thread closed by sender — no reply owed; new message = new thread)"
-            else:
-                cta = f" [Reply via mesh to {sender} — action: {action}, reply: {reply}]"
-        display_text = f"⬡ [Mesh from:{sender}] {body_text}{cta}"
+        display_text = self._format_display_text(
+            sender, body_text, action, reply, [msg_id] if msg_id else [], ref
+        )
 
         # Session-selector routing (0.1.8): a [session:<name>] token overrides
         # the target_session when the name maps in the local session_map.
