@@ -75,6 +75,18 @@ leases = [r for r in ot.load() if r.get("opened_by") == "zero" and r.get("peer")
 check("H1", "a second message to the same peer delivers", m2.get("delivery") == "delivered", str(m2)[:70])
 check("H1", "…and does NOT mint a second lease", len(leases) == 1, f"{len(leases)} leases for one pair")
 
+# ── H1 · a reply between two parties who already share a lease is never refused for a third party
+wipe()
+first = send("p", msg="zero->p opens")
+ot.open_thread("third-party-holds-zero", "q", "zero", lease_minutes=30)   # zero is q's peer
+again = send("p", msg="p answers a third party's hold — ref-less on purpose")
+check("H1", "a shared pair talks through a third party's lease", again.get("delivery") == "delivered",
+      str(again)[:90])
+# r is held by q's thread; zero shares no lease with r → the cap still bites
+ot.open_thread("third-party-holds-r", "q", "r", lease_minutes=30)
+fresh = send("r", reply="yes", msg="zero has no lease with r")
+check("H1", "a target with no shared lease is still refused", fresh.get("error") == "E-BUSY", str(fresh)[:70])
+
 # ── H3(b) release on failure ──────────────────────────────────────────────────
 wipe()
 sr._deliver_webhook = lambda *a_, **kw: (None, "door said no")

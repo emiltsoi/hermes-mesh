@@ -296,6 +296,15 @@ def claim(
             # must never make her un-addressable: reading "in a thread" as "busy" deadlocked the
             # family in production (two outbound threads from one sender blocked every reply to
             # her, each on account of the other).
+            # THREAD TRAFFIC, keyed on the PAIR rather than on the optional `ref` envelope field.
+            # Britney's simulation: britney->zero carried no ref, so lease_for(ref) was None and the
+            # busy check refused her on account of Linda's lease — even though britney and zero
+            # already shared a live thread. A message between two parties who already hold a live
+            # lease makes no new claim on the door; it continues a conversation that exists. The
+            # registry is the truth here, not whether the sender happened to attach a ref.
+            for rec in entries:
+                if {rec.get("opened_by"), rec.get("peer")} == {by, to}:
+                    return {"ok": True, "lease": rec, "thread_traffic": True}
             for rec in entries:
                 if rec.get("peer") == to and rec.get("opened_by") not in (by, to):
                     return {"ok": False, "blocker": dict(rec, kind="busy")}
