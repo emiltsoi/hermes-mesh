@@ -360,7 +360,14 @@ class MeshAdapter(BasePlatformAdapter):
 
         # FR-4: reject inbound replies referencing a closed thread (backstop for
         # non-hermes-mesh peers that lack the outbound guard).
-        if ref is not None and not is_dsn and _threads.is_closed(ref):
+        #
+        # …but a TERMINATOR must never be refused. The sender writes its close to the shared
+        # registry the moment it sends reply:end, so its own terminating message then arrives
+        # referencing a thread that is already closed — and the backstop ate it. Linda's reply
+        # was refused six times this way at 18:39 and reached me as a DSN instead of an answer:
+        # a thread that cannot be closed over the wire can only be closed by expiry.
+        is_terminator = parsed.get("reply") == "end"
+        if ref is not None and not is_dsn and not is_terminator and _threads.is_closed(ref):
             logger.warning(
                 "[mesh] Rejected reply to closed thread %s from %s", ref, sender
             )

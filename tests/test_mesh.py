@@ -595,6 +595,42 @@ class TestAdapterHandleMesh:
     def _run(coro):
         return asyncio.run(coro)
 
+    def test_terminator_reaches_a_thread_it_closes(self):
+        """Linda, 18:39 — reply:end refused by the door it was closing, six times over.
+
+        The sender writes its close to the shared registry as it sends, so the terminating
+        message arrives referencing an already-closed thread. The backstop must not eat it.
+        """
+        from hermes_mesh import threads as _threads
+
+        adapter = self._make_adapter()
+        closed_id = "lin-closed-939"
+        _threads.record(closed_id, "linda")
+        assert _threads.is_closed(closed_id)
+
+        text = self._envelope(sender="linda", msg_id="lin-term-1", reply="end", ref=closed_id)
+        req = self._make_request(
+            {"from": "linda", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status != 400, f"a terminator was refused: {resp.status}"
+
+    def test_ordinary_reply_to_closed_thread_is_still_refused(self):
+        """The backstop still works: a normal reply to a closed thread is rejected."""
+        from hermes_mesh import threads as _threads
+
+        adapter = self._make_adapter()
+        closed_id = "lin-closed-940"
+        _threads.record(closed_id, "linda")
+        text = self._envelope(sender="linda", msg_id="lin-late-1", reply="yes", ref=closed_id)
+        req = self._make_request(
+            {"from": "linda", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = self._run(adapter._handle_mesh(req))
+        assert resp.status == 400
+
     def test_lowercase_agent_name(self):
         adapter = self._make_adapter(agent_name="ADA")
         assert adapter._agent_name == "ada"
