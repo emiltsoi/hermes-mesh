@@ -648,6 +648,39 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     task_id = task_id or str(uuid.uuid4())
 
+    # ── H3 · busy gate (SPEC §H1–H3) ────────────────────────────────────────────
+    # One open thread per wife. A message from the SAME peer is never refused — it
+    # merges into the open thread with attribution. Notices (reply=no) are exempt
+    # (H9): the board must never go silent because a wife is mid-conversation.
+    # Refused is neither delivered nor lost: nothing has been sent at this point.
+    if reply not in ("no", "end"):
+        try:
+            from . import open_threads as _open_threads
+
+            blocker = _open_threads.conflict(agent, from_agent)
+        except Exception:  # noqa: BLE001 — the gate must never break sending
+            blocker = None
+        if blocker:
+            holder = (
+                blocker.get("opened_by")
+                if blocker.get("opened_by") != agent
+                else blocker.get("peer")
+            )
+            return {
+                "error": "E-BUSY",
+                "message": (
+                    f"'{agent}' has an open thread with '{holder}'; it ends on reply:end "
+                    f"or when its lease expires"
+                ),
+                "thread_id": blocker.get("thread_id"),
+                "peer": holder,
+                "opened_at": blocker.get("opened_at"),
+                "lease_until": blocker.get("lease_until"),
+                "reroute": blocker.get("reroute"),
+                "note": "refused is neither delivered nor lost — nothing was sent",
+            }
+    # ────────────────────────────────────────────────────────────────────────────
+
     # Session-selector tokens (0.1.8): validate against the envelope alphabet.
     if session is not None and session != "":
         try:
@@ -772,6 +805,27 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
 
     # Part 2: Telegram float (best-effort, non-blocking)
     _float.send(text=padded_message, sender_name=from_agent)
+
+    # ── H2/H4 · lease bookkeeping, only after a real delivery ───────────────────
+    # A notice (reply=no) opens nothing. A reply touches the lease it answers and
+    # resizes it once. An explicit end releases it. Failures here never affect a
+    # delivery that already happened.
+    try:
+        from . import open_threads as _open_threads
+
+        resize = int(os.getenv("MESH_LEASE_RESIZE_MINUTES", "120"))
+        if reply == "end":
+            for tid in {ref, delivery_id, task_id}:
+                if tid:
+                    _open_threads.release_if_party(tid, from_agent)
+        elif reply == "yes":
+            if ref:
+                _open_threads.touch(ref, resize_to=resize)
+            else:
+                _open_threads.open_thread(delivery_id or task_id, from_agent, agent)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a delivery
+        pass
+    # ────────────────────────────────────────────────────────────────────────────
 
     return {
         "task_id": task_id,
