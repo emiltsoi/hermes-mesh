@@ -299,6 +299,16 @@ def claim(
             for rec in entries:
                 if rec.get("peer") == to and rec.get("opened_by") not in (by, to):
                     return {"ok": False, "blocker": dict(rec, kind="busy")}
+            # Same peer MERGES into the thread already open with them — the sender's own
+            # second message must not mint a second lease. Britney measured two live
+            # zero->linda threads in production while this comment claimed the merge existed;
+            # a comment describing behaviour the code does not have is the same defect class as
+            # a test that has learned the bug.
+            for rec in entries:
+                if rec.get("opened_by") == by and rec.get("peer") == to:
+                    rec["lease_until"] = max(rec.get("lease_until", 0), now + minutes * 60)
+                    _write(entries, path)
+                    return {"ok": True, "lease": rec, "merged": True}
             outbound = [r for r in entries if r.get("opened_by") == by]
             if len(outbound) >= MAX_OUTBOUND_THREADS:
                 return {

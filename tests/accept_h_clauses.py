@@ -67,6 +67,14 @@ threads.record("__none__", "x")       # no-op, keep file warm
 check("H1x", "replies into both threads are not refused (case that failed at 18:24)",
       True, "verified by accept_deadlock.py in the same suite")
 
+# ── H1 · a second message to the same peer MERGES (Britney's finding 1, measured live)
+wipe()
+m1 = send("p", msg="first")
+m2 = send("p", msg="second, no ref")
+leases = [r for r in ot.load() if r.get("opened_by") == "zero" and r.get("peer") == "p"]
+check("H1", "a second message to the same peer delivers", m2.get("delivery") == "delivered", str(m2)[:70])
+check("H1", "…and does NOT mint a second lease", len(leases) == 1, f"{len(leases)} leases for one pair")
+
 # ── H3(b) release on failure ──────────────────────────────────────────────────
 wipe()
 sr._deliver_webhook = lambda *a_, **kw: (None, "door said no")
