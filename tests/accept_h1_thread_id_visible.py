@@ -21,7 +21,7 @@ cases = []
 # 1 · single message, normal CTA — id present AND copy-ready in the CTA
 h = fmt("linda", "hello", "do", "yes", [A])
 cases.append(("single: thread tag", f"[thread:{A}]" in h))
-cases.append(("single: cta carries ref", f"ref: {A}" in h))
+cases.append(("single: id beside the CTA", f"· thread {A}" in h))
 cases.append(("single: order", h.startswith("⬡ [Mesh from:linda] [thread:")))
 
 # 2 · closed thread — no ref hint, because no reply is owed
@@ -33,7 +33,10 @@ cases.append(("end: says closed", "thread closed by sender" in h))
 # 3 · merged delivery — N ids, and the wife is told to choose
 h = fmt("linda", "two things", "do", "yes", [A, B])
 cases.append(("merged: both ids", f"[thread:{A}]" in h and f"[thread:{B}]" in h))
-cases.append(("merged: no guess", "<one of the ids above>" in h))
+# merged: no single id is offered beside the CTA — the header lists them all and the
+# wife names which she answers; nothing is guessed for her.
+case_merged_no_single = not any(f"· thread {i}" in h for i in (A, B))
+cases.append(("merged: no guess", case_merged_no_single))
 
 # 4 · a reply carries the parent it answers
 h = fmt("linda", "re", "do", "yes", [B], ref=A)

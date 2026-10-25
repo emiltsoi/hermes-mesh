@@ -534,6 +534,28 @@ def _send_delivery_error(
 # handle_mesh_send
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# The send meter — one structured line per attempt.
+#
+# Why: "mesh_send completed (0.93s)" records timing only. The payload is never logged,
+# so the number of messages that EXPECTED an answer has never been measurable, and any
+# fraction quoted about reply:yes traffic is an impression wearing a statistic's clothing.
+# One line, four fields, and the gate's coverage becomes a grep across every seat.
+# ---------------------------------------------------------------------------
+_METER = "[mesh] send"
+
+
+def _meter(action: str, reply: str, peer: str, thread_id: str | None, outcome: str) -> None:
+    try:
+        logger.info(
+            "%s agent=%s action=%s reply=%s thread=%s outcome=%s",
+            _METER, peer, action, reply, (thread_id or "-"), outcome,
+        )
+    except Exception:  # noqa: BLE001 — a meter must never break a send
+        pass
+
+
 def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     """Send a session-aware message to a Hermes mesh peer.
 
@@ -669,6 +691,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 pass
         if not claimed.get("ok"):
             blocker = claimed.get("blocker") or {}
+            _meter(action, reply, agent, blocker.get("thread_id"), "refused")
             holder = (
                 blocker.get("opened_by")
                 if blocker.get("opened_by") != agent
@@ -807,6 +830,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             from_agent,
             agent,
         )
+        _meter(action, reply, agent, task_id, "failed")
         if claim_held:
             try:
                 from . import open_threads as _open_threads
@@ -841,6 +865,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         pass
     # ────────────────────────────────────────────────────────────────────────────
 
+    _meter(action, reply, agent, delivery_id or task_id, "delivered")
     return {
         "task_id": task_id,
         "state": "completed",

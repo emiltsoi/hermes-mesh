@@ -663,11 +663,12 @@ class MeshAdapter(BasePlatformAdapter):
             if reply == "end":
                 cta = " (thread closed by sender — no reply owed; new message = new thread)"
             else:
-                ref_hint = msg_ids[0] if len(msg_ids) == 1 else "<one of the ids above>"
-                cta = (
-                    f" [Reply via mesh to {sender} — action: {action}, reply: {reply},"
-                    f" ref: {ref_hint}]"
-                )
+                cta = f" [Reply via mesh to {sender} — action: {action}, reply: {reply}]"
+                # The id is copy-ready NEXT TO the CTA, never inside it: three upstream tests
+                # guard the bracket byte-for-byte and they are right to — anything matching
+                # the CTA exactly must keep working.
+                if len(msg_ids) == 1 and msg_ids[0]:
+                    cta += f" · thread {msg_ids[0]}"
         thread_tags = "".join(f" [thread:{i}]" for i in msg_ids if i)
         reply_to_tag = f" [re:{ref}]" if ref else ""
         return f"⬡ [Mesh from:{sender}]{thread_tags}{reply_to_tag} {body_text}{cta}"
