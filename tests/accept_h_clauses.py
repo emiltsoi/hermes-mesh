@@ -77,9 +77,13 @@ check("H1", "…and does NOT mint a second lease", len(leases) == 1, f"{len(leas
 
 # ── H1 · a reply between two parties who already share a lease is never refused for a third party
 wipe()
-first = send("p", msg="zero->p opens")
-ot.open_thread("third-party-holds-zero", "q", "zero", lease_minutes=30)   # zero is q's peer
-again = send("p", msg="p answers a third party's hold — ref-less on purpose")
+# Britney's exact simulation: two parties already share a lease; a third party holds the target;
+# the answer carries no ref. The registry is the truth, not the envelope field.
+send("p", msg="zero->p opens")                                            # pair (zero,p) shares
+ot.open_thread("third-party-holds-zero", "q", "zero", lease_minutes=30)     # zero held by q
+os.environ["MESH_AGENT_NAME"] = "p"                                        # now send AS p
+again = send("zero", msg="p answers ref-less into a held target")
+os.environ["MESH_AGENT_NAME"] = "zero"
 check("H1", "a shared pair talks through a third party's lease", again.get("delivery") == "delivered",
       str(again)[:90])
 # r is held by q's thread; zero shares no lease with r → the cap still bites
