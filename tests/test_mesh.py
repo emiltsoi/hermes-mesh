@@ -1401,7 +1401,7 @@ class TestF5_ResolveBeforeRecord:
             order.append("resolve")
             return (sender_private, None)
 
-        def _record(anchor, closed_by):
+        def _record(anchor, closed_by, **kwargs):
             order.append("record")
 
         with patch.dict(os.environ, {"MESH_AGENT_NAME": "sender"}), \
@@ -1415,7 +1415,10 @@ class TestF5_ResolveBeforeRecord:
                 "reply": "end", "task_id": "f5-ok",
             })
         assert result.get("status") == "delivered"
-        mock_record.assert_called_once_with("f5-ok", closed_by="sender")
+        # The anchor is written PENDING: it still closes the in-flight window before delivery
+        # (this test's whole point — resolve first, then record, then deliver), but it no longer
+        # claims a delivery that has not happened. Promoted on success, withdrawn on failure.
+        mock_record.assert_called_once_with("f5-ok", closed_by="sender", pending=True)
         assert order.index("resolve") < order.index("record")
 
 

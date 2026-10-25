@@ -801,7 +801,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     # failure must never kill the terminal message delivery (AC-2.3).
     if reply == "end":
         try:
-            threads.record(task_id, closed_by=from_agent)
+            threads.record(task_id, closed_by=from_agent, pending=True)
         except (OSError, ValueError) as exc:
             logger.warning(
                 "[mesh] failed to record terminal anchor %s (closed_by=%s): %s",
@@ -852,6 +852,8 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             agent,
         )
         _meter(action, reply, agent, task_id, "failed")
+        if reply == "end":
+            threads.withdraw(task_id)
         if claim_held:
             try:
                 from . import open_threads as _open_threads
@@ -886,6 +888,8 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         pass
     # ────────────────────────────────────────────────────────────────────────────
 
+    if reply == "end":
+        threads.promote(task_id)
     _meter(action, reply, agent, delivery_id or task_id, "delivered")
     return {
         "task_id": task_id,

@@ -163,7 +163,7 @@ def load() -> list[dict]:
     return entries
 
 
-def record(anchor_task_id: str, closed_by: str) -> None:
+def record(anchor_task_id: str, closed_by: str, pending: bool = False) -> None:
     """Persist a closed-thread anchor (append-only, idempotent).
 
     Both fields are validated with the shared envelope-token validator so no
@@ -188,12 +188,64 @@ def record(anchor_task_id: str, closed_by: str) -> None:
             if entry.get("anchor_task_id") == anchor:
                 _hydrate(entries, path)
                 return
-        entries.append(
-            {"anchor_task_id": anchor, "closed_at": time.time(), "closed_by": by}
-        )
+        entry = {"anchor_task_id": anchor, "closed_at": time.time(), "closed_by": by}
+        if pending:
+            # PENDING closes the in-flight window without claiming a delivery that has not
+            # happened. It is promoted on confirmed delivery and withdrawn on failure — a
+            # terminal signal that closes a thread its recipient never saw is the one message
+            # shape that must not be fire-and-forget (Linda, 18:39).
+            entry["pending"] = True
+        entries.append(entry)
         _write_entries(entries, path)
         _hydrate(entries, path)
-    logger.info("[mesh] thread closed by terminal message %s (closed_by=%s)", anchor, by)
+    logger.info(
+        "[mesh] thread %s by terminal message %s (closed_by=%s)",
+        "pending" if pending else "closed", anchor, by,
+    )
+
+
+def _rewrite(anchor_task_id: str, drop_pending_only: bool, promote: bool) -> None:
+    anchor = validate_envelope_token(anchor_task_id)
+    path = _registry_path()
+    with _registry_lock(path):
+        entries, failed = _core._read_entries_strict(path)
+        if failed:
+            return
+        changed = False
+        kept = []
+        for entry in entries:
+            if entry.get("anchor_task_id") != anchor:
+                kept.append(entry)
+                continue
+            if drop_pending_only:
+                if entry.get("pending"):
+                    changed = True
+                    continue  # withdraw: this close never earned its place
+            elif promote:
+                if entry.get("pending"):
+                    entry.pop("pending", None)
+                    changed = True
+            kept.append(entry)
+        if not changed:
+            return
+        _write_entries(kept, path)
+        _hydrate(kept, path)
+
+
+def promote(anchor_task_id: str) -> None:
+    """Delivery confirmed — the pending terminal anchor becomes a real close."""
+    try:
+        _rewrite(anchor_task_id, drop_pending_only=False, promote=True)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never kill a delivery
+        logger.warning("[mesh] failed to promote terminal anchor %s: %s", anchor_task_id, exc)
+
+
+def withdraw(anchor_task_id: str) -> None:
+    """Delivery failed — retract the pending close so the thread stays retryable."""
+    try:
+        _rewrite(anchor_task_id, drop_pending_only=True, promote=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[mesh] failed to withdraw terminal anchor %s: %s", anchor_task_id, exc)
 
 
 def is_closed(anchor_task_id: str | None) -> bool:
