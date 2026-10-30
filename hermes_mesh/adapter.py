@@ -154,6 +154,18 @@ def _core_binds_platform_itself() -> bool:
 _CORE_BINDS_PLATFORM = _core_binds_platform_itself()
 
 
+def _core_binds_routed_platform() -> bool:
+    """True only on a core carrying the routed-platform binding."""
+    try:
+        from gateway.session_ingress_context import ROUTED_PLATFORM_BINDING
+        return ROUTED_PLATFORM_BINDING is True
+    except Exception:
+        return False
+
+
+_ROUTED_BINDING = _core_binds_routed_platform()
+
+
 class MeshAdapter(BasePlatformAdapter):
     """Receive Ed25519-signed Mesh messages into a configured platform session."""
 
@@ -165,6 +177,15 @@ class MeshAdapter(BasePlatformAdapter):
     # this adapter enforces its own access policy so env allowlists do not
     # double-deny authenticated mesh senders.
     enforces_own_access_policy: bool = True
+
+    # Routed-platform declaration (fleet carry): this adapter may hand in events
+    # stamped as the listed platforms; a core without ROUTED_PLATFORM_BINDING
+    # refuses the stamp with the same not_found an undeclared stamp gets, so the
+    # declaration is inert where the binding does not exist. ``Platform(...)``
+    # call form — the member is identical to ``Platform.TELEGRAM`` on a real
+    # core, and only the call form resolves on the stub Platform used by this
+    # plugin's own test harness (it declares no telegram member).
+    delivers_as_platforms = frozenset({Platform("telegram")})
 
     @property
     def authorization_is_upstream(self) -> bool:
@@ -788,11 +809,12 @@ class MeshAdapter(BasePlatformAdapter):
                 user_id_alt=user_id_alt,
                 user_name=sender,
             )
-            # Old core: stamp the routed platform so the turn joins that platform's session.
-            # New core: provenance and authorization resolve by the adapter's own platform, so a
-            # stamp here would be admitted and then denied — the turn must stay mesh-keyed, with the
+            # Old core, or new core carrying the routed-platform binding: stamp the routed
+            # platform so the turn joins that platform's session. New core without the carry:
+            # provenance and authorization resolve by the adapter's own platform, so a stamp
+            # here would be admitted and then denied — the turn must stay mesh-keyed, with the
             # target chat id riding on chat_id/chat_type.
-            if not _CORE_BINDS_PLATFORM:
+            if not _CORE_BINDS_PLATFORM or _ROUTED_BINDING:
                 source_kwargs["_platform"] = Platform(target_platform_str)
             source = self.build_source(**source_kwargs)
         else:
