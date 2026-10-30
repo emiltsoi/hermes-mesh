@@ -123,6 +123,37 @@ def _global_mesh_target_session() -> Optional[str]:
         return None
 
 
+def _core_binds_platform_itself() -> bool:
+    """True on the 2026-10+ core, which owns platform provenance end to end.
+
+    Two upstream rules arrived together on that core:
+
+      * native events carry no metadata at all — ``gateway/session_envelope._native_metadata``
+        returns None (→ ``invalid_params / metadata``) for anything non-whatsapp;
+      * an event's source platform must be the adapter's OWN platform — ``_owning_profile`` +
+        ``_transport_owner`` resolve provenance by platform, and a plugin platform has no
+        ``{PLATFORM}_ALLOWED_USERS``, so a routed platform stamp is admitted only to be denied
+        ``permission_denied / user_not_authorized``.
+
+    On that core this plugin emits no metadata and never stamps a routed platform; the target chat
+    id still rides on chat_id/chat_type, so the turn lands in a mesh-keyed session. On the older
+    core both behaviours are preserved exactly as they were.
+
+    NOTE: the presence of `_platform` on ``build_source`` is NOT a usable discriminator — that
+    keyword is added by this fleet's own carry (ce03089252), not by upstream, so it exists on the
+    carried build of either generation.
+    """
+    try:
+        from gateway.session_envelope import _native_metadata  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+_CORE_BINDS_PLATFORM = _core_binds_platform_itself()
+
+
 class MeshAdapter(BasePlatformAdapter):
     """Receive Ed25519-signed Mesh messages into a configured platform session."""
 
@@ -134,6 +165,18 @@ class MeshAdapter(BasePlatformAdapter):
     # this adapter enforces its own access policy so env allowlists do not
     # double-deny authenticated mesh senders.
     enforces_own_access_policy: bool = True
+
+    @property
+    def authorization_is_upstream(self) -> bool:
+        """Mesh owns the authorization decision for its own turns.
+
+        From 2026-10 (upstream #139199) a native event either carries a relay seal or is checked
+        against the platform allowlist. A plugin platform has no ``MESH_ALLOWED_USERS``, so without
+        this declaration every mesh turn is refused ``permission_denied / user_not_authorized``.
+        The declaration is honest: the Ed25519 signature verified against a vault-registered public
+        key at intake IS the authorization. Older cores do not know the attribute and ignore it.
+        """
+        return True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("mesh"))
@@ -737,15 +780,21 @@ class MeshAdapter(BasePlatformAdapter):
                 user_id = f"mesh:{sender}"
                 user_id_alt = None
 
-            source = self.build_source(
+            source_kwargs: Dict[str, Any] = dict(
                 chat_id=target_chat_id,
                 chat_name=f"mesh/{sender}",
                 chat_type=target_chat_type,
                 user_id=user_id,
                 user_id_alt=user_id_alt,
                 user_name=sender,
-                _platform=Platform(target_platform_str),
             )
+            # Old core: stamp the routed platform so the turn joins that platform's session.
+            # New core: provenance and authorization resolve by the adapter's own platform, so a
+            # stamp here would be admitted and then denied — the turn must stay mesh-keyed, with the
+            # target chat id riding on chat_id/chat_type.
+            if not _CORE_BINDS_PLATFORM:
+                source_kwargs["_platform"] = Platform(target_platform_str)
+            source = self.build_source(**source_kwargs)
         else:
             source = self.build_source(
                 chat_id=f"mesh:{sender}:{msg_id}",
@@ -762,16 +811,22 @@ class MeshAdapter(BasePlatformAdapter):
             raw_message=payload,
             message_id=msg_id,
         )
-        event.metadata["mesh"] = {
-            "sender": sender,
-            "recipient": recipient,
-            "action": action,
-            "reply": reply,
-            "ref": ref,
-            "message_id": msg_id,
-            "session": session,
-            "from_session": from_session,
-        }
+        # Metadata: the old core ignores it, but from 2026-10 upstream's native admission REFUSES any
+        # non-empty metadata on a non-WhatsApp platform (invalid_params / metadata — see
+        # gateway/session_envelope._native_metadata). Nothing reads these keys downstream, but they
+        # are part of this plugin's own tested contract, so they are emitted only where the core
+        # tolerates them rather than deleted outright.
+        if not _CORE_BINDS_PLATFORM:
+            event.metadata["mesh"] = {
+                "sender": sender,
+                "recipient": recipient,
+                "action": action,
+                "reply": reply,
+                "ref": ref,
+                "message_id": msg_id,
+                "session": session,
+                "from_session": from_session,
+            }
         return event, None
 
 

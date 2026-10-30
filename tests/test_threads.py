@@ -255,6 +255,7 @@ class TestFR2_TerminalSemantics:
 
     def test_terminal_message_delivers_full_content(self):
         """AC-2.3: terminal message delivers normally, full goodbye content."""
+        from hermes_mesh import adapter as _adapter_mod
         adapter = _make_adapter()
         text = _envelope(reply="end", msg_id="term-full", body="full goodbye content")
         req = _make_request({"from": "ada", "text": text})
@@ -263,7 +264,13 @@ class TestFR2_TerminalSemantics:
         assert not adapter._mesh_inbox.empty()
         event = adapter._mesh_inbox.get_nowait()
         assert "full goodbye content" in event.text
-        assert event.metadata["mesh"]["reply"] == "end"
+        if _adapter_mod._CORE_BINDS_PLATFORM:
+            # 2026-10+ core refuses non-empty metadata on native events; the reply marker is
+            # carried in the rendered text and the raw payload instead.
+            assert "mesh" not in event.metadata
+            assert event.raw_message["text"].startswith("[mesh]")
+        else:
+            assert event.metadata["mesh"]["reply"] == "end"
 
 
 class TestFR3_OutboundGuard:

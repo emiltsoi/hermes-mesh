@@ -106,6 +106,10 @@ class TestSessionSelector:
         assert event.source.chat_id == "default", "absent session should use target_session"
 
     def test_session_tokens_carried_in_event_metadata(self):
+        from hermes_mesh import adapter as _adapter_mod
+        import pytest
+        if _adapter_mod._CORE_BINDS_PLATFORM:
+            pytest.skip("core refuses non-empty event metadata (2026-10+); see TestCorePortability")
         adapter = self._make_adapter()
         text = self._envelope(sender="linda", session="review", from_session="chat")
         parsed, err = adapter._parse_envelope(text)
@@ -123,3 +127,76 @@ class TestSessionSelector:
         text = self._envelope(sender="linda", session="rev#iew")
         parsed, err = adapter._parse_envelope(text)
         assert err is not None, "invalid session token must be rejected"
+
+
+class TestCorePortability:
+    """The plugin must run on both cores.
+
+    Upstream 2026-10 removed ``_platform`` from ``build_source()`` and began refusing non-empty
+    ``event.metadata`` on native events. Both behaviours are probed at import, so the old core keeps
+    its exact contract and the new core gets the shape it accepts. These tests pin both sides of
+    each gate — the flag is monkeypatched, so neither depends on which core is installed.
+    """
+
+    @staticmethod
+    def _adapter(target_session="telegram:dm:123"):
+        from hermes_mesh.adapter import MeshAdapter
+        from gateway.platforms.base import PlatformConfig
+        return MeshAdapter(PlatformConfig(extra={
+            "secret": "INSECURE_NO_AUTH", "agent_name": "ada",
+            "target_session": target_session, "host": None,
+        }))
+
+    @staticmethod
+    def _build(adapter):
+        return adapter._build_event(
+            {}, "ada", "ADA", "mid-1", "info", "no", None, "hello",
+            session=None, from_session=None,
+        )
+
+    def test_routed_source_omits_platform_on_new_core(self, monkeypatch):
+        from hermes_mesh import adapter as mod
+        ad = self._adapter()
+        seen = {}
+
+        def spy(**kw):
+            seen.update(kw)
+            kw.pop("_platform", None)
+            return ad.__class__.build_source(ad, **kw)
+
+        monkeypatch.setattr(ad, "build_source", spy)
+        monkeypatch.setattr(mod, "_CORE_BINDS_PLATFORM", True)
+        event, err = self._build(ad)
+
+        assert err is None
+        assert "_platform" not in seen, "new core must not stamp a routed platform"
+        assert seen["chat_id"] == "123", "routed target still rides on chat_id"
+
+    def test_routed_source_stamps_platform_on_old_core(self, monkeypatch):
+        from hermes_mesh import adapter as mod
+        ad = self._adapter()
+        seen = {}
+
+        def spy(**kw):
+            seen.update(kw)
+            kw.pop("_platform", None)
+            return ad.__class__.build_source(ad, **kw)
+
+        monkeypatch.setattr(ad, "build_source", spy)
+        monkeypatch.setattr(mod, "_CORE_BINDS_PLATFORM", False)
+        event, err = self._build(ad)
+
+        assert err is None
+        assert seen["_platform"].value == "telegram", "old core keeps the routed stamp"
+
+    def test_no_event_metadata_when_core_refuses_it(self, monkeypatch):
+        from hermes_mesh import adapter as mod
+        ad = self._adapter()
+        monkeypatch.setattr(mod, "_CORE_BINDS_PLATFORM", True)
+        event, err = self._build(ad)
+        assert err is None
+        assert "mesh" not in event.metadata, "new core refuses non-empty metadata"
+
+    def test_authorization_is_upstream_declared(self):
+        ad = self._adapter()
+        assert ad.authorization_is_upstream is True
