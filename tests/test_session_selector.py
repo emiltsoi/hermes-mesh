@@ -166,11 +166,38 @@ class TestCorePortability:
 
         monkeypatch.setattr(ad, "build_source", spy)
         monkeypatch.setattr(mod, "_CORE_BINDS_PLATFORM", True)
+        monkeypatch.setattr(mod, "_ROUTED_BINDING", False, raising=False)
         event, err = self._build(ad)
 
         assert err is None
-        assert "_platform" not in seen, "new core must not stamp a routed platform"
+        assert "_platform" not in seen, "new core WITHOUT the routed carry must not stamp"
         assert seen["chat_id"] == "123", "routed target still rides on chat_id"
+
+    def test_routed_source_stamps_platform_on_new_core_with_the_carry(self, monkeypatch):
+        """Third generation case: a new core carrying ROUTED_PLATFORM_BINDING accepts the stamp.
+
+        Without this case the two above can both pass while the carry core — the only core the
+        fleet is about to run — silently stays mesh-keyed.
+        """
+        from hermes_mesh import adapter as mod
+        ad = self._adapter()
+        seen = {}
+
+        def spy(**kw):
+            seen.update(kw)
+            kw.pop("_platform", None)
+            return ad.__class__.build_source(ad, **kw)
+
+        monkeypatch.setattr(ad, "build_source", spy)
+        monkeypatch.setattr(mod, "_CORE_BINDS_PLATFORM", True)
+        monkeypatch.setattr(mod, "_ROUTED_BINDING", True, raising=False)
+        event, err = self._build(ad)
+
+        assert err is None
+        stamped = seen.get("_platform")
+        assert stamped is not None, "carry core must stamp the routed platform; nothing was passed"
+        assert "telegram" in str(getattr(stamped, "value", stamped)).lower(), (
+            f"carry core must stamp telegram, saw {stamped!r}")
 
     def test_routed_source_stamps_platform_on_old_core(self, monkeypatch):
         from hermes_mesh import adapter as mod
@@ -200,3 +227,40 @@ class TestCorePortability:
     def test_authorization_is_upstream_declared(self):
         ad = self._adapter()
         assert ad.authorization_is_upstream is True
+
+
+class TestRoutedPlatformDeclaration:
+    """The declaration the core carry reads must exist, and must be a real collection.
+
+    Core-side tests set ``delivers_as_platforms`` on a stub adapter, so nothing in this repo
+    noticed if the real MeshAdapter lost it — the plugin suite could be green while the
+    fleet's routed delivery silently degraded to mesh-keyed sessions. Found by Britney's
+    mutation M1 (plugin side), 2026-10-31. A survivor that is a missing test is still a hole.
+    """
+
+    def test_mesh_adapter_declares_telegram(self):
+        from hermes_mesh.adapter import MeshAdapter, _ROUTED_BINDING  # noqa: F401
+        from gateway.config import Platform
+
+        declared = getattr(MeshAdapter, "delivers_as_platforms", None)
+        assert declared is not None, "the routed-platform declaration is gone — the carry reads it"
+        assert isinstance(declared, (set, frozenset)), (
+            f"must be a real collection; the core refuses a bare string, got {type(declared)!r}")
+        assert Platform("telegram") in declared, "must name the platform the fleet actually routes to"
+
+    def test_the_probe_is_a_bool_not_a_throw(self):
+        """A missing sentinel on the old core must read False, never raise at import."""
+        from hermes_mesh import adapter as adapter_mod
+
+        assert isinstance(adapter_mod._ROUTED_BINDING, bool)
+
+    def test_stamp_condition_covers_both_generations(self):
+        """Old core OR carry core -> stamp. New core without the carry -> no stamp (mesh-keyed)."""
+        from hermes_mesh import adapter as adapter_mod
+
+        def stamps(core_binds_platform, routed_binding):
+            return (not core_binds_platform) or routed_binding
+
+        assert stamps(core_binds_platform=False, routed_binding=False) is True   # old core
+        assert stamps(core_binds_platform=True, routed_binding=True) is True     # carry core
+        assert stamps(core_binds_platform=True, routed_binding=False) is False   # new core alone
