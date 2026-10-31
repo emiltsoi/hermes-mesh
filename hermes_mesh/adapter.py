@@ -166,6 +166,24 @@ def _core_binds_routed_platform() -> bool:
 _ROUTED_BINDING = _core_binds_routed_platform()
 
 
+def _declared_routed_platforms() -> frozenset:
+    """Platforms this adapter may deliver events stamped as (read by the core carry).
+
+    Deliberately defensive. The sibling probe ``_core_binds_routed_platform()`` degrades to False on
+    any surprise, but a bare class-level ``Platform("telegram")`` would take the plugin down **at
+    import** on a core whose Platform rejects the call form — turning a degraded route into a dead
+    gateway, which is the one failure direction worse than refusing. Prefer the enum attribute, fall
+    back to the call form, and declare nothing rather than raise.
+    """
+    try:
+        return frozenset({Platform.TELEGRAM})
+    except Exception:
+        try:
+            return frozenset({Platform("telegram")})
+        except Exception:
+            return frozenset()
+
+
 class MeshAdapter(BasePlatformAdapter):
     """Receive Ed25519-signed Mesh messages into a configured platform session."""
 
@@ -185,7 +203,7 @@ class MeshAdapter(BasePlatformAdapter):
     # call form — the member is identical to ``Platform.TELEGRAM`` on a real
     # core, and only the call form resolves on the stub Platform used by this
     # plugin's own test harness (it declares no telegram member).
-    delivers_as_platforms = frozenset({Platform("telegram")})
+    delivers_as_platforms = _declared_routed_platforms()
 
     @property
     def authorization_is_upstream(self) -> bool:
