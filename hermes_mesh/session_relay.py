@@ -876,7 +876,11 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             try:
                 from . import open_threads as _open_threads
 
-                _open_threads.release(task_id)
+                # Party-checked on purpose: `task_id` is caller-supplied and `claim()` does not
+                # enforce id uniqueness, so a bare release() here would let a sender whose
+                # delivery failed close a lease that belongs to somebody else. Kore found this
+                # reading the port (2026-10-31); the success path already used the party form.
+                _open_threads.release_if_party(task_id, from_agent)
             except Exception:  # noqa: BLE001
                 pass
         return {
