@@ -89,7 +89,8 @@ def test_relay_never_releases_by_bare_thread_id():
     id-only function on its failure path. A behavioural harness for that path does not exist, so
     this asserts the call itself: no bare `_open_threads.release(` may appear in the relay.
     """
-    src = pathlib.Path("hermes_mesh/session_relay.py").read_text()
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    src = (repo / "hermes_mesh" / "session_relay.py").read_text()
     offenders = [
         f"{i}: {line.strip()}"
         for i, line in enumerate(src.splitlines(), 1)
@@ -98,4 +99,33 @@ def test_relay_never_releases_by_bare_thread_id():
     assert not offenders, (
         "session_relay releases by thread id alone; a third party can close a conversation:\n  "
         + "\n  ".join(offenders)
+    )
+
+
+def test_the_guard_can_actually_fail(tmp_path):
+    """Kore's correction: a check that cannot fail on the broken state is not a check.
+
+    The first version read a RELATIVE path, so running it from the repo was always green and
+    running it anywhere else inspected the wrong tree — including a seat that still carried the
+    defect. This pins the detector itself against a synthetic broken file.
+    """
+    broken = tmp_path / "session_relay.py"
+    broken.write_text("        _open_threads.release(task_id)\n")
+
+    lines = broken.read_text().splitlines()
+    offenders = [
+        f"{i}: {ln.strip()}"
+        for i, ln in enumerate(lines, 1)
+        if "_open_threads.release(" in ln and "_open_threads.release_if_party(" not in ln
+    ]
+    assert offenders == ["1: _open_threads.release(task_id)"], (
+        "the detector failed to see the exact defect it exists to find"
+    )
+
+
+def test_guard_path_is_absolute_not_cwd_dependent():
+    """The regression that produced the false 'green' in the first place."""
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    assert (repo / "hermes_mesh" / "session_relay.py").is_file(), (
+        "the guard resolved a path that does not exist from this CWD"
     )
