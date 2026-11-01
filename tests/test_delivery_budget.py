@@ -41,6 +41,8 @@ class _Peer:
         self.status = 200
         self.payload: dict = {"delivery_id": "x"}
         self.sleep_s = 0.0
+        self.sleep_after_first: float | None = None
+        self.slow_count: int | None = None
         self.requests = 0
         self._lock = threading.Lock()
         peer = self
@@ -54,10 +56,24 @@ class _Peer:
                     self.rfile.read(length)
                 with peer._lock:
                     peer.requests += 1
-                if peer.sleep_s:
+                    index = peer.requests
+                # `sleep_after_first` lets a test make the peer swallow leading
+                # requests and answer later ones immediately -- the only shape that
+                # exercises the deadline extension. `slow_count` says HOW MANY
+                # leading requests are swallowed, and it must be set whenever the
+                # extension is under test: `_resolve_target_url` returns loopback
+                # twice, so `_pinned_request` sends TWO requests per attempt and a
+                # single slow request would be answered by the duplicate.
+                delay = peer.sleep_s
+                if peer.slow_count is not None:
+                    if index > peer.slow_count:
+                        delay = peer.sleep_after_first or 0.0
+                elif index > 1 and peer.sleep_after_first is not None:
+                    delay = peer.sleep_after_first
+                if delay:
                     import time as _t
 
-                    _t.sleep(peer.sleep_s)
+                    _t.sleep(delay)
                 body = json.dumps(peer.payload).encode()
                 self.send_response(peer.status)
                 self.send_header("Content-Type", "application/json")
@@ -113,16 +129,32 @@ def _send(peer, sender_key):
 def test_a19_slow_peer_inside_total_budget_is_delivered(peer, sender_key):
     """A peer slower than total/retries but faster than total must succeed.
 
-    Pre-fix attempt 0 receives 10/3 ~= 3.33 s, so a 4.0 s peer is unreachable by
-    construction and every later attempt fails *because the message arrived*.
+    Pre-fix attempt 0 receives 10/3 ~= 3.33 s, so a peer that accepts after that
+    threshold is unreachable on the only attempt with enough budget and every
+    later attempt fails *because the message arrived*.
+
+    The sleep is 8.0 s and not 4.0 s on purpose, and the number comes from
+    measurement rather than arithmetic.
+
+    ``_pinned_request`` tries **every** resolved IP with the full ``timeout``, and
+    ``_resolve_target_url`` currently returns loopback **twice**
+    (``[IPv4Address('127.0.0.1'), IPv4Address('127.0.0.1')]``), so one attempt's
+    wall clock is ~2x its nominal window: a 3.33 s window blocked for 6.67 s and a
+    1.56 s window for 3.13 s (measured). A 4.0 s peer is therefore served by the
+    divided schedule's own doubling, and a 6.0 s peer likewise -- both survive the
+    budget mutation and prove nothing.
+
+    8.0 s sits outside ``2 * total/retries`` (6.67 s) and inside ``2 * total``
+    (20 s), so the divided schedule cannot reach it however the retries fall,
+    while first-attempt-full delivers it on attempt 0.
     """
     peer.status = 200
     peer.payload = {"delivery_id": "x"}
-    peer.sleep_s = 4.0
+    peer.sleep_s = 8.0
 
     delivery_id, error = _send(peer, sender_key)
 
-    assert error is None, f"a 4.0s peer must be deliverable inside a 10s budget, got {error!r}"
+    assert error is None, f"an 8.0s peer must be deliverable inside a 10s budget, got {error!r}"
     assert delivery_id == "x"
 
 
@@ -185,3 +217,38 @@ def test_a24_receipt_without_id_is_still_delivered(peer, sender_key):
 
     assert error is None, f"a duplicate receipt without an id is a delivery, got {error!r}"
     assert delivery_id is not None
+
+
+def test_a25_deadline_extension_rescues_the_retries(peer, sender_key, monkeypatch):
+    """The once-only extension is the difference between a retry and a formality.
+
+    This is the test A19 cannot be. Post-fix, attempt 0 takes the whole timeout,
+    so it never fails against a merely-slow peer and the extension is never
+    exercised -- deleting the extension leaves A19 green. The extension only
+    earns its place when attempt 0 gets *no answer at all*: without it the
+    remaining budget is already spent and the retries return ``unconfirmed``
+    without ever being tried.
+
+    The peer swallows the first request entirely and answers the second
+    immediately, so the only thing under test is whether attempt 1 happens.
+    """
+    monkeypatch.setattr(session_relay, "_DELIVERY_TIMEOUT", 2)
+    peer.status = 200
+    peer.payload = {"delivery_id": "x"}
+    peer.sleep_s = 5.0
+    peer.sleep_after_first = 0.0
+    # Two, not one: `_pinned_request` sends one request per resolved IP and the
+    # resolver currently returns loopback twice, so an attempt is two requests.
+    # Swallowing one would be answered by the duplicate and attempt 0 would
+    # succeed, which is what A19 already covers.
+    peer.slow_count = 2
+
+    delivery_id, error = _send(peer, sender_key)
+
+    assert peer.requests >= 3, (
+        "attempt 1 was never tried: without the extension the deadline is "
+        f"already spent after attempt 0 (saw {peer.requests} request(s))"
+    )
+    assert error is None, f"the extension must let attempt 1 succeed, got {error!r}"
+    assert delivery_id == "x"
+
