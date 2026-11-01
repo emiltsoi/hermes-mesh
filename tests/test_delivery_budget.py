@@ -243,18 +243,47 @@ def test_a25_deadline_extension_rescues_the_retries(peer, sender_key, monkeypatc
     peer.payload = {"delivery_id": "x"}
     peer.sleep_s = 5.0
     peer.sleep_after_first = 0.0
-    # Two, not one: `_pinned_request` sends one request per resolved IP and the
-    # resolver currently returns loopback twice, so an attempt is two requests.
-    # Swallowing one would be answered by the duplicate and attempt 0 would
-    # succeed, which is what A19 already covers.
-    peer.slow_count = 2
+    # One, not two. This was 2 while `_resolve_host` returned every address twice
+    # and one attempt therefore made two requests; the de-duplication condition
+    # makes an attempt a single request, so swallowing one is exactly one attempt
+    # and swallowing two would swallow attempt 1 as well and fail a correct build.
+    peer.slow_count = 1
 
     delivery_id, error = _send(peer, sender_key)
 
-    assert peer.requests >= 3, (
+    assert peer.requests >= 2, (
         "attempt 1 was never tried: without the extension the deadline is "
         f"already spent after attempt 0 (saw {peer.requests} request(s))"
     )
     assert error is None, f"the extension must let attempt 1 succeed, got {error!r}"
     assert delivery_id == "x"
+
+
+def test_a26_resolution_yields_distinct_addresses():
+    """One address must mean one attempt, or the budget's arithmetic is fiction.
+
+    ``getaddrinfo`` without ``type``/``proto`` returns one entry per socket kind,
+    so every address appears twice::
+
+        getaddrinfo('127.0.0.1')  -> ['127.0.0.1', '127.0.0.1']
+        getaddrinfo('localhost')  -> ['127.0.0.1', '127.0.0.1', '::1', '::1']
+
+    ``_pinned_request`` gives **each** entry the full timeout, so a duplicate here
+    doubles the wall clock of every attempt and asks a timed-out peer twice -- a
+    duplicate generator sitting inside the fix for duplicates. This asserts the
+    property rather than the argument: ``type=`` and ``proto=`` each fix it alone,
+    and a defensive de-duplication fixes it too, so the test names the invariant
+    and lets the implementation choose how to hold it.
+    """
+    for host in ("127.0.0.1", "localhost"):
+        try:
+            addrs = session_relay._resolve_host(host)
+        except ValueError:
+            continue  # host not resolvable on this box: not this test's subject
+        assert addrs, f"{host} resolved to nothing"
+        assert len(addrs) == len(set(addrs)), (
+            f"{host} returned duplicate addresses {addrs}; every duplicate gives one "
+            "more full-timeout connection attempt, so the delivery budget doubles"
+        )
+
 

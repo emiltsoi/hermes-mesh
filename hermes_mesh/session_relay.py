@@ -119,11 +119,29 @@ def _is_ip_blocked(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, *, all
 
 
 def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Resolve a hostname and validate all returned addresses."""
+    """Resolve a hostname and validate all returned addresses.
+
+    ``type``/``proto`` are not optional hygiene. Without them ``getaddrinfo``
+    returns one entry per socket *kind*, so every address appears twice -- once
+    for SOCK_STREAM and once for SOCK_DGRAM -- and for ``localhost`` that is four
+    entries for two addresses::
+
+        getaddrinfo('127.0.0.1')  -> ['127.0.0.1', '127.0.0.1']
+        getaddrinfo('localhost')  -> ['127.0.0.1', '127.0.0.1', '::1', '::1']
+        getaddrinfo('127.0.0.1', type=SOCK_STREAM, proto=IPPROTO_TCP) -> ['127.0.0.1']
+
+    ``_pinned_request`` gives **each** returned address the full timeout, so a
+    duplicate here silently doubles the delivery budget's wall clock and asks a
+    timed-out peer twice per attempt. We only ever open TCP stream connections,
+    so both are declared and the list is de-duplicated defensively below: the
+    budget's arithmetic is only true if this function returns distinct addresses.
+    """
     if not host:
         raise ValueError("Empty host")
     try:
-        addrinfo = socket.getaddrinfo(host, None)
+        addrinfo = socket.getaddrinfo(
+            host, None, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
     except socket.gaierror as exc:
         raise ValueError(f"Unable to resolve host {host}: {exc}") from exc
     if not addrinfo:
@@ -132,9 +150,11 @@ def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Addre
     ip_objs: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for _, _, _, _, sockaddr in addrinfo:
         try:
-            ip_objs.append(ipaddress.ip_address(sockaddr[0]))
+            ip_obj = ipaddress.ip_address(sockaddr[0])
         except ValueError:
             continue
+        if ip_obj not in ip_objs:  # order-preserving: first answer wins
+            ip_objs.append(ip_obj)
     if not ip_objs:
         raise ValueError(f"No valid IP addresses for host {host}")
 
