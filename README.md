@@ -168,7 +168,7 @@ mesh_register(name="britney", url="http://127.0.0.1:8745/mesh/receive", public_k
 export MESH_AGENT_NAME=linda                  # Who the sender is
 export MESH_WEBHOOK_DELIVERY_RETRIES=3        # Delivery retry count
 export MESH_WEBHOOK_DELIVERY_BACKOFF=1.0      # Initial retry backoff in seconds
-export MESH_WEBHOOK_DELIVERY_TIMEOUT=10       # Per-attempt timeout
+export MESH_WEBHOOK_DELIVERY_TIMEOUT=10       # FIRST-ATTEMPT timeout — not the ceiling, see below
 export MESH_WEBHOOK_ALLOW_LOOPBACK=0          # Set to 1 to allow deliveries to loopback/private targets
 export MESH_REGISTER_ALLOW_LOOPBACK=0         # Set to 1 to let mesh_register store loopback URLs
 export MESH_IDENTITY_CACHE_TTL=1.0            # Identity YAML cache TTL in seconds (0 disables)
@@ -188,6 +188,17 @@ export MESH_OUTBOX_INTERVAL=30                # Outbox retry sweep interval in s
 export TELEGRAM_BOT_TOKEN=[REDACTED:API key param]                 # For float delivery
 export TELEGRAM_HOME_CHANNEL=...              # Where floats go
 ```
+
+> **The delivery ceiling is 20 seconds, not `RETRIES x TIMEOUT`.** The first attempt gets the whole
+> `MESH_WEBHOOK_DELIVERY_TIMEOUT`. If it gets **no answer**, the deadline is extended **once** by the
+> same amount so the retries are not starved, and the later attempts share what remains. A peer that
+> answers — including `503 busy` — never earns the extension. So the defaults (`RETRIES=3`,
+> `TIMEOUT=10`) mean a **20 s worst case**, reached only by a peer that has already proved itself slow;
+> the common case still completes on the first attempt inside 10 s.
+>
+> One attempt is one connection. This is only true because address resolution de-duplicates: an address
+> that appears twice in the resolution result would be tried twice for the full timeout, doubling the
+> ceiling without changing any configured number.
 
 
 
