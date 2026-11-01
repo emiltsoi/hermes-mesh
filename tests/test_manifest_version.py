@@ -6,7 +6,11 @@ directory plugin by its ``plugin.yaml``, so that number is what an operator, an 
 decision reads. Two sources of truth with no test between them is the defect; this is the test.
 """
 import pathlib
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 — tomllib is stdlib only from 3.11
+    import tomli as tomllib  # backport, installed by CI below 3.11
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
