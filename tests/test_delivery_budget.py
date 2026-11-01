@@ -166,7 +166,13 @@ def test_a20_duplicate_refusal_is_a_delivery(peer, sender_key):
     delivery_id, error = _send(peer, sender_key)
 
     assert error is None, f"409 duplicate must be DELIVERED, got {error!r}"
-    assert delivery_id in ("abc", None, "unknown")
+    # Not `in ("abc", None, "unknown")`: that disjunction accepts every way of
+    # failing to read the id, so a build that read `abc`, one that defaulted to
+    # "unknown" and one that gave up with None would all pass. The peer's body
+    # says `abc` and the code returns it, so the claim is the exact value.
+    assert delivery_id == "abc", (
+        f"the id must be READ from the duplicate body, not defaulted; got {delivery_id!r}"
+    )
     assert peer.requests == 1, f"a duplicate must not be retried, saw {peer.requests} requests"
 
 
