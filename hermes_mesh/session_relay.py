@@ -13,6 +13,7 @@ header. Caller passes raw message; tool handles all mesh metadata.
 from __future__ import annotations
 
 import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -257,7 +258,17 @@ def _pinned_request(
             resp = conn.getresponse()
             data = resp.read()
             if resp.status >= 400:
-                raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, resp)
+                # The body is the proof, and reading it above already drained the
+                # response stream: an HTTPError built on ``resp`` hands every
+                # downstream reader a body at EOF. That is precisely how a peer's
+                # {"status":"duplicate"} -- "I already have it", the strongest
+                # available proof of arrival -- became ``unreachable``: the token
+                # was read and discarded before anyone could score it.
+                if _declares_arrival(data):
+                    return data
+                raise urllib.error.HTTPError(
+                    url, resp.status, resp.reason, resp.headers, io.BytesIO(data)
+                )
             return data
         except (OSError, socket.timeout, http.client.HTTPException) as exc:
             last_exc = exc
@@ -305,6 +316,94 @@ def _validate_agent_name(name: str) -> str:
 _DELIVERY_RETRIES = int(os.getenv("MESH_WEBHOOK_DELIVERY_RETRIES", "3"))
 _DELIVERY_BACKOFF = float(os.getenv("MESH_WEBHOOK_DELIVERY_BACKOFF", "1.0"))
 _DELIVERY_TIMEOUT = int(os.getenv("MESH_WEBHOOK_DELIVERY_TIMEOUT", "10"))
+
+# ---------------------------------------------------------------------------
+# Outcome vocabulary (sender side)
+# ---------------------------------------------------------------------------
+#
+# "A timeout means we do not know. A 409-duplicate means it landed." The two
+# have opposite remedies, so collapsing them re-creates the duplicate bug one
+# layer down: a delivered message retried forever, or a QueueFull message marked
+# delivered and lost with a success report.
+#
+# ``mesh_core.delivery._exception_to_reason`` already maps 503->busy,
+# 400->bad-request, 404->not-found and 429->rate-limited. It maps **no 409 at
+# all** (falling through to ``unreachable``) and it maps a **timeout** to
+# ``unreachable`` as well. Those two cases are therefore classified here;
+# everything else delegates to it, so the shared client stays untouched.
+_ARRIVAL_TOKENS = frozenset({"duplicate", "replay", "already-delivered"})
+
+_REFUSAL_REASONS = {
+    "busy": "busy",
+    "queue-full": "busy",
+    "rate-limited": "rate-limited",
+    "unauthorized": "unauthorized",
+    "bad-request": "bad-request",
+}
+
+UNCONFIRMED = "unconfirmed"
+
+
+def _json_status_token(payload: bytes | None) -> str | None:
+    """Return the lowercase ``status`` token from a JSON body, else None."""
+    if not payload:
+        return None
+    try:
+        parsed = json.loads(payload.decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    token = parsed.get("status") if isinstance(parsed, dict) else None
+    return token.lower() if isinstance(token, str) else None
+
+
+def _declares_arrival(payload: bytes | None) -> bool:
+    """True when the body token says the peer already holds this message."""
+    return _json_status_token(payload) in _ARRIVAL_TOKENS
+
+
+def _error_body_token(exc: Exception) -> str | None:
+    """Return the ``status`` token carried by an HTTPError body, if readable."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return None
+    try:
+        return _json_status_token(exc.read())
+    except Exception:  # noqa: BLE001 - an unreadable body is simply "no token"
+        return None
+
+
+def _is_timeout(exc: Exception) -> bool:
+    """True for a send that got no answer at all.
+
+    An HTTPError is never a timeout: the peer answered. Timeouts arrive as
+    ``socket.timeout``/``TimeoutError`` (aliases since 3.10) or as an OSError
+    mentioning the timeout.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _delivery_failure_reason(exc: Exception) -> str:
+    """Classify a final delivery failure into the sender's outcome vocabulary.
+
+    Token first, then timeout, then the shared status-code mapping. **The token
+    beats the code**: 409 is Kore's duplicate and could be someone else's busy,
+    and our own door answers 503 for busy while a 409 from a different peer may
+    mean something else entirely.
+    """
+    token = _error_body_token(exc)
+    if token in _ARRIVAL_TOKENS:
+        # Arrival tokens are returned as success before any raise; reaching here
+        # means the body said "landed" but the caller still treated it as a
+        # failure. Never invent a second arrival path -- report the uncertainty.
+        return UNCONFIRMED
+    if token is not None:
+        return _REFUSAL_REASONS.get(token, UNCONFIRMED)
+    if _is_timeout(exc):
+        return UNCONFIRMED
+    return _exception_to_reason(exc)
 
 # Matches the [from:<name>] token inside a mesh envelope header. Used to derive
 # the JSON wire-wrap "from" field when the caller does not pass an explicit
@@ -382,20 +481,37 @@ def _deliver_webhook(
     sig = auth.sign_ed25519(signing_material, signed_body)
     headers["X-Mesh-Signature"] = sig
 
-    # Enforce a single total deadline across all attempts instead of letting
-    # each attempt run for the full _DELIVERY_TIMEOUT and accumulate linearly.
+    # First-attempt-full budget (brief option B).
+    #
+    # The previous form was:
+    #     attempt_timeout = max(1.0, remaining / (_DELIVERY_RETRIES - attempt))
+    # which hands attempt 0 only ``total / retries`` seconds. A peer that accepts
+    # just after that threshold therefore times out on the ONLY attempt that had
+    # enough budget, and every later attempt then fails *because the message
+    # arrived* (409 duplicate). That form is prohibited: it makes a slow but
+    # healthy peer unreachable by construction and manufactures duplicates.
+    #
+    # Attempt 0 now receives the whole timeout. If it times out the deadline is
+    # extended once so the remaining attempts are not starved, and each later
+    # attempt gets everything that remains -- no division, because the division
+    # is what created the threshold. Worst case is 2 x timeout (20 s at the
+    # default), reached only by a peer that has already proven itself slow; the
+    # common case still completes on attempt 0 inside 10 s.
     deadline = time.monotonic() + _DELIVERY_TIMEOUT
+    extended = False
 
     for attempt in range(_DELIVERY_RETRIES):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             logger.error("Mesh relay: delivery exceeded total timeout budget")
-            return None, "unreachable"
+            # Earlier attempts got no answer, so arrival is unknown -- not a
+            # statement that the peer was unreachable.
+            return None, UNCONFIRMED
 
         try:
-            # Give each attempt an equal share of the remaining budget so a
-            # slow/dead target cannot consume the whole timeout on one attempt.
-            attempt_timeout = max(1.0, remaining / (_DELIVERY_RETRIES - attempt))
+            attempt_timeout = (
+                float(_DELIVERY_TIMEOUT) if attempt == 0 else max(1.0, remaining)
+            )
             data = _pinned_request(
                 url,
                 wire_body.encode(),
@@ -414,6 +530,19 @@ def _deliver_webhook(
             record_metric("send", "total")
             return delivery_id, None
         except Exception as exc:
+            if attempt == 0 and not extended and _is_timeout(exc):
+                # Attempt 0 spent the whole timeout without an answer. Extend
+                # once so the retries are not starved by a budget the first
+                # attempt legitimately consumed, then let them share what
+                # remains. Extension is granted on a timeout only -- a peer that
+                # answered 503 has not earned a longer wall clock.
+                extended = True
+                deadline = time.monotonic() + _DELIVERY_TIMEOUT
+                logger.info(
+                    "Mesh relay: first attempt got no answer; extending the "
+                    "delivery budget once before retrying %s",
+                    url,
+                )
             remaining = deadline - time.monotonic()
             if attempt < _DELIVERY_RETRIES - 1 and remaining > 0:
                 backoff = _DELIVERY_BACKOFF * (2 ** attempt)
@@ -426,7 +555,7 @@ def _deliver_webhook(
                     )
                     time.sleep(sleep_time)
             else:
-                reason = _exception_to_reason(exc)
+                reason = _delivery_failure_reason(exc)
                 logger.error(
                     "Mesh relay: delivery failed after %d attempts: %s",
                     _DELIVERY_RETRIES, exc,
