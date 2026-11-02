@@ -268,6 +268,128 @@ def release_if_party(thread_id: str, who: str) -> bool:
         return False
 
 
+def registry_path() -> str:
+    """The absolute registry path this process actually consults.
+
+    The terminator reports this beside the release reason (SPEC §4.1): a config
+    typo is visible in the same line as the failure instead of requiring an
+    operator to resolve the fleet root by hand.
+    """
+    path = _registry_path()
+    try:
+        return str(path.resolve())
+    except OSError:  # pragma: no cover - resolve is almost always total
+        return str(path.absolute())
+
+
+def _path_state(path: Path) -> str:
+    """``present`` | ``absent`` | ``unreadable`` — without collapsing the two.
+
+    ``_core._read_entries_strict`` deliberately returns ``([], False)`` for an
+    absent path, so the read result cannot tell a fresh/empty registry from a
+    configuration typo. Stat first, explicitly, and let the caller decide which
+    absence is a fault.
+    """
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError:
+        return "unreadable"
+    return "present"
+
+
+def release_if_party_status(thread_id: str, who: str) -> dict:
+    """Release only if ``who`` is a party — and report *which* fact the bool meant.
+
+    SPEC §4: ``release_if_party`` collapses three distinct outcomes into one
+    ``False``. A caller cannot tell "already closed" from "you have no right"
+    from "the registry was unreadable", and those demand different next actions.
+    This sibling keeps the existing bool function untouched (it has other
+    callers) and returns the measured shape the terminator reports:
+
+        {"released": True,  "reason": "released"}
+        {"released": False, "reason": "no-such-lease"}
+        {"released": False, "reason": "not-a-party"}
+        {"released": False, "reason": "registry-unavailable"}
+
+    Presence is decided by an explicit stat, never by the read result or the
+    process-local failopen counter: a missing filename in a writable directory
+    is silent to both, and must not be reported as an empty fleet.
+
+    An explicitly configured ``MESH_OPEN_THREADS`` pointing at an absent file
+    is a configuration fault (registry-unavailable). An absent *derived* path is
+    a fresh fleet, which is honestly no-such-lease (SPEC §4.1) — the terminator
+    reports the exact path so a typo is still visible.
+
+    A failure to write is a registry-unavailable result, not a pretended
+    release: the lease is still on disk, so saying ``released`` would be the
+    same silence this function exists to end.
+    """
+    path = _registry_path()
+    explicitly_configured = bool(os.environ.get("MESH_OPEN_THREADS"))
+    unavailable = {"released": False, "reason": "registry-unavailable"}
+    try:
+        state = _path_state(path)
+        if state == "unreadable":
+            _degrade(f"registry path unreadable: {path}", path)
+            return unavailable
+        if state == "absent":
+            if explicitly_configured:
+                # A writable directory with a missing filename is the silent
+                # case: no read degradation, no counter, no file. It is a
+                # configuration fault, not an empty fleet.
+                _degrade("registry path does not exist", path)
+                return unavailable
+            return {"released": False, "reason": "no-such-lease"}
+
+        with _core._registry_lock(path):
+            # Re-stat under the lock: the file may have disappeared between the
+            # first check and acquiring the lock.
+            state = _path_state(path)
+            if state == "unreadable":
+                _degrade(f"registry path unreadable: {path}", path)
+                return unavailable
+            if state == "absent":
+                if explicitly_configured:
+                    _degrade("registry path does not exist", path)
+                    return unavailable
+                return {"released": False, "reason": "no-such-lease"}
+
+            try:
+                entries, failed = _core._read_entries_strict(path)
+            except Exception as exc:  # noqa: BLE001 — report, never raise
+                _degrade(f"read error {exc!r}", path)
+                return unavailable
+            if failed:
+                _degrade("corrupt or unreadable", path)
+                try:
+                    _core._backup_corrupt(path)
+                except Exception:  # noqa: BLE001
+                    pass
+                return unavailable
+
+            entries = [e for e in entries if isinstance(e, dict)]
+            kept, matched, released = [], False, False
+            for rec in entries:
+                if rec.get("thread_id") == thread_id:
+                    matched = True
+                    if who in {rec.get("opened_by"), rec.get("peer")}:
+                        released = True
+                        continue
+                kept.append(rec)
+            if released:
+                if not _write(kept, path):
+                    return unavailable
+                return {"released": True, "reason": "released"}
+            if matched:
+                return {"released": False, "reason": "not-a-party"}
+            return {"released": False, "reason": "no-such-lease"}
+    except Exception as exc:  # noqa: BLE001 — never raise into the send path
+        _degrade(f"release_if_party_status error {exc!r}", path)
+        return unavailable
+
+
 def claim(
     thread_id: str,
     opened_by: str,

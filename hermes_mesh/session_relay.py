@@ -12,6 +12,7 @@ header. Caller passes raw message; tool handles all mesh metadata.
 """
 from __future__ import annotations
 
+import difflib
 import http.client
 import io
 import ipaddress
@@ -715,6 +716,64 @@ def _meter(action: str, reply: str, peer: str, thread_id: str | None, outcome: s
         pass
 
 
+# The arguments `mesh_send` actually reads. This is deliberately the *args*
+# allowlist, not a validation of `merged`: the framework injects task_id,
+# session_id and user_task into kwargs on every call, and refusing those would
+# refuse every send in the fleet. Non-runtime kwargs remain accepted for
+# convenience (the relay only reads the keys below from them).
+_SEND_ARG_KEYS = frozenset(
+    {
+        "message",
+        "agent",
+        "action",
+        "reply",
+        "ref",
+        "thread",
+        "task_id",
+        "session",
+        "from_session",
+    }
+)
+
+
+def _unknown_argument_error(args: dict) -> dict | None:
+    """Return a near-miss refusal for the first unknown key in ``args``.
+
+    Scope is ``args`` ONLY (SPEC §2). The framework's injected context never
+    appears here; validating ``kwargs`` or the merge would refuse every call.
+    """
+    for key in args:
+        if isinstance(key, str) and key in _SEND_ARG_KEYS:
+            continue
+        name = key if isinstance(key, str) else str(key)
+        suggestion = difflib.get_close_matches(
+            name, sorted(_SEND_ARG_KEYS), n=1, cutoff=0.6
+        )
+        if suggestion:
+            return {
+                "error": f"unknown argument {name!r}; did you mean {suggestion[0]!r}?",
+                "unknown_argument": name,
+                "did_you_mean": suggestion[0],
+            }
+        return {
+            "error": f"unknown argument {name!r}",
+            "unknown_argument": name,
+            "valid_arguments": sorted(_SEND_ARG_KEYS),
+        }
+    return None
+
+
+def _call_shape(**params) -> str:
+    """Render a copy-ready Python call for a refusal.
+
+    Values are literals, so a caller (or a test) can parse the shape with
+    ``ast`` and feed it straight back to the handler. That is hotaru's rule:
+    a refusal that names an action must name a call the tool accepts.
+    """
+    rendered = ", ".join(f"{key}={value!r}" for key, value in params.items())
+    return f"mesh_send({rendered})"
+
+
 def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     """Send a session-aware message to a Hermes mesh peer.
 
@@ -733,6 +792,9 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             task_id are rejected THREAD_CLOSED. Prefer no; reserve yes for
             genuine questions and end for closure.
         ref: Optional message ID being replied to (for threading).
+        thread: Optional lease/thread ID being acted on. On reply="end" this
+            releases the lease it names; distinct from ref, which names the
+            message being answered.
         task_id: Optional task ID override (auto-generated if omitted).
 
     Returns:
@@ -744,7 +806,11 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     # we accept non-runtime kwargs for convenience, but we must never let the
     # framework's task_id (the conversation session id) become the mesh message
     # id, otherwise every mesh_send in a single turn has the same id.
-    merged = dict(args) if args else {}
+    raw_args = dict(args) if args else {}
+    unknown = _unknown_argument_error(raw_args)
+    if unknown:
+        return unknown
+    merged = raw_args
     for key, value in kwargs.items():
         if key in {
             "task_id",
@@ -766,6 +832,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     message = merged.get("message", "")
     agent = merged.get("agent", "")
     ref = merged.get("ref")
+    thread = merged.get("thread")
     task_id = merged.get("task_id")
     session = merged.get("session")
     from_session = merged.get("from_session")
@@ -806,6 +873,17 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             ref = None
     else:
         ref = None
+
+    # `thread` is a lease address, not a message relation. Refuse a malformed
+    # one rather than silently falling back to the three-id probe: a dropped
+    # address is how a terminator releases nothing while reporting success.
+    if thread is not None and thread != "":
+        try:
+            thread = validate_envelope_token(thread)
+        except ValueError as e:
+            return {"error": f"Invalid thread: {e}"}
+    else:
+        thread = None
 
     # FR-3: reject replies referencing a closed (terminal) thread BEFORE delivery.
     if ref is not None and threads.is_closed(ref):
@@ -861,6 +939,21 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             _meter(action, reply, agent, blocker.get("thread_id"), "refused")
             kind = blocker.get("kind")
             if kind == "cap":
+                cap_threads = [t for t in (blocker.get("threads") or []) if t]
+                cap_peers = blocker.get("peers") or []
+                cap_thread = cap_threads[0] if cap_threads else None
+                cap_peer = cap_peers[0] if cap_peers else agent
+                close_call = (
+                    _call_shape(
+                        agent=cap_peer,
+                        message="closing this thread",
+                        action="info",
+                        reply="end",
+                        thread=cap_thread,
+                    )
+                    if cap_thread
+                    else None
+                )
                 return {
                     "error": "E-BUSY",
                     "reason": "too-many-open",
@@ -871,6 +964,9 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                     ),
                     "threads": blocker.get("threads"),
                     "peers": blocker.get("peers"),
+                    # The repair names the lease, not just the verb (SPEC §5).
+                    "thread": cap_thread,
+                    "executable": close_call,
                     # too-many-open is your own doing: close one of YOUR threads and resend.
                     "reroute": (
                         "close one with reply:end, or send as a reply:no notice "
@@ -887,9 +983,19 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                     f"reply:end or when its lease expires"
                 ),
                 "thread_id": blocker.get("thread_id"),
+                "thread": blocker.get("thread_id"),
                 "peer": holder,
                 "opened_at": blocker.get("opened_at"),
                 "lease_until": blocker.get("lease_until"),
+                # The notice is the executable route this refusal names; `thread`
+                # is accepted on it and keeps the blocking lease's address visible.
+                "executable": _call_shape(
+                    agent=agent,
+                    message="noted - this notice needs no reply",
+                    action="info",
+                    reply="no",
+                    thread=blocker.get("thread_id"),
+                ),
                 # never a dead end, and specific to THIS cause: the holder's lease expires,
                 # so the address is a time, not a gesture.
                 "reroute": (
@@ -986,6 +1092,11 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         sender=from_agent,
     )
 
+    # A terminator that never left the box released nothing. The field is still
+    # present — its absence would mean "this build has no such field" — and the
+    # null reason says no release cause was measured because none was tried.
+    release_not_attempted = {"released": False, "reason": None}
+
     if delivery_id is None:
         # F4: surface the final end-message failure.  The close was written
         # pending before the attempt; a failed attempt is not a close.
@@ -1012,7 +1123,7 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 # terminal message's own id.  They are not interchangeable.
                 anchor=task_id if reply == "end" else None,
             )
-            return {
+            response = {
                 "task_id": task_id,
                 "state": "queued",
                 "status": "queued for outbox retry",
@@ -1022,6 +1133,9 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 "agent": agent,
                 "gateway_delivery": False,
             }
+            if reply == "end":
+                response["lease_released"] = release_not_attempted
+            return response
         # Immediate final failure: send DSN to the interested party.
         dsn_to = agent if ref else from_agent
         _send_delivery_error(
@@ -1044,10 +1158,13 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
                 _open_threads.release_if_party(task_id, from_agent)
             except Exception:  # noqa: BLE001
                 pass
-        return {
+        response = {
             "error": f"Webhook to agent '{agent}' failed after {_DELIVERY_RETRIES} attempts",
             "task_id": task_id,
         }
+        if reply == "end":
+            response["lease_released"] = release_not_attempted
+        return response
 
     # Part 2: Telegram float (best-effort, non-blocking)
     _float.send(text=padded_message, sender_name=from_agent)
@@ -1056,25 +1173,61 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     # A notice (reply=no) opens nothing. A reply touches the lease it answers and
     # resizes it once. An explicit end releases it. Failures here never affect a
     # delivery that already happened.
+    # No release has been attempted yet. `None` is "not measured", not a cause;
+    # `registry-unavailable` is an outcome of the block, never its starting value.
+    lease_released = {"released": False, "reason": None}
     try:
         from . import open_threads as _open_threads
 
-        resize = int(os.getenv("MESH_LEASE_RESIZE_MINUTES", "120"))
         if reply == "end":
-            for tid in {ref, delivery_id, task_id}:
-                if tid:
-                    _open_threads.release_if_party(tid, from_agent)
+            if thread:
+                # Identity given: authoritative, and never silently widened to
+                # the three-id probe when it names somebody else's lease.
+                lease_released = _open_threads.release_if_party_status(
+                    thread, from_agent
+                )
+            else:
+                # Fallback preserved in full: a lease may be keyed by any of
+                # these ids, and narrowing it strands a live lease until expiry.
+                statuses = [
+                    _open_threads.release_if_party_status(tid, from_agent)
+                    for tid in (ref, delivery_id, task_id)
+                    if tid
+                ]
+                if any(status.get("released") for status in statuses):
+                    lease_released = {"released": True, "reason": "released"}
+                else:
+                    reasons = [status.get("reason") for status in statuses]
+                    if "registry-unavailable" in reasons:
+                        lease_released = {
+                            "released": False,
+                            "reason": "registry-unavailable",
+                        }
+                    elif "not-a-party" in reasons:
+                        lease_released = {
+                            "released": False,
+                            "reason": "not-a-party",
+                        }
+                    else:
+                        lease_released = {
+                            "released": False,
+                            "reason": "no-such-lease",
+                        }
         elif reply == "yes":
+            resize = int(os.getenv("MESH_LEASE_RESIZE_MINUTES", "120"))
             if ref:
                 _open_threads.touch(ref, resize_to=resize)
-    except Exception:  # noqa: BLE001 — bookkeeping must never break a delivery
-        pass
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never break a delivery
+        # Swallowed, but not silent: the delivery succeeded and the measured
+        # fact is that no release was confirmed.
+        lease_released = {"released": False, "reason": "registry-unavailable"}
+        logger.warning("[mesh] lease bookkeeping failed for %s: %s", task_id, exc)
     # ────────────────────────────────────────────────────────────────────────────
 
     if reply == "end":
         threads.promote(task_id)
     _meter(action, reply, agent, delivery_id or task_id, "delivered")
-    return {
+    response = {
         "task_id": task_id,
         "state": "completed",
         "status": "delivered",
@@ -1084,6 +1237,20 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         "agent": agent,
         "gateway_delivery": True,
     }
+    if reply == "end":
+        # SPEC §4.1: report the absolute path actually consulted, every time.
+        # A missing key means "we did not try"; null means "we tried and got
+        # nothing." The field stays present even when the lookup fails.
+        registry = None  # unknown, not unmentioned
+        try:
+            from . import open_threads as _open_threads
+
+            registry = _open_threads.registry_path()
+        except Exception:  # noqa: BLE001 — the fact outranks the path label
+            registry = None
+        lease_released = {**dict(lease_released), "registry": registry}
+        response["lease_released"] = lease_released
+    return response
 
 # ---------------------------------------------------------------------------
 # mesh_list / mesh_register tools

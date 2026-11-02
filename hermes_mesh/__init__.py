@@ -251,6 +251,15 @@ def register(ctx) -> None:
                         "type": "string",
                         "description": "Optional message ID being replied to (for threading)",
                     },
+                    "thread": {
+                        "type": "string",
+                        "description": (
+                            "Optional lease/thread ID being acted on — the id shown as "
+                            "[thread:<id>] or '· thread=<id>'. On reply=end this releases "
+                            "that lease. Distinct from ref, which names the message being "
+                            "answered."
+                        ),
+                    },
                     "task_id": {
                         "type": "string",
                         "description": "Optional task ID override (auto-generated if omitted)",
