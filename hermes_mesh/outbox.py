@@ -73,8 +73,15 @@ def queue_message(
     attempt: int = 0,
     ref: str | None = None,
     is_dsn: bool = False,
+    anchor: str | None = None,
 ) -> Path:
-    """Persist a failed delivery to the outbox for later retry."""
+    """Persist a failed delivery to the outbox for later retry.
+
+    ``ref`` is the thread reference a reply answers.  ``anchor`` is different:
+    it is the message id of a terminal (``reply:end``) message, carried so a
+    confirmed re-delivery can promote that pending close.  A queued terminal
+    message is not itself a close — the sender withdraws it at enqueue time.
+    """
     root = _outbox_root()
     root.mkdir(parents=True, exist_ok=True)
     try:
@@ -92,6 +99,7 @@ def queue_message(
         "next_retry": time.time(),
         "ref": ref,
         "is_dsn": is_dsn,
+        "anchor": anchor,
     }
     path = root / f"{item['id']}.json"
     with open(path, "w", encoding="utf-8") as f:
@@ -159,11 +167,16 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     # DSN items are exempt: their ref is correlation (delivery notification),
     # not reply intent — mirrors the inbound DSN exemption (B2).
     ref = item.get("ref")
+    anchor = item.get("anchor")
     if ref is not None and not item.get("is_dsn") and _threads.is_closed(ref):
         logger.warning(
             "Mesh outbox: message %s references closed thread %s; dropping",
             item.get("id"), ref,
         )
+        # This item will never be delivered, so its terminal close must not
+        # survive as a read.  withdraw() only drops a pending entry.
+        if anchor:
+            _threads.withdraw(anchor)
         return True
 
     from_agent = item["from"]
@@ -177,19 +190,45 @@ def _attempt_item(item: dict, extra: dict | None = None) -> bool:
     )
     if error:
         logger.warning("Mesh outbox: cannot resolve %s -> %s: %s", from_agent, to_agent, error)
+        if anchor:
+            _threads.withdraw(anchor)
         return False
     sign_timestamp = bool(extra and extra.get("sign_timestamp")) or _sign_timestamp_enabled()
-    delivery_id, _ = _deliver_webhook(
-        target_url,
-        envelope,
-        signing_material,
-        allow_loopback=_webhook_allow_loopback() or _is_local_url(target_url),
-        sign_timestamp=sign_timestamp,
-        sender=from_agent,
-    )
+
+    # A queued terminator is not a delivered close.  The send path withdrew it
+    # at enqueue time so the thread is open between attempts; re-record it
+    # PENDING for the duration of this attempt, exactly as the live send path
+    # does (record-before-delivery), then settle it on the actual outcome.
+    if anchor:
+        try:
+            _threads.record(anchor, closed_by=from_agent, pending=True)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Mesh outbox: failed to record pending terminal anchor %s: %s",
+                anchor, exc,
+            )
+
+    try:
+        delivery_id, _ = _deliver_webhook(
+            target_url,
+            envelope,
+            signing_material,
+            allow_loopback=_webhook_allow_loopback() or _is_local_url(target_url),
+            sign_timestamp=sign_timestamp,
+            sender=from_agent,
+        )
+    except Exception:  # noqa: BLE001 — a raised delivery must still reopen the thread
+        if anchor:
+            _threads.withdraw(anchor)
+        raise
     if delivery_id is not None:
+        # The close becomes real when the message arrives, never when queued.
+        if anchor:
+            _threads.promote(anchor)
         record_metric("send", "outbox_delivered")
         return True
+    if anchor:
+        _threads.withdraw(anchor)
     return False
 
 
@@ -244,6 +283,11 @@ def retry_outbox(
                 os.replace(path, dead_path)
             except OSError:
                 path.unlink()
+            anchor = item.get("anchor")
+            if anchor:
+                # Exhaustion is a confirmed failure: the close never landed, so
+                # nothing may stay closed.  withdraw() only drops pending state.
+                _threads.withdraw(anchor)
             record_metric("send", "outbox_dead")
             logger.warning(
                 "Mesh outbox: message %s exceeded max attempts, moved to dead letter",

@@ -987,17 +987,31 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     )
 
     if delivery_id is None:
-        # F4: surface the send-time-close asymmetry on final end-message failure.
+        # F4: surface the final end-message failure.  The close was written
+        # pending before the attempt; a failed attempt is not a close.
         if reply == "end":
             logger.warning(
-                "[mesh] terminal message %s to %s: sender-side thread closed "
-                "though delivery failed (%s) — recipient may not enforce "
-                "THREAD_CLOSED",
+                "[mesh] terminal message %s to %s: delivery failed (%s) — "
+                "withdrawing the pending close; thread stays open",
                 task_id, agent, error or "unknown",
             )
         record_metric("send", "failed")
+        # Withdraw BEFORE the outbox early return: a queued terminator is not a
+        # delivered close, and the thread must stay retryable for the whole
+        # retry window (§14.3.1).  A later re-delivery promotes it.
+        if reply == "end":
+            threads.withdraw(task_id)
         if outbox.outbox_enabled():
-            outbox.queue_message(from_agent, agent, padded_message, padded_message, ref=ref)
+            outbox.queue_message(
+                from_agent,
+                agent,
+                padded_message,
+                padded_message,
+                ref=ref,
+                # ref is the thread being answered; the anchor is this
+                # terminal message's own id.  They are not interchangeable.
+                anchor=task_id if reply == "end" else None,
+            )
             return {
                 "task_id": task_id,
                 "state": "queued",
@@ -1019,8 +1033,6 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             agent,
         )
         _meter(action, reply, agent, task_id, "failed")
-        if reply == "end":
-            threads.withdraw(task_id)
         if claim_held:
             try:
                 from . import open_threads as _open_threads
