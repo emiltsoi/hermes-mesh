@@ -1092,10 +1092,13 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
         sender=from_agent,
     )
 
-    # A terminator that never left the box released nothing. The field is still
-    # present — its absence would mean "this build has no such field" — and the
-    # null reason says no release cause was measured because none was tried.
-    release_not_attempted = {"released": False, "reason": None}
+    # A terminator that never left the box released nothing, and nothing was
+    # measured. The field is still present — its absence would mean "this build
+    # has no such field" — but its value is `None`: no outcome was reported.
+    # It must not be spelled {"released": False, "reason": None}: that says the
+    # release FAILED when none was attempted, and a fabricated failure cause is
+    # the same defect `lease_released = None` exists to delete.
+    release_not_attempted = None
 
     if delivery_id is None:
         # F4: surface the final end-message failure.  The close was written
@@ -1173,9 +1176,14 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
     # A notice (reply=no) opens nothing. A reply touches the lease it answers and
     # resizes it once. An explicit end releases it. Failures here never affect a
     # delivery that already happened.
-    # No release has been attempted yet. `None` is "not measured", not a cause;
-    # `registry-unavailable` is an outcome of the block, never its starting value.
-    lease_released = {"released": False, "reason": None}
+    # No release has been attempted yet, so no outcome exists to report: the
+    # binding is `None`. That is a DEFECT SIGNAL — "the terminator reported no
+    # outcome" — and never a fifth reason token; the four causes are the only
+    # reasons, and `registry-unavailable` is an outcome of this block, never its
+    # starting value. A default of {"released": False, "reason": None} claims a
+    # failure beside a null cause, so one early return added inside the `try`
+    # would ship a confident wrong answer to every caller.
+    lease_released = None
     try:
         from . import open_threads as _open_threads
 
@@ -1248,8 +1256,17 @@ def handle_mesh_send(args: dict | None = None, **kwargs) -> dict:
             registry = _open_threads.registry_path()
         except Exception:  # noqa: BLE001 — the fact outranks the path label
             registry = None
-        lease_released = {**dict(lease_released), "registry": registry}
-        response["lease_released"] = lease_released
+        if lease_released is None:
+            # The release block reported no outcome at all. There is no report
+            # to label with the path, and manufacturing one here — even an
+            # object carrying only `registry` — would dress an unmeasured
+            # terminator up as a measurement. `None` is itself the whole fact.
+            response["lease_released"] = None
+        else:
+            response["lease_released"] = {
+                **dict(lease_released),
+                "registry": registry,
+            }
     return response
 
 # ---------------------------------------------------------------------------

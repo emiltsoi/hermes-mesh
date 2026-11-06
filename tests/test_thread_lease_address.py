@@ -11,8 +11,13 @@ stubbed:
    (reproducer);
 5. ``lease_released`` reports one of four exact facts on every release path
    (reproducer), including the silent writable-tempdir/missing-file case;
-6. the initial ``lease_released`` binding is claimless, while a genuine
-   registry read failure still reports ``registry-unavailable`` (G2 pair).
+6. the initial ``lease_released`` binding is ``None`` (claimless), while a
+   genuine registry read failure still reports ``registry-unavailable`` (G2
+   pair);
+7. the key is absent *entirely* on every non-``end`` reply, across all four
+   registry states × reply yes/no × delivered/failed/queued (P5);
+8. an undelivered terminator reports ``None`` — no outcome — at both failure
+   arms, never ``{"released": False, ...}`` (P1/P3 on the never-attempted path).
 
 The mutation runs are in the build report, not here. These tests are named so
 each mechanism can be removed and the corresponding arm goes red.
@@ -469,7 +474,7 @@ def _default_before_release_try(**overrides):
         if frame.f_code is not handle_mesh_send.__code__:
             return None
         if event == "line" and frame.f_lineno == read_line:
-            observed["value"] = dict(frame.f_locals["lease_released"])
+            observed["value"] = frame.f_locals["lease_released"]
             return None
         return tracer
 
@@ -489,7 +494,8 @@ def test_no_claim_before_attempt_on_a_plain_reply():
 
     Nothing was requested from the registry, so the response may not report
     ``registry-unavailable``.  The initial binding must not carry that cause
-    either: one early return inside the release ``try`` would ship it as fact.
+    either, and it may not claim ``released: False`` — one early return inside
+    the release ``try`` would ship a fabricated failure as measured fact.
     """
     default, result = _default_before_release_try(
         reply="yes", message="opening a lease"
@@ -498,9 +504,10 @@ def test_no_claim_before_attempt_on_a_plain_reply():
     assert result.get("delivery") == "delivered", result
     assert "lease_released" not in result, result
     assert "registry-unavailable" not in repr(result.get("lease_released")), result
-    assert default == {"released": False, "reason": None}, (
-        "lease_released default claims a cause before any release attempt: "
-        f"{default!r}"
+    assert default is None, (
+        "the pre-attempt lease_released default must be `None` — 'no outcome "
+        "reported' — not an object that claims a release failed before one was "
+        f"attempted: {default!r}"
     )
 
 
@@ -588,3 +595,127 @@ def test_property_every_end_response_carries_lease_released(outcome):
         payload = result["lease_released"]
         assert payload["released"] is expected[0], (outcome, payload)
         assert payload["reason"] == expected[1], (outcome, payload)
+
+
+# ── P2/P5 — the key exists iff the reply is a terminator ─────────────────────
+
+# The four reason tokens, each named by the registry state that produces it.
+# The state is arranged even for a non-end reply, which never reads a lease:
+# that is exactly the claim — nothing was asked, so nothing may be reported.
+_REASON_STATES = (
+    "released",
+    "no-such-lease",
+    "not-a-party",
+    "registry-unavailable",
+)
+
+
+def _arrange(reason):
+    """Build the registry state ``reason`` names; return the send overrides.
+
+    ``reply=yes`` claims the door, and the busy gate refuses a claim when the
+    recipient is the peer of somebody else's live lease. Every case therefore
+    carries a live ``zero -> linda`` thread so the claim merges into it —
+    otherwise ``not-a-party`` would be refused before the wire and its absence
+    assertion would hold for the wrong reason.
+    """
+    if reason == "released":
+        return {"thread": _open_lease()}
+    if reason == "no-such-lease":
+        _write_registry([])
+        return {"thread": "lease-that-does-not-exist"}
+    if reason == "not-a-party":
+        _open_lease()  # gate pass only; this thread is not the one addressed
+        ot.open_thread("lease-daji-linda", "daji", "linda", lease_minutes=30)
+        return {"agent": "linda", "thread": "lease-daji-linda"}
+    # registry-unavailable: the autouse fixture names an ABSENT file inside a
+    # writable tempdir — the silent read that must never read as an empty
+    # fleet. No lease is opened here: opening one would create the very file
+    # whose absence is the state under test.
+    return {"thread": "lease-that-does-not-exist"}
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_undelivered_terminal_reports_no_outcome(queued, tmp_path, monkeypatch):
+    """P1/P3: a terminator that never left the box reports ``None``.
+
+    The release block runs only after a real delivery, so on both failure arms
+    nothing was asked of any lease and no cause was measured. ``None`` says
+    exactly that. ``{"released": False, "reason": None}`` says the release
+    FAILED — an outcome that never happened, sitting one early return away from
+    being shipped as fact.
+    """
+    with _relay():
+        if queued:
+            monkeypatch.setenv("MESH_OUTBOX_ENABLED", "1")
+            monkeypatch.setenv("MESH_OUTBOX_PATH", str(tmp_path / "outbox"))
+        with patch(
+            "hermes_mesh.session_relay._deliver_webhook",
+            return_value=(None, "wire down"),
+        ):
+            result = _send(reply="end", thread="lease-any")
+
+    assert "lease_released" in result, result
+    assert result["lease_released"] is None, (
+        "an undelivered terminator fabricated a release outcome: "
+        f"{result['lease_released']!r}"
+    )
+
+
+@pytest.mark.parametrize("reason", _REASON_STATES)
+def test_absence_matrix_states_still_report_their_reason_on_an_end(reason):
+    """The matrix's states are real: each still yields its token on ``end``.
+
+    Without this, four unrecognised environments would look like four covered
+    reasons and the absence arm would be asserting over arrangements it never
+    made.
+    """
+    with _relay():
+        result = _send(reply="end", **_arrange(reason))
+
+    payload = result.get("lease_released")
+    assert isinstance(payload, dict), (reason, result)
+    assert payload["released"] is (reason == "released"), (reason, payload)
+    assert payload["reason"] == reason, (reason, payload)
+    assert "registry" in payload, (reason, payload)
+
+
+@pytest.mark.parametrize("reason", _REASON_STATES)
+@pytest.mark.parametrize("reply", ["yes", "no"])
+@pytest.mark.parametrize("transport", ["delivered", "failed", "queued"])
+def test_property_non_end_reply_carries_no_lease_released(
+    reason, reply, transport, tmp_path, monkeypatch
+):
+    """P2: on a non-``end`` reply the key is absent *entirely*.
+
+    Nothing was asked of any lease, so there is neither a report to carry nor a
+    ``None`` to stand for a missing one. This is the direction a happy-path
+    read cannot see — the assignments are already gated, so the only way the
+    key appears is a gate that stopped gating. Hence the mutant in the report.
+    """
+    with _relay():
+        overrides = _arrange(reason)
+        if transport == "queued":
+            monkeypatch.setenv("MESH_OUTBOX_ENABLED", "1")
+            monkeypatch.setenv("MESH_OUTBOX_PATH", str(tmp_path / "outbox"))
+        if transport == "delivered":
+            result = _send(reply=reply, **overrides)
+        else:
+            with patch(
+                "hermes_mesh.session_relay._deliver_webhook",
+                return_value=(None, "wire down"),
+            ):
+                result = _send(reply=reply, **overrides)
+
+    label = f"reason={reason} reply={reply} transport={transport}"
+    # The case must be a real send response — never a refusal or a validation
+    # error, which carry no lease_released for reasons of their own.
+    if transport == "delivered":
+        assert result.get("delivery") == "delivered", (label, result)
+    elif transport == "failed":
+        assert "failed after" in str(result.get("error")), (label, result)
+    else:
+        assert result.get("status") == "queued for outbox retry", (label, result)
+    assert "lease_released" not in result, (
+        f"{label}: lease_released present on a non-end reply: {result!r}"
+    )
