@@ -8,10 +8,77 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["register"]
+
+#: The three fields a provisioned ``BUILD`` carries. Nothing else is read.
+_BUILD_FIELDS = ("sha", "describe", "installed_at")
+
+
+def read_build_stamp() -> dict:
+    """What this package was installed from, read from ``BUILD`` beside this file.
+
+    **Returns exactly ``{"present": False}`` when the file is absent — never a
+    placeholder sha.** A fabricated value is worse than a missing one: it turns
+    "I don't know" into a confident wrong answer, which is the whole reason this
+    wave exists.
+
+    **Read on every call, never cached.** ``BUILD`` is a file the deploy step
+    rewrites; caching the first answer would make the process report what it read
+    at boot rather than what is installed now, and a stamp that cannot be re-asked
+    is a stamp that cannot be trusted twice.
+
+    ``__file__`` is resolved at CALL time from the module global, not captured at
+    import time, so a test can point this at a fixture directory.
+    """
+    stamp = Path(__file__).parent / "BUILD"
+    try:
+        if not stamp.is_file():
+            return {"present": False}
+        text = stamp.read_text(encoding="utf-8")
+    except OSError:
+        return {"present": False}
+
+    fields = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key in _BUILD_FIELDS:
+            fields[key] = value.strip()
+
+    # No sha means we do not know what this is. Say so rather than guess.
+    sha = fields.get("sha", "")
+    if not sha:
+        return {"present": False}
+
+    return {
+        "present": True,
+        "sha": sha,
+        "describe": fields.get("describe", ""),
+        "installed_at": fields.get("installed_at", ""),
+    }
+
+
+def _mesh_health_with_build(args=None, **kwargs) -> dict:
+    """``mesh_health`` plus what this process is running.
+
+    Wrapped here rather than edited into the handler because the wave's declared
+    modified set is ``hermes_mesh/__init__.py`` alone — a change to
+    ``session_relay.py`` would fail the content assertion in the spec's §3.
+    """
+    from .session_relay import handle_mesh_health
+
+    result = handle_mesh_health(args, **kwargs)
+    if isinstance(result, dict):
+        result = dict(result)
+        result["build"] = read_build_stamp()
+    return result
+
 
 
 def validate_config(config) -> bool:
@@ -163,7 +230,7 @@ def register(ctx) -> None:
                 "properties": {},
             },
         },
-        handler=_json_dump_handler(handle_mesh_health),
+        handler=_json_dump_handler(_mesh_health_with_build),
     )
 
     ctx.register_tool(
