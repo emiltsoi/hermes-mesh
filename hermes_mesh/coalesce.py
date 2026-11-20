@@ -95,21 +95,36 @@ class Coalescer:
         return os.path.join(arch_dir, f"{safe}.jsonl")
 
     def _migrate_legacy_archives(self) -> None:
-        """Sweep pre-``.delivered/`` archives out of the pending directory, once, at construction.
+        """Sweep pre-``.delivered/`` archives out of the pending directory — exactly once.
 
         An earlier revision kept delivered batches beside the queues as ``<peer>.delivered.jsonl``.
         ``peers()`` must not name-filter that suffix — ``foo.delivered`` is a valid sender — so a
         leftover archive would be listed as a pending queue, re-digested once under a fabricated
         sender name, then cleared. Moving it under ``.delivered/`` is the only safe answer.
-        Best-effort and idempotent: a file that will not move is logged and left behind, and
-        construction never raises because of it.
+
+        The sweep runs once, on the construction that upgrades a root to the ``.delivered/``
+        layout, and the ``.delivered/.migrated`` marker is what keeps that layout unambiguous
+        afterwards: the suffix alone cannot tell a leftover archive from the live pending queue
+        of a peer literally named ``foo.delivered``, so past this one pass nothing at the root is
+        ever moved by name again. The marker is written BEFORE the sweep — if it cannot be
+        written the sweep must not run at all, or the next construction would find no marker and
+        sweep again, possibly destroying a live queue planted in between; a stranded legacy file
+        is always safer than moved mail that was not legacy. Best-effort throughout: an OSError
+        anywhere logs a warning and construction never raises.
         """
         suffix = ".delivered.jsonl"
+        arch_dir = os.path.join(self.root, ".delivered")
+        marker = os.path.join(arch_dir, ".migrated")
         try:
+            if os.path.exists(marker):
+                return
+            os.makedirs(arch_dir, exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write("one-shot legacy-archive sweep done\n")
             names = os.listdir(self.root)
         except OSError as exc:
             logger.warning(
-                "[mesh] coalesce: cannot scan %s for legacy archives (%s)", self.root, exc
+                "[mesh] coalesce: cannot run legacy archive sweep in %s (%s)", self.root, exc
             )
             return
         for name in sorted(names):
@@ -117,8 +132,6 @@ class Coalescer:
             if not name.endswith(suffix) or not os.path.isfile(src):
                 continue
             try:
-                arch_dir = os.path.join(self.root, ".delivered")
-                os.makedirs(arch_dir, exist_ok=True)
                 os.replace(src, os.path.join(arch_dir, name[: -len(suffix)] + ".jsonl"))
             except OSError as exc:
                 logger.warning(
