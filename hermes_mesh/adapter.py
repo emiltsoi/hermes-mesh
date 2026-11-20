@@ -276,12 +276,17 @@ class MeshAdapter(BasePlatformAdapter):
         self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue(maxsize=256)
         # Inbound coalescing (opt-in): informational mesh waits on disk and arrives as ONE turn;
         # anything that asks for action is never delayed and flushes its peer's digest first.
+        # The default root is per-agent: every gateway runs as the same user, so a shared
+        # ~/.hermes/mesh-pending keyed only by peer name would let a second seat read and flush
+        # the first seat's queues. An explicit coalesce.dir still wins, verbatim.
         _coal = config.extra.get("coalesce") or {}
         self._coalesce_enabled = bool(_coal.get("enabled", False))
         self._coalesce = (
             Coalescer(
                 root=_coal.get("dir")
-                or os.path.join(os.path.expanduser("~"), ".hermes", "mesh-pending"),
+                or os.path.join(
+                    os.path.expanduser("~"), ".hermes", "mesh-pending", self._agent_name
+                ),
                 window_seconds=float(_coal.get("window_seconds", 600)),
                 max_items=int(_coal.get("max_items", 25)),
                 preview_chars=int(_coal.get("preview_chars", 700)),
@@ -291,8 +296,13 @@ class MeshAdapter(BasePlatformAdapter):
         )
         self._mesh_processor: Optional[asyncio.Task] = None
         self._coalesce_flusher: Optional[asyncio.Task] = None
+        # Set by disconnect() before anything is cancelled, cleared by connect(): no producer
+        # may mint a digest while the adapter is closing (the urgent path outlives the flusher).
+        self._closing: bool = False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # A reconnect reopens the flush path that disconnect() closed.
+        self._closing = False
         if not AIOHTTP_AVAILABLE:
             logger.error("[mesh] aiohttp is not installed")
             return False
@@ -357,9 +367,13 @@ class MeshAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        # FIRST, before the inbox sentinel: a digest flushed while the processor is draining lands
-        # behind the None and is consumed only on a later reconnect -- and its items were already
-        # taken from disk. Stopping the flusher first means nothing new is produced during shutdown.
+        # FIRST, before the inbox sentinel or any cancellation: closing is a state, not just a
+        # task being gone. A digest flushed while the processor is draining lands behind the
+        # None and is consumed only on a later reconnect -- and its items were already taken
+        # from disk. Cancelling the flusher alone is not enough, because aiohttp keeps serving
+        # requests until the runner is cleaned up and the urgent path can still reach
+        # _flush_coalesced; the flag makes every producer refuse during shutdown.
+        self._closing = True
         await self._cancel_coalesce_flusher()
         if self._mesh_processor:
             try:
@@ -990,6 +1004,12 @@ class MeshAdapter(BasePlatformAdapter):
     def _flush_coalesced(self, peer: str) -> None:
         """Build one digest turn from a peer's pending items and enqueue it."""
         if self._coalesce is None:
+            return
+        # One guard covers both producers — the 30s flush loop and the urgent path in
+        # _handle_mesh: disconnect() can cancel the flusher task but not aiohttp's in-flight
+        # requests, and a digest minted during shutdown strands behind the inbox sentinel.
+        # getattr rather than self._closing: probes exercise this method on a stub self.
+        if getattr(self, "_closing", False):
             return
         body, taken = self._coalesce.build_digest(peer)
         if not body or not taken:

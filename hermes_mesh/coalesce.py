@@ -60,6 +60,7 @@ class Coalescer:
         self.max_items = int(max_items)
         self.preview_chars = int(preview_chars)
         os.makedirs(self.root, exist_ok=True)
+        self._migrate_legacy_archives()
 
     # -- storage ---------------------------------------------------------
     def _stem(self, peer: str) -> str:
@@ -92,6 +93,37 @@ class Coalescer:
         arch_dir = os.path.join(self.root, ".delivered")
         os.makedirs(arch_dir, exist_ok=True)
         return os.path.join(arch_dir, f"{safe}.jsonl")
+
+    def _migrate_legacy_archives(self) -> None:
+        """Sweep pre-``.delivered/`` archives out of the pending directory, once, at construction.
+
+        An earlier revision kept delivered batches beside the queues as ``<peer>.delivered.jsonl``.
+        ``peers()`` must not name-filter that suffix — ``foo.delivered`` is a valid sender — so a
+        leftover archive would be listed as a pending queue, re-digested once under a fabricated
+        sender name, then cleared. Moving it under ``.delivered/`` is the only safe answer.
+        Best-effort and idempotent: a file that will not move is logged and left behind, and
+        construction never raises because of it.
+        """
+        suffix = ".delivered.jsonl"
+        try:
+            names = os.listdir(self.root)
+        except OSError as exc:
+            logger.warning(
+                "[mesh] coalesce: cannot scan %s for legacy archives (%s)", self.root, exc
+            )
+            return
+        for name in sorted(names):
+            src = os.path.join(self.root, name)
+            if not name.endswith(suffix) or not os.path.isfile(src):
+                continue
+            try:
+                arch_dir = os.path.join(self.root, ".delivered")
+                os.makedirs(arch_dir, exist_ok=True)
+                os.replace(src, os.path.join(arch_dir, name[: -len(suffix)] + ".jsonl"))
+            except OSError as exc:
+                logger.warning(
+                    "[mesh] coalesce: could not migrate legacy archive %s (%s)", name, exc
+                )
 
     def _pending_lines(self, peer: str) -> list[str]:
         """Raw non-blank lines of the peer's pending file, malformed rows included."""

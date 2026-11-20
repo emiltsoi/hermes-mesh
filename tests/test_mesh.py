@@ -1176,6 +1176,49 @@ class TestAdapterCoalesce:
             ids.add(adapter._mesh_inbox.get_nowait().message_id)
         assert len(ids) == 2
 
+    def test_closing_adapter_never_flushes(self, tmp_path):
+        """BROKEN from the third review: disconnect() cancels the flusher first, but aiohttp
+        keeps serving requests until the runner is cleaned up — so the urgent path can still
+        mint a digest during shutdown, and that digest lands behind the inbox's None sentinel:
+        stranded, its items already taken from disk. The guard lives inside _flush_coalesced
+        so one check covers both producers, the loop and the urgent path."""
+        adapter = self._make_adapter(tmp_path)
+        adapter._coalesce.add("kore", {"id": "k1", "action": "info", "reply": "no", "body": "held"})
+        adapter._closing = True                                   # disconnect() has begun
+        adapter._flush_coalesced("kore")
+        assert adapter._mesh_inbox.qsize() == 0                    # nothing behind the sentinel
+        assert [i["id"] for i in adapter._coalesce.pending("kore")] == ["k1"]   # still on disk
+
+    def test_default_coalesce_root_is_per_agent(self, tmp_path, monkeypatch):
+        """MAJOR from the third review: ~/.hermes/mesh-pending is keyed only by peer name and
+        every gateway runs as the same user — a second seat enabling coalescing would read and
+        flush the first seat's queues. The default root must carry the agent name."""
+        monkeypatch.setenv("HOME", str(tmp_path))    # keep the real home out of the test
+        adapter = MeshAdapter(
+            PlatformConfig(
+                extra={
+                    "secret": "INSECURE_NO_AUTH",
+                    "agent_name": "ada",
+                    "target_session": "telegram:dm:123",
+                    "coalesce": {"enabled": True},
+                }
+            )
+        )
+        assert adapter._coalesce.root.endswith(os.path.join("mesh-pending", "ada"))
+
+    def test_explicit_coalesce_dir_is_used_verbatim(self, tmp_path):
+        """MAJOR from the third review: a configured coalesce.dir wins over the per-agent
+        default — the root is the configured path unchanged, and it is the directory the
+        Coalescer actually operates on."""
+        pending = tmp_path / "pending"
+        pending.mkdir()
+        (pending / "kore.delivered.jsonl").write_text(
+            json.dumps({"id": "old1", "body": "archived"}) + "\n", encoding="utf-8"
+        )
+        adapter = self._make_adapter(tmp_path)
+        assert adapter._coalesce.root == str(pending)          # no agent suffix, no defaulting
+        assert "kore.delivered" not in adapter._coalesce.peers()   # the dir is really in use
+
 
 class TestMeshAdapterLifecycle:
     """MeshAdapter send/connect behavior."""
