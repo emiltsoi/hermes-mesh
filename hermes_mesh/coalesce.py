@@ -24,6 +24,7 @@ read in full.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -69,10 +70,16 @@ class Coalescer:
         one attribution, and hashing only the names it mangled still lets a legal name land on a
         mangled one (``a b`` and ``a_b.<that-hash>`` shared a queue). Percent-encoding the RAW
         name is injective instead: every name maps to exactly one stem and unquote() recovers it,
-        so no two senders can ever share a pending file. Unreserved characters stay readable —
-        ``kore`` stays ``kore.jsonl`` — and ``peers()`` decodes each stem back to the true name.
+        so no two senders can ever share a pending file.
+
+        Injective per BYTE, that is — filesystems fold case, and on a case-insensitive host
+        ``kore`` and ``Kore`` quote differently yet still land on one file. A short sha1 of the
+        RAW name is appended unconditionally, so stems that fold together still differ in their
+        suffix. Unreserved characters stay readable — ``kore`` stays ``kore.<hash>.jsonl`` — and
+        ``peers()`` strips the suffix and unquotes back to the true name.
         """
-        return quote(peer, safe="")
+        digest = hashlib.sha1(peer.encode("utf-8")).hexdigest()[:8]
+        return f"{quote(peer, safe='')}.{digest}"
 
     def _path(self, peer: str) -> str:
         return os.path.join(self.root, f"{self._stem(peer)}.jsonl")
@@ -121,10 +128,16 @@ class Coalescer:
             # Archives live in the `.delivered/` subdirectory, so every `*.jsonl` beside the queues is
             # a pending queue. There must be NO name-based exclusion here: `foo.delivered` is a valid
             # sender, and filtering its suffix would hide its pending mail from every flush forever.
-            # Stems are percent-encoded; unquote hands the caller back the true peer name so the
-            # flush loop resolves the same file again.
+            # Stems are percent-encoded and carry a trailing `.<8 hex of sha1(raw name)>` —
+            # strip the suffix, then unquote hands the caller back the true peer name so the
+            # flush loop resolves the same file again. A stem whose tail is not a hash suffix
+            # (a queue written by an older layout) keeps it — the decode stays lossless.
             if name.endswith(".jsonl") and os.path.isfile(os.path.join(self.root, name)):
-                out.append(unquote(name[: -len(".jsonl")]))
+                stem = name[: -len(".jsonl")]
+                base, dot, suffix = stem.rpartition(".")
+                if dot and len(suffix) == 8 and all(c in "0123456789abcdef" for c in suffix):
+                    stem = base
+                out.append(unquote(stem))
         return out
 
     def add(self, peer: str, item: dict) -> int:
@@ -132,20 +145,35 @@ class Coalescer:
         item = dict(item)
         item.setdefault("received_at", time.time())
         path = self._path(peer)
-        # A crash mid-append leaves a torn final line, and concatenating the next append onto
-        # it corrupts BOTH lines — pending() then skips them forever. The fragment is already
-        # unrecoverable, so truncate back to the last newline rather than lose the new message
-        # with it. Best-effort: a fault here must never refuse the append itself.
+        # A crash mid-append leaves a final line without its newline, and concatenating the
+        # next append onto it corrupts BOTH lines — pending() then skips them forever. But
+        # truncation is only right for a genuinely torn write: a write can flush the whole row
+        # and die before the newline, and that fragment is good mail. Parse the tail after the
+        # last newline — if it is complete JSON keep it and just mend the line end; only an
+        # unparseable fragment is truncated away. Best-effort: a fault here must never refuse
+        # the append itself.
         try:
             if os.path.getsize(path):
                 with open(path, "rb+") as fh:
                     fh.seek(-1, os.SEEK_END)
                     if fh.read(1) != b"\n":
                         fh.seek(0)
-                        fh.truncate(fh.read().rfind(b"\n") + 1)
-                        logger.warning(
-                            "[mesh] coalesce: dropped torn final line in %s", path
-                        )
+                        data = fh.read()
+                        cut = data.rfind(b"\n") + 1
+                        try:
+                            json.loads(data[cut:].decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            fh.truncate(cut)
+                            logger.warning(
+                                "[mesh] coalesce: dropped torn final line in %s", path
+                            )
+                        else:
+                            fh.seek(0, os.SEEK_END)
+                            fh.write(b"\n")
+                            logger.warning(
+                                "[mesh] coalesce: kept intact final row missing its newline in %s",
+                                path,
+                            )
         except OSError:
             pass
         with open(path, "a", encoding="utf-8") as fh:
@@ -170,15 +198,22 @@ class Coalescer:
 
         Never raises: a file that cannot be read, or an oldest row whose ``received_at`` is not a
         number, skips that one peer with a warning. Letting it raise would abort the scan for every
-        peer after it in listdir order, every flush cycle, forever.
+        peer after it in listdir order, every flush cycle, forever. A stamp that is a number too
+        big for float is not corrupt mail though — it degrades to 0, instantly due, rather than
+        starving the peer forever.
         """
         now = time.time() if now is None else now
         out = []
         for peer in self.peers():
             try:
                 items = self.pending(peer)
-                if items and (now - float(items[0].get("received_at", now))) >= self.window_seconds:
-                    out.append(peer)
+                if items:
+                    try:
+                        oldest = float(items[0].get("received_at", now))
+                    except OverflowError:
+                        oldest = 0.0
+                    if (now - oldest) >= self.window_seconds:
+                        out.append(peer)
             except Exception as exc:
                 logger.warning("[mesh] coalesce: skipping peer %s during due() scan (%s)", peer, exc)
         return out
@@ -193,7 +228,7 @@ class Coalescer:
         hours = ""
         try:
             span = float(taken[-1].get("received_at")) - float(taken[0].get("received_at"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             span = 0.0
         if span >= 3600:
             hours = f" over {span / 3600:.1f}h"
@@ -228,9 +263,9 @@ class Coalescer:
     def take(self, peer: str, count: int) -> None:
         """Remove the first `count` items, rewriting what remains.
 
-        The delivered batch is written to ``<peer>.delivered.jsonl`` first, so the path a digest
-        names still holds the full text after the digest has been enqueued. Without this the
-        footer pointed at a file the same call had just deleted.
+        The delivered batch is written to the ``.delivered/`` archive first, so the path a
+        digest names still holds the full text after the digest has been enqueued. Without
+        this the footer pointed at a file the same call had just deleted.
 
         The rewrite carries raw lines, not re-parsed rows: `count` indexes parsed items, and a
         line that does not parse is neither taken nor counted — it is written back verbatim so a
@@ -287,60 +322,3 @@ class Coalescer:
             for line in lines:
                 fh.write(line + "\n")
         os.replace(tmp, self._path(peer))
-
-
-def migrate_legacy_archives(root: str) -> int:
-    """Sweep pre-``.delivered/`` archives out of the pending directory — run ONCE, before
-    enabling, when upgrading from the old layout. Returns the number of files moved.
-
-    An earlier revision kept delivered batches beside the queues as ``<peer>.delivered.jsonl``.
-    ``peers()`` must not name-filter that suffix — ``foo.delivered`` is a valid sender — so a
-    leftover archive would be listed as a pending queue and re-digested once under a fabricated
-    sender name. That same ambiguity is why this is a deliberate one-shot and never runs at
-    construction: the suffix cannot tell a genuine leftover archive from the live pending
-    queue of a peer literally named ``foo.delivered``, so nothing is moved unless an operator
-    asked for it on a root known to predate the ``.delivered/`` layout.
-
-    The ``.migration-complete`` marker lives at the ROOT, not inside ``.delivered/`` — purging
-    the archive directory must not silently re-arm the sweep. It is written only after a sweep
-    in which every move succeeded, so a failed ``os.replace`` is retried on the next deliberate
-    run rather than permanently disarmed. Best-effort throughout: an OSError anywhere logs a
-    warning and the call never raises.
-    """
-    suffix = ".delivered.jsonl"
-    arch_dir = os.path.join(root, ".delivered")
-    marker = os.path.join(root, ".migration-complete")
-    try:
-        if os.path.exists(marker):
-            return 0
-        names = os.listdir(root)
-    except OSError as exc:
-        logger.warning(
-            "[mesh] coalesce: cannot run legacy archive sweep in %s (%s)", root, exc
-        )
-        return 0
-    moved = 0
-    failed = False
-    for name in sorted(names):
-        src = os.path.join(root, name)
-        if not name.endswith(suffix) or not os.path.isfile(src):
-            continue
-        try:
-            os.makedirs(arch_dir, exist_ok=True)
-            os.replace(src, os.path.join(arch_dir, name[: -len(suffix)] + ".jsonl"))
-            moved += 1
-        except OSError as exc:
-            failed = True
-            logger.warning(
-                "[mesh] coalesce: could not migrate legacy archive %s (%s)", name, exc
-            )
-    if failed:
-        return moved
-    try:
-        with open(marker, "w", encoding="utf-8") as fh:
-            fh.write("one-shot legacy-archive sweep done\n")
-    except OSError as exc:
-        logger.warning(
-            "[mesh] coalesce: could not write migration marker in %s (%s)", root, exc
-        )
-    return moved

@@ -396,7 +396,7 @@ class MeshAdapter(BasePlatformAdapter):
         # where the next boot's flush finds it. Ordinary queued events are in-memory mail the
         # sender retries after a 503 — a discarded digest has no retry path at all.
         if self._coalesce is not None:
-            restored = 0
+            stranded = []
             while True:
                 try:
                     queued = self._mesh_inbox.get_nowait()
@@ -404,9 +404,12 @@ class MeshAdapter(BasePlatformAdapter):
                     break
                 self._mesh_inbox.task_done()
                 batch = getattr(queued, "_coalesced_batch", None)
-                if batch is None:
-                    continue
-                peer, taken = batch
+                if batch is not None:
+                    stranded.append(batch)
+            # restore() PREPENDS each batch, so the drained order must be replayed backwards
+            # or a peer's stranded digests come back newest-first.
+            restored = 0
+            for peer, taken in reversed(stranded):
                 try:
                     self._coalesce.restore(peer, taken)
                     restored += 1
@@ -1034,13 +1037,49 @@ class MeshAdapter(BasePlatformAdapter):
                 await _task
             except asyncio.CancelledError:
                 # Distinguish "this per-message task was cancelled" from
-                # "the processor loop itself is being torn down".
+                # "the processor loop itself is being torn down". Either way the
+                # event's turn is aborted — and a digest's items were already
+                # taken off disk, so it goes back or it is lost mail.
+                self._restore_coalesced_event(event)
                 if not _task.cancelled():
                     break
             except Exception:
                 logger.exception("[mesh] Failed to process queued message")
             finally:
                 self._mesh_inbox.task_done()
+            # Cancelling THIS task does not always surface at the await above:
+            # _process_mesh_event absorbs its own cancellation, so the await can
+            # return cleanly while the loop is being torn down. The only reliable
+            # teardown signal is the loop task's own cancel count — without this
+            # check the absorbed cancel leaves disconnect() waiting on a live
+            # task, and the in-flight digest is consumed but never delivered.
+            task = asyncio.current_task()
+            if task is not None and getattr(task, "cancelling", lambda: 0)():
+                self._restore_coalesced_event(event)
+                break
+
+    def _restore_coalesced_event(self, event) -> None:
+        """Put a dequeued-but-undelivered digest's items back on disk. Never raises.
+
+        disconnect() only rescues digests still queued in the inbox — an event
+        already consumed by the processor has no second chance unless the loop
+        itself puts it back. The tag is consumed on use, so the same event can
+        never be restored twice.
+        """
+        if self._coalesce is None:
+            return
+        batch = getattr(event, "_coalesced_batch", None)
+        if batch is None:
+            return
+        event._coalesced_batch = None
+        peer, taken = batch
+        try:
+            self._coalesce.restore(peer, taken)
+        except OSError as exc:
+            logger.warning(
+                "[mesh] coalesce: could not restore stranded digest for %s (%s)",
+                peer, exc,
+            )
 
     def _flush_coalesced(self, peer: str) -> None:
         """Build one digest turn from a peer's pending items and enqueue it."""
