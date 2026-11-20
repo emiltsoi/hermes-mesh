@@ -34,6 +34,7 @@ except ImportError:
 from . import float as _float
 from . import outbox as _outbox
 from . import threads as _threads
+from .coalesce import Coalescer, _urgent
 from .identity import get_raw_agent_identity
 from .common import MESH_DSN_HEADER, MESH_DSN_VALUE
 from .session_relay import _dsn_enabled, _send_delivery_error, _validate_agent_name
@@ -273,6 +274,21 @@ class MeshAdapter(BasePlatformAdapter):
         self._sender_rate_buckets: Dict[str, tuple[int, float]] = {}
         self._dsn_rate_buckets: Dict[str, tuple[int, float]] = {}
         self._mesh_inbox: "asyncio.Queue[Optional[MessageEvent]]" = asyncio.Queue(maxsize=256)
+        # Inbound coalescing (opt-in): informational mesh waits on disk and arrives as ONE turn;
+        # anything that asks for action is never delayed and flushes its peer's digest first.
+        _coal = config.extra.get("coalesce") or {}
+        self._coalesce_enabled = bool(_coal.get("enabled", False))
+        self._coalesce = (
+            Coalescer(
+                root=_coal.get("dir")
+                or os.path.join(os.path.expanduser("~"), ".hermes", "mesh-pending"),
+                window_seconds=float(_coal.get("window_seconds", 600)),
+                max_items=int(_coal.get("max_items", 25)),
+                preview_chars=int(_coal.get("preview_chars", 700)),
+            )
+            if self._coalesce_enabled
+            else None
+        )
         self._mesh_processor: Optional[asyncio.Task] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -324,6 +340,11 @@ class MeshAdapter(BasePlatformAdapter):
         self._mark_connected()
         self._mesh_processor = asyncio.create_task(self._mesh_processor_loop())
         self._outbox_reaper = asyncio.create_task(self._outbox_reaper_loop())
+        self._coalesce_flusher = (
+            asyncio.create_task(self._coalesce_flush_loop())
+            if self._coalesce is not None
+            else None
+        )
         logger.info(
             "[mesh] Listening on %s:%d — agent '%s'",
             self._host or "* (all interfaces, IPv4+IPv6)",
@@ -499,6 +520,40 @@ class MeshAdapter(BasePlatformAdapter):
             reply,
             msg_id,
         )
+
+        # Coalescing happens BEFORE the inbox: informational traffic is stored, not turned.
+        if self._coalesce is not None and not _urgent(action, reply):
+            try:
+                held = self._coalesce.add(
+                    sender,
+                    {
+                        "id": msg_id,
+                        "action": action,
+                        "reply": reply,
+                        "body": body_text,
+                        "session": parsed.get("session"),
+                        "from_session": parsed.get("from_session"),
+                        "received_at": time.time(),
+                    },
+                )
+                self._seen_message_ids[msg_id] = time.time()
+                self._expire_seen_messages()
+                record_metric("receive", "coalesced")
+                logger.info(
+                    "[mesh] coalesced from=%s id=%s pending=%d (delivered as one turn after %.0fs of quiet)",
+                    sender, msg_id, held, self._coalesce.window_seconds,
+                )
+                return web.json_response(
+                    {"status": "accepted", "delivery_id": msg_id, "coalesced": True, "pending": held},
+                    status=202,
+                )
+            except OSError as exc:
+                # Never lose a message to a full disk: fall through and deliver it normally.
+                logger.warning("[mesh] coalesce store failed (%s); delivering %s directly", exc, msg_id)
+
+        # An urgent envelope flushes its peer's digest first, so the older material lands first.
+        if self._coalesce is not None and _urgent(action, reply):
+            self._flush_coalesced(sender)
 
         try:
             self._mesh_inbox.put_nowait(event)
@@ -905,6 +960,41 @@ class MeshAdapter(BasePlatformAdapter):
                 logger.exception("[mesh] Failed to process queued message")
             finally:
                 self._mesh_inbox.task_done()
+
+    def _flush_coalesced(self, peer: str) -> None:
+        """Build one digest turn from a peer's pending items and enqueue it."""
+        if self._coalesce is None:
+            return
+        body, taken = self._coalesce.build_digest(peer)
+        if not body or not taken:
+            return
+        event, err = self._build_event(
+            {}, peer, self._agent_name, f"digest-{int(time.time())}", "info", "no", None, body,
+        )
+        if err or event is None:
+            logger.warning("[mesh] coalesce: could not build digest event for %s", peer)
+            return
+        self._coalesce.take(peer, len(taken))
+        try:
+            self._mesh_inbox.put_nowait(event)
+            record_metric("receive", "digest")
+            logger.info("[mesh] digest from=%s items=%d -> one turn", peer, len(taken))
+        except asyncio.QueueFull:
+            logger.warning("[mesh] coalesce: inbox full, digest for %s stays on disk", peer)
+
+    async def _coalesce_flush_loop(self) -> None:
+        """Flush peers whose oldest pending item has waited past the window."""
+        while True:
+            try:
+                await asyncio.sleep(30)
+                if self._coalesce is None:
+                    continue
+                for peer in self._coalesce.due():
+                    self._flush_coalesced(peer)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[mesh] coalesce flush loop error")
 
     async def _outbox_reaper_loop(self) -> None:
         """Periodically retry messages from the on-disk outbox."""
