@@ -4,9 +4,10 @@ Delivery contract when coalescing is enabled (coalesce.enabled): AT-LEAST-ONCE, 
 at-most-once. The digest is enqueued before its pending rows are taken, so a full inbox leaves
 the mail on disk, and a failed take() after a successful enqueue re-delivers the batch on the
 next flush. Duplicates are visible to the receiver; losses are silent — that asymmetry decides
-every ordering question in this file. Teardown restores an undelivered batch, using the loop
-task's own cancel count (`Task.cancelling`), which requires Python >= 3.11; on 3.10 that one
-absorbed-cancel edge does not restore. The fleet runs 3.14.
+every ordering question in this file. Teardown restores an undelivered batch by consulting the loop
+task's own cancel count (`Task.cancelling`), which is a 3.11 API: on 3.10 the fallback reads 0, so an
+absorbed cancel leaves the already-taken digest UNRESTORED and, if the sentinel could not be queued,
+the loop blocks at get() forever. requires-python is therefore >=3.11 by correctness, not conservatism.
     
 Runs an aiohttp HTTP server that receives one-way mesh pings from other
 Hermes fleet agents, validates Ed25519 signatures, parses the mesh
