@@ -391,6 +391,34 @@ class MeshAdapter(BasePlatformAdapter):
                 except asyncio.CancelledError:
                     pass
             self._mesh_processor = None
+        # A digest still queued when the processor exits is the one loss this feature must
+        # never have: take() already deleted its pending rows, so its batch goes back on disk
+        # where the next boot's flush finds it. Ordinary queued events are in-memory mail the
+        # sender retries after a 503 — a discarded digest has no retry path at all.
+        if self._coalesce is not None:
+            restored = 0
+            while True:
+                try:
+                    queued = self._mesh_inbox.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._mesh_inbox.task_done()
+                batch = getattr(queued, "_coalesced_batch", None)
+                if batch is None:
+                    continue
+                peer, taken = batch
+                try:
+                    self._coalesce.restore(peer, taken)
+                    restored += 1
+                except OSError as exc:
+                    logger.warning(
+                        "[mesh] coalesce: could not restore stranded digest for %s (%s)",
+                        peer, exc,
+                    )
+            if restored:
+                logger.info(
+                    "[mesh] restored %d stranded digest(s) to disk on disconnect", restored
+                )
         if self._outbox_reaper:
             self._outbox_reaper.cancel()
             try:
@@ -551,6 +579,19 @@ class MeshAdapter(BasePlatformAdapter):
             reply,
             msg_id,
         )
+
+        # Closing is a state, not a dead task: aiohttp keeps serving requests until the runner
+        # is cleaned up, so a message accepted after the inbox sentinel exists only in memory
+        # and dies with the process. Refuse instead of storing or enqueueing — a 503 puts the
+        # message back on the sender's retry path where a retry can actually redeliver it.
+        if self._closing:
+            logger.warning(
+                "[mesh] rejecting %s from %s — adapter is shutting down", msg_id, sender
+            )
+            return web.json_response(
+                {"status": "shutting down", "delivery_id": msg_id},
+                status=503,
+            )
 
         # Coalescing happens BEFORE the inbox: informational traffic is stored, not turned.
         if self._coalesce is not None and not _urgent(action, reply):
@@ -1024,6 +1065,10 @@ class MeshAdapter(BasePlatformAdapter):
         if err or event is None:
             logger.warning("[mesh] coalesce: could not build digest event for %s", peer)
             return
+        # disconnect() must be able to find this batch again: the event carries its peer and
+        # items so a digest still queued at shutdown goes back on disk instead of dying in
+        # memory. take() has not run yet here — the tag is inert bookkeeping until it has.
+        event._coalesced_batch = (peer, taken)
         # ENQUEUE FIRST, then take. If the inbox is full this digest must stay on disk; taking
         # before enqueueing deletes the only copy of messages whose digest was then dropped, which
         # is the one failure this feature must never have. A failed take() after a successful

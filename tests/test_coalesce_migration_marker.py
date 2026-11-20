@@ -1,16 +1,22 @@
-"""The legacy-archive sweep is one-shot — disarmed by `.delivered/.migrated`.
+"""The legacy-archive sweep is a deliberate one-shot — never automatic.
 
 CRITICAL from the fourth review: `_migrate_legacy_archives()` swept every root-level
 `*.delivered.jsonl` on EVERY construction, but `foo.delivered` is a valid sender whose live
-pending queue is exactly `foo.delivered.jsonl` — so a second construction moved the queue into
-the archive dir, `peers()` lost the peer, and the peer's next flush overwrote the file. The
-suffix cannot distinguish a legacy archive from a live queue, so the sweep runs once, on the
-upgrade that introduces `.delivered/`, and the marker is what makes the layout unambiguous
-after that.
+pending queue is exactly `foo.delivered.jsonl`. The marker stopped later runs — but not the
+FIRST construction, which still swept a live queue into the archive dir, hid the peer from
+`peers()`, and let its next flush overwrite the file. The suffix cannot distinguish a legacy
+archive from a live queue, so construction now moves nothing at all: the sweep only runs when
+an operator calls `migrate_legacy_archives(root)` on a root known to predate `.delivered/`.
+
+MAJOR from the fifth review: the marker lived inside `.delivered/` — purgeable — and was
+written before a best-effort sweep, so `rm -rf .delivered` re-armed the migration while one
+failed `os.replace` disarmed it forever. The marker now sits at the root as
+`.migration-complete` and is written only when every move succeeded.
 """
 import importlib.util
 import json
 import os
+import shutil
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,48 +29,62 @@ def _module():
     return mod
 
 
-def test_live_queue_named_like_a_legacy_archive_survives_reconstruction(tmp_path):
-    """T1: `foo.delivered` is a valid sender, and its pending queue is exactly the name the
-    legacy sweep looks for. The first construction may sweep — the SECOND must not touch a
-    queue planted in between, or the peer's mail is destroyed and peers() hides it."""
+def test_construction_never_moves_a_live_queue(tmp_path):
+    """F2: `foo.delivered` is a valid sender, and its pending queue is exactly the name the
+    legacy sweep looks for — so even the FIRST construction on a pre-existing root must
+    leave it in place and listed by peers()."""
     m = _module()
-    root = str(tmp_path / "pending")
-    first = m.Coalescer(root)
-    first.add("foo.delivered", {"id": "b1", "action": "info", "reply": "no", "body": "live mail"})
+    root = tmp_path / "pending"
+    root.mkdir()
+    (root / "foo.delivered.jsonl").write_text(
+        json.dumps({"id": "b1", "action": "info", "reply": "no", "body": "live mail"}) + "\n",
+        encoding="utf-8",
+    )
+    c = m.Coalescer(str(root))
+    assert (root / "foo.delivered.jsonl").is_file()          # unmoved
+    assert not (root / ".delivered" / "foo.jsonl").exists()
+    assert [i["id"] for i in c.pending("foo.delivered")] == ["b1"]
+    assert "foo.delivered" in c.peers()
 
-    second = m.Coalescer(root)
-    assert [i["id"] for i in second.pending("foo.delivered")] == ["b1"]
-    assert "foo.delivered" in second.peers()
 
-
-def test_legacy_archive_still_migrates_and_writes_the_marker(tmp_path):
-    """T2: the one-shot sweep still does its job — a genuine `<peer>.delivered.jsonl` present
-    at the FIRST construction moves into `.delivered/` — and the marker recording that the
-    layout is now unambiguous is written."""
+def test_explicit_migration_moves_legacy_archives_and_marks_at_root(tmp_path):
+    """F2/F3: the operator-run sweep still does its job — a genuine `<peer>.delivered.jsonl`
+    moves into `.delivered/` — and the marker recording the upgrade lives at the ROOT, so
+    purging the archive dir cannot re-arm the sweep."""
     m = _module()
     root = tmp_path / "pending"
     root.mkdir()
     (root / "kore.delivered.jsonl").write_text(
         json.dumps({"id": "old1", "body": "archived"}) + "\n", encoding="utf-8"
     )
-    m.Coalescer(str(root))
-    assert (root / ".delivered" / "kore.jsonl").is_file()   # still moved
+    assert m.migrate_legacy_archives(str(root)) == 1
+    assert (root / ".delivered" / "kore.jsonl").is_file()    # still moved
     assert not (root / "kore.delivered.jsonl").exists()
-    assert (root / ".delivered" / ".migrated").is_file()    # the disarm itself
+    assert (root / ".migration-complete").is_file()          # marker at root, not in .delivered/
 
-
-def test_marker_disarms_the_sweep_forever(tmp_path):
-    """T3: with the marker present, a file that merely LOOKS like a legacy archive is left
-    exactly where it is — after the one-time upgrade pass the layout is unambiguous and
-    nothing at the root is ever moved by name again."""
-    m = _module()
-    root = tmp_path / "pending"
-    m.Coalescer(str(root))                                   # first construction sweeps, marks
-    assert (root / ".delivered" / ".migrated").is_file()
-
+    # Purging .delivered/ must not re-arm the sweep.
+    shutil.rmtree(root / ".delivered")
     (root / "late.delivered.jsonl").write_text(
         json.dumps({"id": "n1", "body": "planted after the sweep"}) + "\n", encoding="utf-8"
     )
-    m.Coalescer(str(root))
-    assert (root / "late.delivered.jsonl").is_file()         # untouched
-    assert not (root / ".delivered" / "late.jsonl").exists()
+    assert m.migrate_legacy_archives(str(root)) == 0         # considered done
+    assert (root / "late.delivered.jsonl").is_file()         # untouched — a live queue by name
+
+
+def test_failed_move_does_not_write_the_marker(tmp_path):
+    """F3: one failed os.replace must not permanently disarm retry — the marker is written
+    only when every move succeeded, so the next deliberate run retries the stranded file."""
+    m = _module()
+    root = tmp_path / "pending"
+    root.mkdir()
+    (root / "kore.delivered.jsonl").write_text('{"id": "a"}\n', encoding="utf-8")
+    blocker = root / ".delivered"
+    blocker.mkdir()
+    (blocker / "kore.jsonl").mkdir()                          # forces the os.replace to fail
+    m.migrate_legacy_archives(str(root))
+    assert not (root / ".migration-complete").exists()       # failure must not disarm retry
+
+    shutil.rmtree(blocker / "kore.jsonl")
+    assert m.migrate_legacy_archives(str(root)) == 1         # retry completes the move
+    assert (blocker / "kore.jsonl").is_file()
+    assert (root / ".migration-complete").is_file()

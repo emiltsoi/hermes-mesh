@@ -1217,7 +1217,9 @@ class TestAdapterCoalesce:
         )
         adapter = self._make_adapter(tmp_path)
         assert adapter._coalesce.root == str(pending)          # no agent suffix, no defaulting
-        assert "kore.delivered" not in adapter._coalesce.peers()   # the dir is really in use
+        # `kore.delivered` is a valid sender whose live queue has exactly this name — the dir
+        # is really in use when construction sees it, and construction must never move mail.
+        assert "kore.delivered" in adapter._coalesce.peers()
 
 
 class TestMeshAdapterLifecycle:

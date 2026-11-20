@@ -178,13 +178,15 @@ def test_legacy_delivered_files_migrate_into_the_archive_dir(tmp_path):
     """MAJOR from the third review: archives used to live beside the queues as
     <peer>.delivered.jsonl, and peers() rightly refuses to name-filter that suffix (a
     'foo.delivered' sender is valid) — so a leftover archive would list as a pending queue and
-    be re-digested once under a fabricated name. Construction sweeps them into .delivered/."""
+    be re-digested once under a fabricated name. The sweep is an explicit operator one-shot;
+    construction itself never moves mail (a live 'foo.delivered' queue has the same name)."""
     m = _module()
     root = tmp_path / "pending"
     root.mkdir()
     (root / "kore.delivered.jsonl").write_text(
         json.dumps({"id": "old1", "body": "archived"}) + "\n", encoding="utf-8"
     )
+    assert m.migrate_legacy_archives(str(root)) == 1
     c = m.Coalescer(str(root))
     moved = root / ".delivered" / "kore.jsonl"
     assert moved.exists()                                   # archive dir, never a sibling name
@@ -195,7 +197,7 @@ def test_legacy_delivered_files_migrate_into_the_archive_dir(tmp_path):
 
 def test_legacy_migration_is_best_effort(tmp_path):
     """An OSError on one file logs and continues: the unmovable archive is left behind rather
-    than lost, the next legacy file still migrates, and construction never raises."""
+    than lost, the next legacy file still migrates, and the call never raises."""
     m = _module()
     root = tmp_path / "pending"
     root.mkdir()
@@ -205,7 +207,7 @@ def test_legacy_migration_is_best_effort(tmp_path):
     blocker = root / ".delivered"
     blocker.mkdir()
     (blocker / "kore.jsonl").mkdir()
-    c = m.Coalescer(str(root))
+    assert m.migrate_legacy_archives(str(root)) == 1
     assert (root / "kore.delivered.jsonl").exists()         # left behind, not lost
     assert (blocker / "linda.jsonl").is_file()              # the unblocked one still moved
-    m.Coalescer(str(root))                                  # and a second construction is fine
+    m.Coalescer(str(root))                                  # and construction is still fine
