@@ -1,5 +1,13 @@
 """Mesh platform adapter — receive Ed25519-signed Mesh messages.
 
+Delivery contract when coalescing is enabled (coalesce.enabled): AT-LEAST-ONCE, never
+at-most-once. The digest is enqueued before its pending rows are taken, so a full inbox leaves
+the mail on disk, and a failed take() after a successful enqueue re-delivers the batch on the
+next flush. Duplicates are visible to the receiver; losses are silent — that asymmetry decides
+every ordering question in this file. Teardown restores an undelivered batch, using the loop
+task's own cancel count (`Task.cancelling`), which requires Python >= 3.11; on 3.10 that one
+absorbed-cancel edge does not restore. The fleet runs 3.14.
+    
 Runs an aiohttp HTTP server that receives one-way mesh pings from other
 Hermes fleet agents, validates Ed25519 signatures, parses the mesh
 metadata envelope, and routes the message into the configured platform
