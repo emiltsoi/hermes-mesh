@@ -5,6 +5,7 @@ turn whether or not it asked for anything. These tests cover the decision (urgen
 the digest shape, the cap, and restart safety. They do not touch a gateway.
 """
 import importlib.util
+import json
 import os
 import time
 
@@ -50,7 +51,8 @@ def test_informational_waits_then_arrives_once(coal):
     assert "not asking for a reply" in body   # the digest must not invite an answer
     assert "nothing here needs an answer" in body
     assert "[…]" in body                      # long bodies are truncated, not lost
-    assert "kore.jsonl" in body               # and the full text is named
+    assert "kore.delivered.jsonl" in body     # the full text is named via the archive — the old
+    # assertion pinned kore.jsonl, the pending file this same flush removes
 
 
 def test_take_clears_and_overflow_keeps_the_rest(coal):
@@ -75,3 +77,61 @@ def test_empty_digest_is_none(coal):
     m, c = coal
     body, taken = c.build_digest("nobody")
     assert body is None and taken == []
+
+
+def test_due_skips_a_corrupt_peer_and_scans_the_rest(coal):
+    """F4: one corrupt pending file must not stall the whole fleet's scan."""
+    m, c = coal
+    # "aaa" sorts before "zzz" in listdir order — the corrupt file is hit FIRST.
+    with open(c._path("aaa"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"id": "b0", "received_at": "not-a-number"}) + "\n")
+    c.add("zzz", {"id": "g1", "action": "info", "reply": "no", "body": "hi", "received_at": 0})
+    assert c.due(now=time.time()) == ["zzz"]
+
+
+def test_build_digest_tolerates_a_non_numeric_received_at(coal):
+    """F4: the same corrupt row that due() skips must not break digest building either."""
+    m, c = coal
+    with open(c._path("ada"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"id": "b0", "received_at": "never", "body": "hi"}) + "\n")
+    body, taken = c.build_digest("ada")
+    assert body is not None and len(taken) == 1
+
+
+def test_peer_names_that_sanitize_alike_get_distinct_files(coal):
+    """F7: 'a b' and 'a_b' both used to land in a_b.jsonl — merged mail, wrong attribution."""
+    m, c = coal
+    c.add("a b", {"id": "s1", "body": "spaces"})
+    c.add("a_b", {"id": "s2", "body": "underscore"})
+    assert c._path("a b") != c._path("a_b")
+    assert c._archive_path("a b") != c._archive_path("a_b")
+    assert [i["body"] for i in c.pending("a b")] == ["spaces"]
+    assert [i["body"] for i in c.pending("a_b")] == ["underscore"]
+
+
+def test_add_returns_minus_one_when_the_recount_fails(coal, monkeypatch):
+    """F8: the append already happened, so a failed recount must not raise — the caller would
+    fall through to direct delivery and the message would arrive now AND in a later digest."""
+    m, c = coal
+
+    def boom(peer):
+        raise OSError("disk went away after the append")
+
+    monkeypatch.setattr(c, "pending", boom)
+    held = c.add("daji", {"id": "x1", "action": "info", "reply": "no", "body": "hi"})
+    assert held == -1                       # non-raising: the caller treats it as coalesced
+    monkeypatch.undo()
+    assert len(c.pending("daji")) == 1      # and the item really is on disk
+
+
+def test_take_preserves_malformed_lines(coal):
+    """F10: a corrupt row must survive a rewrite triggered by an unrelated flush."""
+    m, c = coal
+    c.add("yoyo", {"id": "g1", "action": "info", "reply": "no", "body": "one"})
+    with open(c._path("yoyo"), "a", encoding="utf-8") as fh:
+        fh.write("{not json\n")
+    c.add("yoyo", {"id": "g2", "action": "info", "reply": "no", "body": "two"})
+    c.take("yoyo", 1)
+    raw = open(c._path("yoyo"), encoding="utf-8").read()
+    assert "{not json" in raw               # verbatim, not silently dropped
+    assert [i["id"] for i in c.pending("yoyo")] == ["g2"]

@@ -290,6 +290,7 @@ class MeshAdapter(BasePlatformAdapter):
             else None
         )
         self._mesh_processor: Optional[asyncio.Task] = None
+        self._coalesce_flusher: Optional[asyncio.Task] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -340,6 +341,8 @@ class MeshAdapter(BasePlatformAdapter):
         self._mark_connected()
         self._mesh_processor = asyncio.create_task(self._mesh_processor_loop())
         self._outbox_reaper = asyncio.create_task(self._outbox_reaper_loop())
+        # A reconnect must not stack flushers: cancel a leftover before creating its replacement.
+        await self._cancel_coalesce_flusher()
         self._coalesce_flusher = (
             asyncio.create_task(self._coalesce_flush_loop())
             if self._coalesce is not None
@@ -377,12 +380,23 @@ class MeshAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._outbox_reaper = None
+        await self._cancel_coalesce_flusher()
         await self.cancel_background_tasks()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
         self._mark_disconnected()
         logger.info("[mesh] Disconnected")
+
+    async def _cancel_coalesce_flusher(self) -> None:
+        """Stop the digest flush loop. Idempotent: safe on disconnect and before reconnect."""
+        if self._coalesce_flusher:
+            self._coalesce_flusher.cancel()
+            try:
+                await self._coalesce_flusher
+            except asyncio.CancelledError:
+                pass
+            self._coalesce_flusher = None
 
     async def _handle_mesh(self, request: "web.Request") -> "web.Response":
         body = await request.read()
@@ -540,7 +554,7 @@ class MeshAdapter(BasePlatformAdapter):
                 self._expire_seen_messages()
                 record_metric("receive", "coalesced")
                 logger.info(
-                    "[mesh] coalesced from=%s id=%s pending=%d (delivered as one turn after %.0fs of quiet)",
+                    "[mesh] coalesced from=%s id=%s pending=%d (one turn once the oldest item is %.0fs old — the window bounds the wait, which is what prevents starvation)",
                     sender, msg_id, held, self._coalesce.window_seconds,
                 )
                 return web.json_response(
@@ -552,8 +566,17 @@ class MeshAdapter(BasePlatformAdapter):
                 logger.warning("[mesh] coalesce store failed (%s); delivering %s directly", exc, msg_id)
 
         # An urgent envelope flushes its peer's digest first, so the older material lands first.
+        # The flush is best-effort bookkeeping: a fault in the pending file must never reject the
+        # urgent message that triggered it — a persistent fault would otherwise 500 EVERY urgent
+        # message from that peer.
         if self._coalesce is not None and _urgent(action, reply):
-            self._flush_coalesced(sender)
+            try:
+                self._flush_coalesced(sender)
+            except Exception as exc:
+                logger.warning(
+                    "[mesh] coalesce flush failed for %s (%s); delivering %s normally",
+                    sender, exc, msg_id,
+                )
 
         try:
             self._mesh_inbox.put_nowait(event)
@@ -968,19 +991,29 @@ class MeshAdapter(BasePlatformAdapter):
         body, taken = self._coalesce.build_digest(peer)
         if not body or not taken:
             return
+        # The id carries the (sanitized) peer: two digests flushed in the same second would
+        # otherwise collide, and anything keying on event id would drop all but one — after
+        # take() has already run, so the loss would be silent.
+        safe_peer = "".join(c if c.isalnum() or c in "-_." else "_" for c in peer)
         event, err = self._build_event(
-            {}, peer, self._agent_name, f"digest-{int(time.time())}", "info", "no", None, body,
+            {}, peer, self._agent_name, f"digest-{int(time.time())}-{safe_peer}", "info", "no", None, body,
         )
         if err or event is None:
             logger.warning("[mesh] coalesce: could not build digest event for %s", peer)
             return
-        self._coalesce.take(peer, len(taken))
+        # ENQUEUE FIRST, then take. If the inbox is full this digest must stay on disk; taking
+        # before enqueueing deletes the only copy of messages whose digest was then dropped, which
+        # is the one failure this feature must never have. A failed take() after a successful
+        # enqueue can duplicate a digest on the next flush -- at-least-once beats at-most-once
+        # for a message bus, and duplicates are visible while losses are silent.
         try:
             self._mesh_inbox.put_nowait(event)
-            record_metric("receive", "digest")
-            logger.info("[mesh] digest from=%s items=%d -> one turn", peer, len(taken))
         except asyncio.QueueFull:
             logger.warning("[mesh] coalesce: inbox full, digest for %s stays on disk", peer)
+            return
+        self._coalesce.take(peer, len(taken))
+        record_metric("receive", "digest")
+        logger.info("[mesh] digest from=%s items=%d -> one turn", peer, len(taken))
 
     async def _coalesce_flush_loop(self) -> None:
         """Flush peers whose oldest pending item has waited past the window."""

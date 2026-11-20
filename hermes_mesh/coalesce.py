@@ -9,7 +9,10 @@ Two rules, both applied at the receiver, because the receiver is the only party 
 turn is worth:
 
   1. COALESCE — non-urgent traffic from one peer waits on disk and arrives as ONE turn carrying all
-     of it, after a quiet window. Ten informational messages cost one turn, not ten.
+     of it, once the oldest pending item is older than the window (checked every 30 s). Ten
+     informational messages cost one turn, not ten — and because the trigger is the OLDEST item's
+     age rather than a stretch of quiet, a steadily-talking peer is still flushed roughly every
+     tick. That is what prevents starvation: the window bounds the wait, it does not require silence.
   2. NEVER DELAY URGENT — an envelope that asks for action (`action: do`, or any `reply:` other than
      "no") flushes that peer's pending digest first, then arrives immediately. Order is preserved:
      the digest is always older than the urgent message that triggered it.
@@ -21,6 +24,7 @@ read in full.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -58,30 +62,50 @@ class Coalescer:
         os.makedirs(self.root, exist_ok=True)
 
     # -- storage ---------------------------------------------------------
-    def _path(self, peer: str) -> str:
-        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in peer)
-        return os.path.join(self.root, f"{safe}.jsonl")
+    def _stem(self, peer: str) -> str:
+        """Filesystem-safe, collision-free stem for a peer name.
 
-    def pending(self, peer: str) -> list[dict]:
+        Sanitizing alone maps ``a b`` and ``a_b`` to the same file, merging two peers' mail under
+        one attribution; when the name had to be mangled a short digest of the RAW peer is appended
+        so distinct senders can never share a pending file. Clean names keep their readable stem —
+        ``kore`` stays ``kore.jsonl`` — and a stem re-sanitized is itself, so the filename stems
+        that ``peers()`` hands back resolve to the same file again.
+        """
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in peer)
+        if safe != peer:
+            safe = f"{safe}.{hashlib.sha1(peer.encode('utf-8')).hexdigest()[:8]}"
+        return safe
+
+    def _path(self, peer: str) -> str:
+        return os.path.join(self.root, f"{self._stem(peer)}.jsonl")
+
+    def _archive_path(self, peer: str) -> str:
+        """Where the most recently delivered batch is kept, readable by the digest's reader."""
+        return os.path.join(self.root, f"{self._stem(peer)}.delivered.jsonl")
+
+    def _pending_lines(self, peer: str) -> list[str]:
+        """Raw non-blank lines of the peer's pending file, malformed rows included."""
         path = self._path(peer)
         if not os.path.exists(path):
             return []
-        items: list[dict] = []
         with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    items.append(json.loads(line))
-                except json.JSONDecodeError:
-                    logger.warning("[mesh] coalesce: skipping malformed pending line for %s", peer)
+            return [line.strip() for line in fh if line.strip()]
+
+    def pending(self, peer: str) -> list[dict]:
+        items: list[dict] = []
+        for line in self._pending_lines(peer):
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("[mesh] coalesce: skipping malformed pending line for %s", peer)
         return items
 
     def peers(self) -> list[str]:
         out = []
         for name in sorted(os.listdir(self.root)):
-            if name.endswith(".jsonl"):
+            # ``*.delivered.jsonl`` is the take() archive, not a pending queue — listing it as a
+            # peer would re-digest already-delivered mail every window.
+            if name.endswith(".jsonl") and not name.endswith(".delivered.jsonl"):
                 out.append(name[: -len(".jsonl")])
         return out
 
@@ -91,7 +115,13 @@ class Coalescer:
         item.setdefault("received_at", time.time())
         with open(self._path(peer), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(item, ensure_ascii=False) + "\n")
-        return len(self.pending(peer))
+        # The append already succeeded, so the recount is informational only: if it fails the
+        # caller must still treat the message as coalesced, or it is delivered now AND in a digest.
+        try:
+            return len(self.pending(peer))
+        except Exception:
+            logger.warning("[mesh] coalesce: stored but could not recount pending for %s", peer)
+            return -1
 
     def clear(self, peer: str) -> None:
         try:
@@ -101,13 +131,21 @@ class Coalescer:
 
     # -- flush -----------------------------------------------------------
     def due(self, now: Optional[float] = None) -> list[str]:
-        """Peers whose oldest pending item has waited past the window."""
+        """Peers whose oldest pending item has waited past the window.
+
+        Never raises: a file that cannot be read, or an oldest row whose ``received_at`` is not a
+        number, skips that one peer with a warning. Letting it raise would abort the scan for every
+        peer after it in listdir order, every flush cycle, forever.
+        """
         now = time.time() if now is None else now
         out = []
         for peer in self.peers():
-            items = self.pending(peer)
-            if items and (now - float(items[0].get("received_at", now))) >= self.window_seconds:
-                out.append(peer)
+            try:
+                items = self.pending(peer)
+                if items and (now - float(items[0].get("received_at", now))) >= self.window_seconds:
+                    out.append(peer)
+            except Exception as exc:
+                logger.warning("[mesh] coalesce: skipping peer %s during due() scan (%s)", peer, exc)
         return out
 
     def build_digest(self, peer: str) -> tuple[Optional[str], list[dict]]:
@@ -118,7 +156,10 @@ class Coalescer:
         taken = items[: self.max_items]
         held = len(items) - len(taken)
         hours = ""
-        span = float(taken[-1]["received_at"]) - float(taken[0]["received_at"])
+        try:
+            span = float(taken[-1]["received_at"]) - float(taken[0]["received_at"])
+        except (TypeError, ValueError):
+            span = 0.0
         if span >= 3600:
             hours = f" over {span / 3600:.1f}h"
         elif span >= 60:
@@ -133,25 +174,59 @@ class Coalescer:
             body = str(item.get("body", ""))
             if len(body) > self.preview_chars:
                 body = body[: self.preview_chars].rstrip() + " […]"
-            when = time.strftime("%H:%M:%S", time.localtime(float(item.get("received_at", 0))))
+            try:
+                when = time.strftime("%H:%M:%S", time.localtime(float(item.get("received_at", 0))))
+            except (TypeError, ValueError, OverflowError, OSError):
+                when = "??:??:??"
             lines.append(f"--- [{i}] {when}  id={item.get('id', '?')}  action={item.get('action', 'info')}")
             lines.append(body)
             lines.append("")
         if held:
             lines.append(f"({held} more held on disk — {self._path(peer)})")
-        else:
-            lines.append(f"(full text kept at {self._path(peer)} until the next flush)")
+        # The delivered batch is archived by take(); this line must name THAT file, not the pending
+        # queue, or it points at a path the same flush is about to delete.
+        lines.append(
+            f"(full text of these {len(taken)} kept at {self._archive_path(peer)} until the next flush)"
+        )
         return "\n".join(lines), taken
 
     def take(self, peer: str, count: int) -> None:
-        """Remove the first `count` items, rewriting what remains."""
-        items = self.pending(peer)
-        rest = items[count:]
+        """Remove the first `count` items, rewriting what remains.
+
+        The delivered batch is written to ``<peer>.delivered.jsonl`` first, so the path a digest
+        names still holds the full text after the digest has been enqueued. Without this the
+        footer pointed at a file the same call had just deleted.
+
+        The rewrite carries raw lines, not re-parsed rows: `count` indexes parsed items, and a
+        line that does not parse is neither taken nor counted — it is written back verbatim so a
+        corrupt row is not destroyed by an unrelated flush.
+        """
+        taken: list[str] = []
+        rest: list[str] = []
+        seen = 0
+        for line in self._pending_lines(peer):
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                rest.append(line)
+                continue
+            if seen < count:
+                taken.append(line)
+                seen += 1
+            else:
+                rest.append(line)
+        if taken:
+            archive = self._archive_path(peer)
+            tmp_a = archive + ".tmp"
+            with open(tmp_a, "w", encoding="utf-8") as fh:
+                for line in taken:
+                    fh.write(line + "\n")
+            os.replace(tmp_a, archive)
         if not rest:
             self.clear(peer)
             return
         tmp = self._path(peer) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            for item in rest:
-                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+            for line in rest:
+                fh.write(line + "\n")
         os.replace(tmp, self._path(peer))

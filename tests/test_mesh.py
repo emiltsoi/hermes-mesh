@@ -1082,6 +1082,101 @@ class TestMeshSendValidation:
             assert "[id:custom-123]" in body
 
 
+class TestAdapterCoalesce:
+    """Coalescing wiring on the adapter: an unguarded flush must never reject an urgent
+    message, the flusher is a single managed task across reconnects, and digest ids are
+    unique per peer."""
+
+    @staticmethod
+    def _make_adapter(tmp_path):
+        return MeshAdapter(
+            PlatformConfig(
+                extra={
+                    "secret": "INSECURE_NO_AUTH",
+                    "agent_name": "ada",
+                    "target_session": "telegram:dm:123",
+                    "coalesce": {
+                        "enabled": True,
+                        "dir": str(tmp_path / "pending"),
+                        "window_seconds": 0,
+                    },
+                }
+            )
+        )
+
+    def test_urgent_message_delivered_when_flush_raises(self, tmp_path):
+        """F3: a broken pending file must not reject the urgent message that triggered the
+        flush — otherwise a persistent fault refuses EVERY urgent message from that peer."""
+        adapter = self._make_adapter(tmp_path)
+
+        def boom(peer):
+            raise OSError("pending file unreadable")
+
+        adapter._coalesce.build_digest = boom
+        text = TestAdapterHandleMesh._envelope(
+            sender="kore", recipient="ada", msg_id="urg-1", action="do", reply="yes"
+        )
+        req = TestAdapterHandleMesh._make_request(
+            {"from": "kore", "text": text},
+            {"X-Mesh-Timestamp": str(time.time())},
+        )
+        resp = asyncio.run(adapter._handle_mesh(req))
+        assert resp.status == 202
+        assert adapter._mesh_inbox.qsize() == 1
+
+    def test_disconnect_cancels_the_coalesce_flusher(self, tmp_path):
+        """F5: the flush task is cancelled on disconnect, and cancelling again is a no-op."""
+        adapter = self._make_adapter(tmp_path)
+
+        async def go():
+            adapter._coalesce_flusher = asyncio.create_task(asyncio.sleep(60))
+            await adapter.disconnect()
+            assert adapter._coalesce_flusher is None
+            await adapter.disconnect()      # second call must not raise or resurrect a task
+            assert adapter._coalesce_flusher is None
+
+        asyncio.run(go())
+
+    def test_reconnect_does_not_stack_flushers(self, tmp_path):
+        """F5: connect() cancels a leftover flusher before creating its replacement."""
+        with patch("hermes_mesh.adapter.web") as mock_web:
+            mock_web.AppRunner.return_value.setup = AsyncMock()
+            mock_web.AppRunner.return_value.cleanup = AsyncMock()
+            site = MagicMock()
+            site.start = AsyncMock()
+            mock_web.TCPSite.return_value = site
+            adapter = self._make_adapter(tmp_path)
+
+            async def go():
+                assert await adapter.connect() is True
+                first = adapter._coalesce_flusher
+                assert first is not None
+                await adapter.connect()
+                assert adapter._coalesce_flusher is not None
+                assert adapter._coalesce_flusher is not first
+                assert first.done()
+                await adapter.disconnect()
+                assert adapter._coalesce_flusher is None
+
+            asyncio.run(go())
+
+    def test_digest_ids_are_unique_per_peer_in_one_tick(self, tmp_path, monkeypatch):
+        """F6: two peers flushed in the same second must not share an event id — anything
+        downstream that keys on id would drop all but one, after take() already ran."""
+        adapter = self._make_adapter(tmp_path)
+        adapter._coalesce.add("kore", {"id": "k1", "action": "info", "reply": "no", "body": "one"})
+        adapter._coalesce.add("linda", {"id": "l1", "action": "info", "reply": "no", "body": "two"})
+        frozen = MagicMock()
+        frozen.time.return_value = 1_700_000_000.0   # same tick for both flushes, deterministically
+        monkeypatch.setattr("hermes_mesh.adapter.time", frozen)
+        adapter._flush_coalesced("kore")
+        adapter._flush_coalesced("linda")
+        ids = set()
+        while adapter._mesh_inbox.qsize():
+            ids.add(adapter._mesh_inbox.get_nowait().message_id)
+        assert len(ids) == 2
+
+
 class TestMeshAdapterLifecycle:
     """MeshAdapter send/connect behavior."""
 
