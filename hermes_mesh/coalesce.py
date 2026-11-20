@@ -80,8 +80,18 @@ class Coalescer:
         return os.path.join(self.root, f"{self._stem(peer)}.jsonl")
 
     def _archive_path(self, peer: str) -> str:
-        """Where the most recently delivered batch is kept, readable by the digest's reader."""
-        return os.path.join(self.root, f"{self._stem(peer)}.delivered.jsonl")
+        """Where the most recently delivered batch is kept, readable by the digest's reader.
+
+        Archives live in their own subdirectory, never beside the pending queues. A sibling name is
+        not safe: ``foo.delivered`` is a valid sender, and its pending queue would then land on
+        exactly the file that is ``foo``'s archive — ``foo``'s flush would destroy ``foo.delivered``'s
+        mail, and ``peers()`` would hide it so it never flushed. A directory cannot be reached by any
+        peer name, because no name may contain a path separator.
+        """
+        safe = self._stem(peer)
+        arch_dir = os.path.join(self.root, ".delivered")
+        os.makedirs(arch_dir, exist_ok=True)
+        return os.path.join(arch_dir, f"{safe}.jsonl")
 
     def _pending_lines(self, peer: str) -> list[str]:
         """Raw non-blank lines of the peer's pending file, malformed rows included."""
@@ -95,17 +105,25 @@ class Coalescer:
         items: list[dict] = []
         for line in self._pending_lines(peer):
             try:
-                items.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
                 logger.warning("[mesh] coalesce: skipping malformed pending line for %s", peer)
+                continue
+            # Valid JSON is not necessarily a row: "123" and "[1]" parse fine and then explode on
+            # item.get() inside build_digest, which would abort the whole flush scan.
+            if not isinstance(row, dict):
+                logger.warning("[mesh] coalesce: skipping non-object pending row for %s", peer)
+                continue
+            items.append(row)
         return items
 
     def peers(self) -> list[str]:
         out = []
         for name in sorted(os.listdir(self.root)):
-            # ``*.delivered.jsonl`` is the take() archive, not a pending queue — listing it as a
-            # peer would re-digest already-delivered mail every window.
-            if name.endswith(".jsonl") and not name.endswith(".delivered.jsonl"):
+            # Archives live in the `.delivered/` subdirectory, so every `*.jsonl` beside the queues is
+            # a pending queue. There must be NO name-based exclusion here: `foo.delivered` is a valid
+            # sender, and filtering its suffix would hide its pending mail from every flush forever.
+            if name.endswith(".jsonl") and os.path.isfile(os.path.join(self.root, name)):
                 out.append(name[: -len(".jsonl")])
         return out
 
@@ -206,8 +224,14 @@ class Coalescer:
         seen = 0
         for line in self._pending_lines(peer):
             try:
-                json.loads(line)
+                row = json.loads(line)
             except json.JSONDecodeError:
+                rest.append(line)
+                continue
+            # Only objects are rows. A line that parses as valid JSON but not an object is not an
+            # item, is not counted toward `count`, and is written back verbatim like any other line
+            # this method cannot interpret.
+            if not isinstance(row, dict):
                 rest.append(line)
                 continue
             if seen < count:

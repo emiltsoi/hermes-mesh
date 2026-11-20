@@ -357,6 +357,10 @@ class MeshAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        # FIRST, before the inbox sentinel: a digest flushed while the processor is draining lands
+        # behind the None and is consumed only on a later reconnect -- and its items were already
+        # taken from disk. Stopping the flusher first means nothing new is produced during shutdown.
+        await self._cancel_coalesce_flusher()
         if self._mesh_processor:
             try:
                 self._mesh_inbox.put_nowait(None)
@@ -380,7 +384,6 @@ class MeshAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._outbox_reaper = None
-        await self._cancel_coalesce_flusher()
         await self.cancel_background_tasks()
         if self._runner:
             await self._runner.cleanup()
@@ -991,12 +994,12 @@ class MeshAdapter(BasePlatformAdapter):
         body, taken = self._coalesce.build_digest(peer)
         if not body or not taken:
             return
-        # The id carries the (sanitized) peer: two digests flushed in the same second would
-        # otherwise collide, and anything keying on event id would drop all but one — after
-        # take() has already run, so the loss would be silent.
+        # The id carries the peer AND a nanosecond stamp: per-peer alone still collides when the same
+        # peer is flushed twice inside one second (a 25-item cap plus two urgents), and anything
+        # keying on event id would drop all but one -- after take() has run, so the loss is silent.
         safe_peer = "".join(c if c.isalnum() or c in "-_." else "_" for c in peer)
         event, err = self._build_event(
-            {}, peer, self._agent_name, f"digest-{int(time.time())}-{safe_peer}", "info", "no", None, body,
+            {}, peer, self._agent_name, f"digest-{time.time_ns()}-{safe_peer}", "info", "no", None, body,
         )
         if err or event is None:
             logger.warning("[mesh] coalesce: could not build digest event for %s", peer)
@@ -1023,7 +1026,12 @@ class MeshAdapter(BasePlatformAdapter):
                 if self._coalesce is None:
                     continue
                 for peer in self._coalesce.due():
-                    self._flush_coalesced(peer)
+                    # Per-peer guard: one peer's write fault (read-only file, disk full) must not
+                    # stop every peer after it in the scan, every cycle, forever.
+                    try:
+                        self._flush_coalesced(peer)
+                    except Exception:
+                        logger.exception("[mesh] coalesce: flush failed for %s", peer)
             except asyncio.CancelledError:
                 break
             except Exception:

@@ -51,7 +51,9 @@ def test_informational_waits_then_arrives_once(coal):
     assert "not asking for a reply" in body   # the digest must not invite an answer
     assert "nothing here needs an answer" in body
     assert "[…]" in body                      # long bodies are truncated, not lost
-    assert "kore.delivered.jsonl" in body     # the full text is named via the archive — the old
+    assert c._archive_path("kore") in body     # the full text is named via the archive — the old
+                                               # assertion pinned the PENDING file, which the flush
+                                               # deletes; archives now live in their own directory
     # assertion pinned kore.jsonl, the pending file this same flush removes
 
 
@@ -135,3 +137,38 @@ def test_take_preserves_malformed_lines(coal):
     raw = open(c._path("yoyo"), encoding="utf-8").read()
     assert "{not json" in raw               # verbatim, not silently dropped
     assert [i["id"] for i in c.pending("yoyo")] == ["g2"]
+
+
+def test_archive_never_collides_with_another_peers_pending(coal):
+    """CRITICAL from the second review: `foo.delivered` is a valid sender, and its PENDING queue
+    used to land on exactly the file that is `foo`'s ARCHIVE -- so foo's flush destroyed
+    foo.delivered's mail and peers() hid it. Archives now live in their own directory."""
+    m, c = coal
+    c.add("foo", {"id": "a1", "action": "info", "reply": "no", "body": "for foo"})
+    c.add("foo.delivered", {"id": "b1", "action": "info", "reply": "no", "body": "for the other peer"})
+
+    assert c._path("foo.delivered") != c._archive_path("foo")
+
+    body, taken = c.build_digest("foo")
+    c.take("foo", len(taken))
+
+    survivors = c.pending("foo.delivered")
+    assert [i["id"] for i in survivors] == ["b1"]     # untouched by foo's flush
+    assert "foo.delivered" in c.peers()               # and still visible to the flush loop
+
+
+def test_non_object_json_rows_are_not_items(coal):
+    """MAJOR from the second review: "123" parses as JSON but is not a row; it used to reach
+    item.get() in build_digest and abort the entire flush scan."""
+    m, c = coal
+    c.add("isa", {"id": "o1", "action": "info", "reply": "no", "body": "real"})
+    with open(c._path("isa"), "a", encoding="utf-8") as fh:
+        fh.write("123\n[1]\nnull\n")
+
+    assert [i["id"] for i in c.pending("isa")] == ["o1"]      # non-objects are not rows
+    body, taken = c.build_digest("isa")                        # must not raise
+    assert len(taken) == 1 and "real" in body
+
+    c.take("isa", len(taken))
+    raw = open(c._path("isa"), encoding="utf-8").read()
+    assert "123" in raw and "[1]" in raw and "null" in raw     # preserved verbatim, like any junk row
