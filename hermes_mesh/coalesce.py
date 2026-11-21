@@ -111,8 +111,13 @@ class Coalescer:
         for line in self._pending_lines(peer):
             try:
                 row = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("[mesh] coalesce: skipping malformed pending line for %s", peer)
+            except ValueError:
+                # Not just JSONDecodeError: on Python >= 3.11 an integer literal longer than the
+                # interpreter's int/str digit limit (4300 by default) makes json.loads raise a plain
+                # ValueError from int(), which JSONDecodeError does not cover. Catching the narrower
+                # class let ONE such row abort the whole scan for that peer, so its queue neither
+                # flushed nor drained. JSONDecodeError is a ValueError subclass, so this covers both.
+                logger.warning("[mesh] coalesce: skipping unparsable pending line for %s", peer)
                 continue
             # Valid JSON is not necessarily a row: "123" and "[1]" parse fine and then explode on
             # item.get() inside build_digest, which would abort the whole flush scan.
